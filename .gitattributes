@@ -1,0 +1,5 @@
+# 统一换行处理：文本按原生平台换行，二进制不要动
+* text=auto
+*.png binary
+*.ico binary
+*.exe binary

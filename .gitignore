@@ -1,0 +1,14 @@
+# 编译产物
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# 本机偏好：里面有这台电脑的软件名单和排序习惯，不该进仓库
+settings.json
+*.log
+
+# 打好的发布包（走 Release 附件，不进源码树）
+dist/
+*.zip
