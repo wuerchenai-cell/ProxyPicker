@@ -22,7 +22,7 @@ namespace ProxyPicker.Core
         /// 界面上不会出现版本链接，也不会发出任何网络请求。
         /// 建好仓库后把这里改成实际地址，重新编译一次即可。
         /// </summary>
-        const string DefaultSlug = "";
+        const string DefaultSlug = "wuerchenai-cell/ProxyPicker";
 
         // 只在 --checkupdate 自检时被临时替换，正式运行永远用 DefaultSlug。
         // 有了它，接仓库之前就能拿一个真实的公开仓库把「发请求 + 解析 + 比版本」整条链路验通。
