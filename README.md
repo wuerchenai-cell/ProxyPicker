@@ -4,6 +4,10 @@
 
 单文件 exe，约 900 KB，不需要安装、不写注册表、不碰你的订阅。
 
+[**下载最新版**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
+[直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
+[更新记录](CHANGELOG.md)
+
 ![主界面](docs/img/main.png)
 
 ---
