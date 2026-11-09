@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 
 namespace ProxyPicker.Core
@@ -22,7 +23,21 @@ namespace ProxyPicker.Core
         {
             public string Exe;
             public string Policy;   // PP-FIXED / DIRECT
+            /// <summary>
+            /// 非空 = 这是一条按安装目录整树覆盖的规则（PROCESS-PATH-REGEX）。
+            /// 用于把某个软件自己的辅助进程一起包含进来，而不是逐个猜 exe 名字。
+            /// </summary>
+            public string PathRegex;
+            public bool IsPathRule { get { return !string.IsNullOrEmpty(PathRegex); } }
+            /// <summary>
+            /// true = 这条规则是工具从主软件推导出来的（helper / 目录整树），
+            /// 不是用户勾选的对象。保存名单时必须过滤掉，否则取消勾选主软件后，
+            /// 残留的 helper 仍会作为一条独立勾选项继续代理（复审 F-08）。
+            /// </summary>
+            public bool Derived;
             public Item(string exe, string policy) { Exe = exe; Policy = policy; }
+            public Item(string pattern, string policy, bool pathRule)
+            { Exe = pattern; Policy = policy; if (pathRule) PathRegex = pattern; }
         }
 
         public sealed class ApplyOutcome
@@ -33,65 +48,184 @@ namespace ProxyPicker.Core
             public long Ms;
             public string Policy = "";
             public bool Ipv6Off;    // 回读确认 ipv6 已经是 false
+            public bool Degraded;   // 内核不支持目录规则，已退回只按进程名
+        }
+
+        /// <summary>本次会话里内核明确拒绝过目录规则；之后不再尝试，避免每次保存都多推一遍。</summary>
+        public static bool PathRulesRejected;
+
+        static bool HasPathRule(List<Item> items)
+        {
+            if (items == null) return false;
+            foreach (var it in items) if (it.IsPathRule) return true;
+            return false;
+        }
+
+        /// <summary>只有 400 且响应明确指向规则类型/解析失败，才算「旧内核不支持」，才允许降级。</summary>
+        static bool IsPathRuleUnsupported(ApiResult push)
+        {
+            if (push == null || push.Status != 400) return false;
+            string body = ((push.Body ?? "") + " " + (push.Error ?? "")).ToLowerInvariant();
+            if (body.IndexOf("process-path-regex", StringComparison.Ordinal) >= 0) return true;
+            if (body.IndexOf("processpath", StringComparison.Ordinal) >= 0) return true;
+            return body.IndexOf("rule", StringComparison.Ordinal) >= 0 &&
+                   (body.IndexOf("unsupported", StringComparison.Ordinal) >= 0 ||
+                    body.IndexOf("invalid", StringComparison.Ordinal) >= 0 ||
+                    body.IndexOf("parse", StringComparison.Ordinal) >= 0);
         }
 
         const string Header =
             "# ProxyPicker 唯一勾选清单（由面板自动改写，手改也可）\n" +
             "#\n" +
-            "# 语义：PROCESS-NAME,<exe 名>,<策略>；PP-FIXED=走固定节点，DIRECT=直连。\n" +
+            "# 语义：PROCESS-NAME,<exe 名>,<策略>；PP-FIXED=走自动选出的主节点组，\n" +
+            "#       手改成 DIRECT 或某个组名也会按条目生效。\n" +
             "# 未出现在本清单的软件，落到 rules 段首的 MATCH,DIRECT（默认直连）。\n" +
             "#\n" +
-            "# 注意：匹配粒度是「可执行文件名」，同一 exe 的所有进程一起分流；\n" +
-            "#       msedge.exe 不等于 msedgewebview2.exe，勾 Edge 不覆盖 WebView2 宿主。\n";
+            "# 两种条目：\n" +
+            "#   PROCESS-NAME,<exe>,<策略>          按进程名，同一 exe 名的所有进程一起分流\n" +
+            "#   PROCESS-PATH-REGEX,<正则>,<策略>   按安装目录整树覆盖，目录里的辅助程序\n" +
+            "#                                      （helper / 语言服务 / 更新器）全部一起走代理，\n" +
+            "#                                      以后更新新增的程序也不需要再改\n" +
+            "# 目录条目的正则以 (?i)^ 开头、以 \\\\ 结尾，保证不会顺带匹配到名字相近的其它目录。\n";
 
         // ---------------------------------------------------------------- 读
 
-        public static List<Item> Load()
+        /// <summary>最近一次名单读取失败的原因（空 = 正常）；读失败绝不能当成「空名单」。</summary>
+        public static string LastLoadError = "";
+        public static bool LastLoadFailed { get { return !string.IsNullOrEmpty(LastLoadError); } }
+        /// <summary>最后一次成功读到的名单，读取失败时界面用它兜底显示。</summary>
+        public static List<Item> LastGoodItems = new List<Item>();
+
+        /// <summary>最近一次读取里无法解析、被跳过的 payload 行数（第 7 轮复审 R7-6，--audit 会报出来）。</summary>
+        public static int LastSkippedLines = 0;
+        /// <summary>坏行行号（1 起），保存失败时直接告诉用户改哪一行。</summary>
+        public static readonly List<int> LastSkippedLineNumbers = new List<int>();
+
+        /// <summary>三态读取：文件不存在 / 真空名单都算成功；占用、权限、损坏算失败。</summary>
+        public static bool TryLoad(out List<Item> items, out string error)
         {
-            var items = new List<Item>();
+            items = new List<Item>();
+            error = "";
+            LastSkippedLines = 0;
+            LastSkippedLineNumbers.Clear();
             string path = Paths.ListPath;
-            if (!File.Exists(path)) return items;
+            if (!File.Exists(path)) return true;
             string[] lines;
             try { lines = File.ReadAllLines(path, Encoding.UTF8); }
-            catch { return items; }
+            catch (Exception ex) { error = "读取勾选名单失败：" + ex.Message; return false; }
 
             bool inPayload = false;
-            foreach (var raw in lines)
+            bool sawPayload = false;
+            bool sawContent = false;
+            for (int lineNo = 0; lineNo < lines.Length; lineNo++)
             {
+                string raw = lines[lineNo];
                 string s = raw.Trim();
-                if (s.StartsWith("payload:", StringComparison.Ordinal)) { inPayload = true; continue; }
+                if (s.Length > 0 && !s.StartsWith("#", StringComparison.Ordinal)) sawContent = true;
+                if (s.StartsWith("payload:", StringComparison.Ordinal)) { inPayload = true; sawPayload = true; continue; }
                 if (!inPayload || !s.StartsWith("-", StringComparison.Ordinal)) continue;
                 string body = s.Substring(1).Trim().Trim('\'', '"');
                 string[] parts = body.Split(',');
-                if (parts.Length >= 3 && parts[0].Trim().Equals("PROCESS-NAME", StringComparison.OrdinalIgnoreCase))
-                    items.Add(new Item(parts[1].Trim(), parts[2].Trim().ToUpperInvariant()));
+                // 兼容早期/手写的两字段写法：`PROCESS-NAME,chrome.exe` 视为 PP-FIXED。
+                // 只有「类型不认识 / 名字为空」才算坏行，避免把正常老名单判死。
+                bool nameRule = parts.Length >= 2 &&
+                    parts[0].Trim().Equals("PROCESS-NAME", StringComparison.OrdinalIgnoreCase) &&
+                    parts[1].Trim().Length > 0;
+                bool pathRule = parts.Length >= 2 &&
+                    parts[0].Trim().Equals("PROCESS-PATH-REGEX", StringComparison.OrdinalIgnoreCase) &&
+                    parts[1].Trim().Length > 0;
+                if (nameRule)
+                    items.Add(new Item(parts[1].Trim(), parts.Length >= 3 && parts[2].Trim().Length > 0
+                        ? parts[2].Trim() : "PP-FIXED"));
+                else if (pathRule)
+                    items.Add(new Item(parts[1].Trim(), parts.Length >= 3 && parts[2].Trim().Length > 0
+                        ? parts[2].Trim() : "PP-FIXED", true) { Derived = true });
+                else
+                {
+                    // 手改坏了的行：不静默吞掉。保存前必须拦住，否则这一条会悄悄变直连。
+                    LastSkippedLineNumbers.Add(lineNo + 1);
+                }
             }
+            LastSkippedLines = LastSkippedLineNumbers.Count;
+            // 文件里有内容、却连 payload: 段都没有：这不是空名单，是格式坏了。
+            // 继续当成空名单会推出一份「全部直连」，必须停下来（复审 F-04）。
+            if (sawContent && !sawPayload)
+            {
+                error = "勾选名单缺少 payload: 段，格式已损坏；已停止读取，避免把全部软件改成直连";
+                return false;
+            }
+            return true;
+        }
+
+        public static List<Item> Load()
+        {
+            List<Item> items;
+            string error;
+            if (!TryLoad(out items, out error))
+            {
+                LastLoadError = error;
+                return new List<Item>(LastGoodItems);
+            }
+            LastLoadError = "";
+            LastGoodItems = new List<Item>(items);
             return items;
         }
 
         public static Dictionary<string, string> LoadPolicyMap()
         {
             var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var it in Load()) map[it.Exe] = it.Policy;
+            // 目录规则不是软件行：它由勾选状态自动生成，不能混进列表里变成一条「软件」。
+            foreach (var it in Load()) if (!it.IsPathRule) map[it.Exe] = it.Policy;
             return map;
         }
 
         // ---------------------------------------------------------------- 写
 
-        public static void Save(List<Item> items)
+        public static string LastSaveError = "";
+
+        /// <summary>临时文件 + 原子替换；写失败返回 false，调用方必须停止推送。</summary>
+        public static bool Save(List<Item> items)
         {
-            string path = Paths.ListPath;
-            string dir = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            string temp = null;
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append(Header);
+                sb.Append("payload:\n");
+                foreach (var it in items)
+                {
+                    sb.Append("  - '").Append(it.IsPathRule ? "PROCESS-PATH-REGEX" : "PROCESS-NAME")
+                      .Append(',').Append(it.IsPathRule ? it.PathRegex : it.Exe)
+                      .Append(',').Append(it.Policy).Append("'\n");
+                }
 
-            var sb = new StringBuilder();
-            sb.Append(Header);
-            sb.Append("payload:\n");
-            foreach (var it in items)
-                sb.Append("  - 'PROCESS-NAME,").Append(it.Exe).Append(',').Append(it.Policy).Append("'\n");
-
-            // UTF-8 无 BOM + LF：与 Python 侧工具写的格式保持一致
-            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+                string path = Paths.ListPath;
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                byte[] bytes = new UTF8Encoding(false).GetBytes(sb.ToString());
+                using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush(true);
+                }
+                if (File.Exists(path)) File.Replace(temp, path, null);
+                else File.Move(temp, path);
+                LastSaveError = "";
+                LastLoadError = "";
+                LastGoodItems = new List<Item>(items);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                LastSaveError = ex.Message;
+                CrashLog.Write(ex, "保存勾选名单失败");
+                return false;
+            }
+            finally
+            {
+                if (temp != null && File.Exists(temp)) { try { File.Delete(temp); } catch { } }
+            }
         }
 
         /// <summary>
@@ -103,13 +237,80 @@ namespace ProxyPicker.Core
         /// </summary>
         public static List<Item> Compose(IEnumerable<string> proxy, IEnumerable<string> direct)
         {
+            return Compose(proxy, direct, null);
+        }
+
+        /// <summary>
+        /// peers 传入「主软件 exe → 同目录辅助进程 exe 名」的映射。
+        /// Electron / 类 VS Code 软件的登录、更新、语言服务常由 helper 发起连接，
+        /// 只写主 exe 会让这些连接落到 MATCH,DIRECT（Antigravity 登录失败的根因）。
+        /// 勾一个软件就把它的 helper 一起写进规则块。
+        /// </summary>
+        public static List<Item> Compose(IEnumerable<string> proxy, IEnumerable<string> direct,
+                                         Dictionary<string, List<string>> peers)
+        {
+            return Compose(proxy, direct, peers, null);
+        }
+
+        /// <summary>
+        /// roots 传入「要整树覆盖的软件安装目录」。
+        /// 目录规则排在进程名规则之后：内核回读校验和「第一条是不是自家规则」的判断
+        /// 都依赖第一条仍是 PROCESS-NAME，顺序不能反。
+        /// </summary>
+        public static List<Item> Compose(IEnumerable<string> proxy, IEnumerable<string> direct,
+                                         Dictionary<string, List<string>> peers, IEnumerable<string> roots)
+        {
+            return Compose(proxy, direct, peers, roots, null);
+        }
+
+        /// <summary>
+        /// policies：用户手改过的策略名（名字 → DIRECT / 某个组名）。
+        /// 勾选状态由「名单里有没有这一条」决定，但保存时必须把手改的策略原样带回去，
+        /// 否则用户在名单里写 `微信.exe,🚀 节点选择`，界面一保存就被改回 PP-FIXED（F-13）。
+        /// </summary>
+        public static List<Item> Compose(IEnumerable<string> proxy, IEnumerable<string> direct,
+                                         Dictionary<string, List<string>> peers, IEnumerable<string> roots,
+                                         Dictionary<string, string> policies)
+        {
             var items = new List<Item>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var name in proxy)
             {
                 string exe = Normalize(name);
                 if (exe.Length == 0 || !seen.Add(exe)) continue;
-                items.Add(new Item(exe, "PP-FIXED"));
+                string pol = "PP-FIXED";
+                if (policies != null)
+                {
+                    string custom;
+                    if (policies.TryGetValue(exe, out custom) && !string.IsNullOrEmpty(custom))
+                        pol = custom;
+                }
+                items.Add(new Item(exe, pol));
+
+                List<string> related;
+                if (peers != null && peers.TryGetValue(exe, out related))
+                {
+                    foreach (var p in related)
+                    {
+                        string helper = Normalize(p);
+                        if (helper.Length == 0 || !seen.Add(helper)) continue;
+                        // 辅助进程永远跟随主软件走默认组，不继承用户手改的策略。
+                        items.Add(new Item(helper, "PP-FIXED") { Derived = true });
+                    }
+                }
+            }
+            // 目录规则放最后：一条规则覆盖整个安装树（含以后新增的辅助程序），
+            // 进程名规则继续保留，作为路径匹配不可用时的兜底。
+            if (roots != null)
+            {
+                var seenRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var root in roots)
+                {
+                    string pattern = AppGroup.PatternFor(root);
+                    if (string.IsNullOrEmpty(pattern)) continue;
+                    if (!seenRoots.Add(pattern)) continue;
+                    items.Add(new Item(pattern, "PP-FIXED", true) { Derived = true });
+                }
             }
             // direct 项不写入：MATCH,DIRECT 已经是兜底，显式写 DIRECT 只会让名单变长。
             return items;
@@ -149,11 +350,16 @@ namespace ProxyPicker.Core
             string policy = Discovery.FindPolicy(text, out reused);
             string payload = Discovery.BuildPayload(text, items ?? new List<Item>(), policy, Settings.PatchOnly);
 
-            // IPv6 不跟着订阅走：它原来只写在某一版订阅的扩展配置里，一换订阅就丢，
-            // 而丢了之后完全看不出来——规则都正常，只是 IPv6 流量从物理网卡直出了。
-            // 所以放到「推给内核的这份配置」里最稳：换订阅、重启客户端都不会影响它。
-            // 注意只加在真实推送路径上，--dryrun 的逐字节基线不受影响。
-            return Guard.EnsureIpv6Off(payload);
+            // IPv6 归客户端自己管，默认一个字都不碰。
+            // Clash Verge 新版把 ipv6 列为「应用设置接管」字段：外部再写它会被丢弃，
+            // 还会在界面上弹橙色警告。以前每次保存都塞一行 ipv6: false，等于给用户添堵。
+            // 只有用户在帮助面板里主动开启「IPv6 防泄漏」才写；关掉时按记下的原值推回。
+            // --dryrun 走的是 Discovery.BuildPayload，不经过这里，逐字节基线不受影响。
+            // 关掉开关时同样一个字都不写：我们从来没改过配置文件，只推过运行时全文，
+            // 停止注入后客户端会用它自己的应用设置重新生成配置，原值自然就回来了。
+            // 反过来若在这里写回 ipv6: true，Clash Verge 一样会判为「越权」并再弹一次警告。
+            if (Settings.Ipv6GuardOn) return Guard.EnsureIpv6Off(payload);
+            return payload;
         }
 
         /// <summary>当前配置里会用的策略名（界面显示用）。</summary>
@@ -171,11 +377,30 @@ namespace ProxyPicker.Core
 
         // ---------------------------------------------------------------- 应用
 
-        /// <summary>写名单 -> 生成 payload -> 推给内核 -> 回读规则表校验。</summary>
+        /// <summary>跨进程互斥：命令行 --apply 与界面保存不能交叉写名单 / 推配置（评审 R6-4）。</summary>
         public static ApplyOutcome Apply(List<Item> items)
         {
-            var result = new ApplyOutcome();
             var sw = System.Diagnostics.Stopwatch.StartNew();
+            using (var gate = new System.Threading.Mutex(false, @"Local\ProxyPicker.Apply"))
+            {
+                bool owned = false;
+                try { owned = gate.WaitOne(TimeSpan.FromSeconds(30)); }
+                catch (System.Threading.AbandonedMutexException) { owned = true; }
+                if (!owned)
+                {
+                    var busy = new ApplyOutcome { Ok = false, Message = "另一个 ProxyPicker 正在保存，请稍后再试" };
+                    busy.Ms = sw.ElapsedMilliseconds;
+                    return busy;
+                }
+                try { return ApplyCore(items, sw); }
+                finally { try { gate.ReleaseMutex(); } catch { } }
+            }
+        }
+
+        /// <summary>生成 payload -> 推给内核 -> 回读规则校验 -> 成功后才写名单。</summary>
+        static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw)
+        {
+            var result = new ApplyOutcome();
 
             string cfg = Paths.ClashYaml;
             if (string.IsNullOrEmpty(cfg) || !File.Exists(cfg))
@@ -186,7 +411,33 @@ namespace ProxyPicker.Core
                 return result;
             }
 
+            // 名单读取失败时绝不能当成「空名单」往下推（评审 R6-3）。
+            List<Item> disk;
+            string loadError;
+            if (!TryLoad(out disk, out loadError))
+            {
+                result.Ok = false;
+                result.Message = loadError + "；已停止推送，避免把勾选清空";
+                result.Ms = sw.ElapsedMilliseconds;
+                return result;
+            }
+            // 名单里有解析不了的行时，绝不能继续保存：那条会被当成没勾，悄悄变直连。
+            if (LastSkippedLines > 0)
+            {
+                string where = string.Join("、", LastSkippedLineNumbers.Take(5).Select(n => n.ToString()).ToArray());
+                if (LastSkippedLineNumbers.Count > 5) where += " 等";
+                result.Ok = false;
+                result.Message = "勾选名单第 " + where + " 行格式不对（共 " + LastSkippedLines +
+                    " 行），已停止保存；请修好后再试，避免这些软件被悄悄改回直连";
+                result.Ms = sw.ElapsedMilliseconds;
+                return result;
+            }
+
             BackupOnce(cfg);
+            // 主动开了防泄漏但还没记原值（例如命令行直接保存）时，先补记一次。
+            if (Settings.Ipv6GuardOn) Settings.CaptureIpv6Original();
+            // 第一次保存前记下客户端原本的 find-process-mode，退出时才能恢复原值。
+            Settings.CaptureFindProcessOriginal();
 
             string payload;
             try
@@ -202,9 +453,32 @@ namespace ProxyPicker.Core
             }
 
             result.Policy = PolicyName();
-            try { Save(items); } catch { }
-
+            // 先推送；推送失败时磁盘名单保持原样，界面与内核不分叉（评审 R1-6 / R3-6）。
             var push = Mihomo.PushConfig(payload);
+
+            // 只有内核「明确不认识 PROCESS-PATH-REGEX」时才降级。
+            // 复审 F-07：以前超时/401/网络中断也会走这里，重试一旦成功就把目录规则
+            // 从名单里永久删掉，还谎报「内核不支持」——用户既丢了 helper 覆盖，也查不出原因。
+            if (!push.Ok && HasPathRule(items) && IsPathRuleUnsupported(push))
+            {
+                var onlyNames = new List<Item>();
+                foreach (var it in items) if (!it.IsPathRule) onlyNames.Add(it);
+                string fallback;
+                try { fallback = BuildPayload(cfg, onlyNames); }
+                catch { fallback = null; }
+                if (fallback != null)
+                {
+                    var retry = Mihomo.PushConfig(fallback);
+                    if (retry.Ok)
+                    {
+                        PathRulesRejected = true;   // 本次会话不再尝试，避免每次保存都白推一遍
+                        items = onlyNames;
+                        payload = fallback;
+                        push = retry;
+                        result.Degraded = true;
+                    }
+                }
+            }
             if (!push.Ok)
             {
                 result.Ok = false;
@@ -212,35 +486,99 @@ namespace ProxyPicker.Core
                 result.Ms = sw.ElapsedMilliseconds;
                 return result;
             }
+            // 只把「用户勾选的」写回名单；helper / 目录规则是推导出来的，不能落盘成
+            // 独立条目，否则取消勾选主软件后它们仍会留在名单里继续代理（F-08）。
+            var persist = new List<Item>();
+            foreach (var it in items) if (!it.Derived) persist.Add(it);
+            if (!Save(persist))
+            {
+                result.Ok = false;
+                result.Message = "规则已推送，但勾选名单写入失败：" + LastSaveError + "；请检查文件权限后重新保存";
+                result.Ms = sw.ElapsedMilliseconds;
+                return result;
+            }
 
-            // 回读校验：前 N 条规则必须和名单逐条一致
+            // 回读校验：条数、exe、策略、空名单兜底、内核模式与进程识别开关（评审 R3-5 / R1-7）。
             var rules = ReadRules();
             result.RuleCount = rules.Count;
-            bool good = rules.Count >= items.Count;
+            bool good = true;
+            string whyBad = "";
+            if (rules.Count < items.Count) { good = false; whyBad = "内核规则条数不足"; }
             if (good)
             {
                 for (int i = 0; i < items.Count; i++)
                 {
+                    string type = rules[i].Type ?? "";
+                    string expectType = items[i].IsPathRule ? "ProcessPathRegex" : "ProcessName";
+                    // 目录规则的类型名在不同内核版本里可能写成 ProcessPathRegex / ProcessPath-REGEX，
+                    // 只要求「是进程类规则」，真正的判据是下面对 payload 的逐条比对。
+                    bool typeOk = type.Equals(expectType, StringComparison.OrdinalIgnoreCase) ||
+                                  (items[i].IsPathRule && type.StartsWith("Process", StringComparison.OrdinalIgnoreCase));
+                    if (!typeOk)
+                    { good = false; whyBad = "第 " + (i + 1) + " 条不是进程规则（" + type + "）"; break; }
                     string got = rules[i].Payload ?? "";
-                    if (!got.Equals(items[i].Exe, StringComparison.OrdinalIgnoreCase)) { good = false; break; }
+                    string wantPayload = items[i].IsPathRule ? items[i].PathRegex : items[i].Exe;
+                    if (!got.Equals(wantPayload, StringComparison.OrdinalIgnoreCase))
+                    { good = false; whyBad = "第 " + (i + 1) + " 条规则对不上"; break; }
+                    string want = items[i].Policy.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)
+                        ? result.Policy : items[i].Policy;
+                    string proxy = rules[i].Proxy ?? "";
+                    if (want.Length > 0 && !proxy.Equals(want, StringComparison.OrdinalIgnoreCase))
+                    { good = false; whyBad = "第 " + (i + 1) + " 条策略被改成 " + proxy; break; }
                 }
+            }
+            if (good && items.Count == 0 && !Settings.PatchOnly &&
+                (rules.Count == 0 || !rules[0].Type.Equals("Match", StringComparison.OrdinalIgnoreCase)))
+            { good = false; whyBad = "空名单下缺少直连兜底"; }
+            // 复审 P2：回读也要核对短路 MATCH 的位置，不能只靠 30 秒后的看守兜底。
+            // 只检查「前 items.Count 条自家规则块」，避免误判订阅里自带的进程规则。
+            if (good && !Settings.PatchOnly && items.Count > 0)
+            {
+                int firstMatch = -1;
+                for (int i = 0; i < rules.Count; i++)
+                    if ((rules[i].Type ?? "").Equals("Match", StringComparison.OrdinalIgnoreCase))
+                    { firstMatch = i; break; }
+                if (firstMatch >= 0 && firstMatch < items.Count)
+                { good = false; whyBad = "直连兜底排在勾选规则前面"; }
+            }
+            if (good)
+            {
+                try
+                {
+                    var conf = Mihomo.GetJson("/configs", 4000);
+                    if (conf != null)
+                    {
+                        string mode = Json.Str(conf, "mode");
+                        string fpm = Json.Str(conf, "find-process-mode");
+                        if (!string.IsNullOrEmpty(mode) && !mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
+                        { good = false; whyBad = "客户端当前是 " + mode + " 模式，规则不生效，请切到规则模式"; }
+                        else if (!string.IsNullOrEmpty(fpm) && !fpm.Equals("always", StringComparison.OrdinalIgnoreCase))
+                        { good = false; whyBad = "进程识别未开启（find-process-mode=" + fpm + "）"; }
+                    }
+                }
+                catch { }
             }
             result.Ok = good;
             result.Message = good
                 ? "已生效 " + items.Count + " 条规则"
-                : "已推送但校验不一致，请点刷新核对";
+                : "已推送但校验不一致：" + whyBad + "，请点刷新核对";
+            if (good && result.Degraded)
+                result.Message += "（这台电脑的内核不支持按目录覆盖，辅助进程已退回按进程名处理）";
 
-            // 推送成功不代表 IPv6 真的关了：内核有可能忽略这个键。既然它坏了界面看不出来，
-            // 就在这里当场回读一次，宁可把不确定说出来，也不假装成功。
-            try
+            // 只有用户主动开了防泄漏才回读 IPv6；否则这个开关归客户端管，
+            // 我们不改、也不评价它的开或关。
+            if (Settings.Ipv6GuardOn)
             {
-                var after = Mihomo.GetJson("/configs", 4000);
-                if (after != null && Json.Bool(after, "ipv6", false))
-                    result.Message += "（IPv6 仍开着，可能被客户端配置覆盖）";
-                else if (after != null)
-                    result.Ipv6Off = true;
+                try
+                {
+                    var after = Mihomo.GetJson("/configs", 4000);
+                    if (after != null && Json.Bool(after, "ipv6", false))
+                        result.Message += "（IPv6 仍开着，客户端可能已覆盖；要彻底关闭请在 Clash Verge 设置里改）";
+                    else if (after != null)
+                        result.Ipv6Off = true;
+                }
+                catch { }
             }
-            catch { }
 
             result.Ms = sw.ElapsedMilliseconds;
             return result;
@@ -248,42 +586,198 @@ namespace ProxyPicker.Core
 
         // ---------------------------------------------------------------- 备份与回滚
 
-        /// <summary>第一次接管前留一份原件，回滚时能推回去。</summary>
+        /// <summary>第一次接管留一份原件；每次保存前再滚动保留最近 3 份（评审 R1-12）。</summary>
+        const string SecretPlaceholder = "secret: \"<备份时已移除，还原时自动补回>\"";
+
+        /// <summary>备份不落明文控制密钥（复审 P2）；还原时从当前配置补回。</summary>
+        static string ScrubSecret(string yaml)
+        {
+            return System.Text.RegularExpressions.Regex.Replace(yaml, @"(?m)^secret:\s*.*$", SecretPlaceholder);
+        }
+
+        static string CurrentSecret()
+        {
+            try
+            {
+                string p = Paths.ClashYaml;
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "";
+                foreach (var line in File.ReadLines(p))
+                    if (line.StartsWith("secret:", StringComparison.Ordinal))
+                        return line.Substring(7).Trim().Trim('\'', '"');
+            }
+            catch { }
+            return "";
+        }
+
         public static void BackupOnce(string configPath)
         {
             try
             {
                 string dir = Paths.BackupDir;
-                string stamp = File.Exists(Path.Combine(dir, "original.yaml")) ? null : "original.yaml";
-                if (stamp == null) return;
-                File.Copy(configPath, Path.Combine(dir, stamp), true);
+                Directory.CreateDirectory(dir);
+                string scrubbed = ScrubSecret(File.ReadAllText(configPath, Encoding.UTF8));
+                var utf8 = new UTF8Encoding(false);
+
+                string original = Path.Combine(dir, "original.yaml");
+                if (!File.Exists(original)) File.WriteAllText(original, scrubbed, utf8);
+
+                string recent = Path.Combine(dir, "recent.yaml");
+                string prev2 = Path.Combine(dir, "recent-2.yaml");
+                string prev3 = Path.Combine(dir, "recent-3.yaml");
+                if (File.Exists(prev2)) File.Copy(prev2, prev3, true);
+                if (File.Exists(recent)) File.Copy(recent, prev2, true);
+                File.WriteAllText(recent, scrubbed, utf8);
             }
             catch { }
         }
 
         /// <summary>
-        /// 一条命令回滚：把最初的配置原样推回内核，并清空勾选名单。
-        /// 返回是否成功。内核会重新接管全部流量，行为退回订阅原样。
+        /// 一键还原：优先推回「上次保存前的配置」，没有再用最初那份。
+        /// 托盘菜单里现在有入口，不再是只有定义没有调用的空承诺。
+        /// 与 Apply 共用同一把跨进程互斥锁（第 7 轮复审 R7-3）：
+        /// 还原会推配置并清空名单，和界面保存 / 自动补回 / --apply 并发时会互相覆盖。
         /// </summary>
         public static bool Rollback(out string message)
         {
+            using (var gate = new System.Threading.Mutex(false, @"Local\ProxyPicker.Apply"))
+            {
+                bool owned = false;
+                try { owned = gate.WaitOne(TimeSpan.FromSeconds(30)); }
+                catch (System.Threading.AbandonedMutexException) { owned = true; }
+                if (!owned)
+                {
+                    message = "另一个 ProxyPicker 正在保存，请稍后再试";
+                    return false;
+                }
+                try { return RollbackCore(out message); }
+                finally { try { gate.ReleaseMutex(); } catch { } }
+            }
+        }
+
+        /// <summary>
+        /// 退出前把系统还回去：只删掉本工具写进内核的规则块，并把 IPv6 恢复成接管前的值。
+        /// 不写订阅文件、不动勾选名单，所以下次打开还是原来的选择。
+        /// 与保存共用同一把锁，避免退出时和后台补回互相覆盖。
+        /// 用户要求「不用的时候电脑跟没装一样」，这条就是那个要求的落点。
+        /// </summary>
+        public static bool LeaveNoTrace(out string message)
+        {
+            using (var gate = new System.Threading.Mutex(false, @"Local\ProxyPicker.Apply"))
+            {
+                bool owned = false;
+                try { owned = gate.WaitOne(TimeSpan.FromSeconds(30)); }
+                catch (System.Threading.AbandonedMutexException) { owned = true; }
+                if (!owned) { message = "另一个 ProxyPicker 正在保存，跳过还原"; return false; }
+                try { return LeaveNoTraceCore(out message); }
+                finally { try { gate.ReleaseMutex(); } catch { } }
+            }
+        }
+
+        static bool LeaveNoTraceCore(out string message)
+        {
+            message = "";
             try
             {
-                string original = Path.Combine(Paths.BackupDir, "original.yaml");
-                if (!File.Exists(original))
+                string cfg = Paths.ClashYaml;
+                if (string.IsNullOrEmpty(cfg) || !File.Exists(cfg)) { message = "没找到客户端配置文件"; return false; }
+                string text = File.ReadAllText(cfg, Encoding.UTF8);
+                // 空名单时策略名用不到，但 FindPolicy 在极端配置上可能抛异常 ——
+                // 退出流程不能因为「挑不出策略组」就放弃还原，所以给它一个兜底值。
+                string policy = "PP-FIXED";
+                try { bool reused; policy = Discovery.FindPolicy(text, out reused); } catch { }
+                // 空名单 + 「订阅兼容」：这一步只会删掉标记块，不会插入 MATCH,DIRECT。
+                // find-process-mode 要恢复成用户原值；没记到原值时保持现状（null = 仍写 always）。
+                string fpm = Settings.Current.FindProcessOriginal;
+                if (fpm.Length == 0) fpm = null;
+                string clean = Discovery.BuildPayload(text, new List<Item>(), policy, true, fpm);
+                bool ipv6Restore = Settings.Ipv6GuardOn && !string.IsNullOrEmpty(Settings.Current.Ipv6Original);
+                if (ipv6Restore)
+                    clean = Guard.RestoreIpv6(clean, Settings.Current.Ipv6Original);
+                // 判断要不要推，必须看「内核里有没有自家规则」，不能拿磁盘配置比：
+                // 本工具从不改订阅文件，磁盘上本来就没有那块规则，一比就会误判成
+                // 「本来就没插过」，于是规则留在内核里、退出等于没还原。
+                var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    foreach (var it in Load())
+                        mine.Add(it.IsPathRule ? it.PathRegex : it.Exe);
+                }
+                catch { }
+                bool readOk;
+                var live = ReadRules(out readOk);
+                // 复审 F-02：任一位置存在自家规则都算，不能只看首条；读失败必须按「有」处理。
+                bool fpmRestore = !string.IsNullOrEmpty(fpm) && !fpm.Equals("always", StringComparison.OrdinalIgnoreCase);
+                if (!ShouldRestore(readOk, live, mine, ipv6Restore, fpmRestore))
+                    return true;                   // 内核里本来就没有我们的东西，不必重载配置
+                var push = Mihomo.PushConfig(clean);
+                if (!push.Ok) { message = push.Error ?? ("HTTP " + push.Status); return false; }
+                return true;
+            }
+            catch (Exception ex) { message = ex.Message; return false; }
+        }
+
+        /// <summary>
+        /// 退出还原决策（纯函数，自检可直接覆盖）：
+        /// 读失败按「有」处理；任意位置存在自家规则就还原；IPv6 / find-process-mode 需要恢复也还原。
+        /// </summary>
+        internal static bool ShouldRestore(bool readOk, IEnumerable<RuleInfo> live, HashSet<string> mine,
+                                           bool ipv6Restore, bool fpmRestore)
+        {
+            if (!readOk) return true;
+            if (live != null)
+            {
+                foreach (var r in live)
+                    if (IsOwnRule(r, mine)) return true;
+            }
+            return ipv6Restore || fpmRestore;
+        }
+
+        /// <summary>内核里的这一条是不是本工具写的：策略是 PP-FIXED，或 payload 与名单里的条目一致。</summary>
+        static bool IsOwnRule(RuleInfo r, HashSet<string> mine)
+        {
+            if (r == null) return false;
+            if ((r.Proxy ?? "").Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)) return true;
+            if (!string.IsNullOrEmpty(r.Payload) && mine != null && mine.Contains(r.Payload)) return true;
+            return false;
+        }
+
+        static bool RollbackCore(out string message)
+        {
+            try
+            {
+                string dir = Paths.BackupDir;
+                string recent = Path.Combine(dir, "recent.yaml");
+                string original = Path.Combine(dir, "original.yaml");
+                string chosen = File.Exists(recent) ? recent : original;
+                if (!File.Exists(chosen))
                 {
                     message = "没有找到备份（本程序还没在这台机器上保存过）";
                     return false;
                 }
-                string text = File.ReadAllText(original, Encoding.UTF8);
+                string text = File.ReadAllText(chosen, Encoding.UTF8);
+                if (text.IndexOf("<备份时已移除", StringComparison.Ordinal) >= 0)
+                {
+                    string secret = CurrentSecret();
+                    if (secret.Length == 0)
+                    {
+                        message = "备份里的控制密钥已被移除，且读不到当前密钥；为安全起见已停止还原";
+                        return false;
+                    }
+                    text = System.Text.RegularExpressions.Regex.Replace(
+                        text, @"(?m)^secret:\s*.*$", "secret: " + Json.Quote(secret));
+                }
                 var push = Mihomo.PushConfig(text);
                 if (!push.Ok)
                 {
-                    message = "推送原件失败：" + (push.Error ?? ("HTTP " + push.Status));
+                    message = "推送备份失败：" + (push.Error ?? ("HTTP " + push.Status));
                     return false;
                 }
-                try { Save(new List<Item>()); } catch { }
-                message = "已还原为最初的配置";
+                if (!Save(new List<Item>()))
+                {
+                    message = "配置已还原，但勾选名单写入失败：" + LastSaveError;
+                    return false;
+                }
+                message = "已还原为上次保存前的配置";
                 return true;
             }
             catch (Exception ex)
@@ -302,6 +796,14 @@ namespace ProxyPicker.Core
 
         public static List<RuleInfo> ReadRules()
         {
+            bool ok;
+            return ReadRules(out ok);
+        }
+
+        /// <summary>读内核规则表。ok=false 表示「没读到/格式异常」，与「真的 0 条」必须区分开。</summary>
+        public static List<RuleInfo> ReadRules(out bool ok)
+        {
+            ok = false;
             var list = new List<RuleInfo>();
             var obj = Mihomo.GetJson("/rules");
             if (obj == null) return list;
@@ -320,6 +822,7 @@ namespace ProxyPicker.Core
                     Proxy = Json.Str(d, "proxy") ?? ""
                 });
             }
+            ok = true;
             return list;
         }
 
@@ -433,6 +936,25 @@ namespace ProxyPicker.Core
             // 这时候再显示「名单未生效，请保存一次」只会让人以为程序坏了。
             if (!st.Applied && Settings.PatchOnly && Load().Count == 0) st.Applied = true;
 
+            // 首条是进程规则不代表整份配置生效：兼容模式下中间若提前出现 MATCH，
+            // 后面的订阅规则永远匹配不到。白名单模式的 MATCH 本来就该排在自家规则后，
+            // 不能一起判（复审 F-07）。
+            if (Settings.PatchOnly)
+            {
+                for (int i = 0; i < rules.Count; i++)
+                {
+                    if ((rules[i].Type ?? "").Equals("Match", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (i < rules.Count - 1)
+                        {
+                            st.Applied = false;
+                            st.Error = "规则里有一条提前的 MATCH，后面的规则不会生效";
+                        }
+                        break;
+                    }
+                }
+            }
+
             return st;
         }
 
@@ -499,13 +1021,21 @@ namespace ProxyPicker.Core
         {
             var outcome = new ReconnectOutcome();
             if (snap == null) return outcome;
-            foreach (var id in snap.Ids)
-            {
-                outcome.Attempted++;
-                var r = Mihomo.DeleteConnection(id);
-                if (r.Ok || r.Status == 404) outcome.Closed++;
-                else outcome.Failed++;
-            }
+            // 复审 F-17：以前逐条串行、每条 5 秒超时，改动 20 个软件时能卡到分钟级。
+            // 现在 4 路并发、单条 2.5 秒；最坏耗时从 N×5s 降到 ceil(N/4)×2.5s。
+            int attempted = 0, closed = 0, failed = 0;
+            System.Threading.Tasks.Parallel.ForEach(snap.Ids,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 4 },
+                id =>
+                {
+                    System.Threading.Interlocked.Increment(ref attempted);
+                    var r = Mihomo.DeleteConnection(id, 2500);
+                    if (r.Ok || r.Status == 404) System.Threading.Interlocked.Increment(ref closed);
+                    else System.Threading.Interlocked.Increment(ref failed);
+                });
+            outcome.Attempted = attempted;
+            outcome.Closed = closed;
+            outcome.Failed = failed;
             return outcome;
         }
 

@@ -13,13 +13,29 @@ namespace ProxyPicker.UI
         public string Description = "";
         public string Path = "";
         public string Alias = "";      // 已安装扫描到的显示名，仅用于搜索匹配
+        /// <summary>同名 exe 出现在多个不同路径：勾一个会连带命中另一个，必须提示。</summary>
+        public bool NameConflict;
+        public List<string> AllPaths = new List<string>();
+        /// <summary>同一安装目录里也在运行的其它 exe，可一键一起勾上。</summary>
+        public List<string> Peers = new List<string>();
         public int Running;
         public bool Proxy;
         public bool Known;
+        /// <summary>名单里手改的策略（DIRECT / 某个组名）；空 = 没写过。保存时要原样带回去。</summary>
+        public string Policy = "";
         public bool Common;
         public float Anim;
         public int Usage;
         public long LastUsed;
+
+        /// <summary>
+        /// 覆盖状态：0 未知/不显示，1 内核看得到（规则真的作用在它身上），
+        /// 2 内核看不到（进程在跑，但流量没进内核，当前底座下勾了也白勾）。
+        /// </summary>
+        public int Coverage;
+
+        /// 悬停高亮的渐入量（0~1）。以前是瞬间切换，鼠标扫过时整行"啪"一下亮起来。
+        public float Hover;
     }
 
     internal sealed class ReorderEventArgs : EventArgs
@@ -146,8 +162,9 @@ namespace ProxyPicker.UI
         {
             bool need = false;
 
-            foreach (var r in _rows)
+            for (int i = 0; i < _rows.Count; i++)
             {
+                var r = _rows[i];
                 float target = r.Proxy ? 1f : 0f;
                 if (Math.Abs(r.Anim - target) < 0.02f)
                 {
@@ -156,6 +173,18 @@ namespace ProxyPicker.UI
                 else
                 {
                     r.Anim += (target - r.Anim) * 0.38f;
+                    need = true;
+                }
+
+                // 悬停/选中高亮的渐入渐出：目标和值对齐后才停表
+                float hTarget = (i == _hover || i == _sel) ? 1f : 0f;
+                if (Math.Abs(r.Hover - hTarget) < 0.01f)
+                {
+                    if (r.Hover != hTarget) { r.Hover = hTarget; need = true; }
+                }
+                else
+                {
+                    r.Hover += (hTarget - r.Hover) * 0.26f;
                     need = true;
                 }
             }
@@ -284,9 +313,10 @@ namespace ProxyPicker.UI
                 using (var p = Theme.RoundRect(row, 8f))
                     g.FillPath(b, p);
             }
-            if (index == _hover || index == _sel)
+            float hv = r.Hover * (index == _sel ? 1f : 0.85f);
+            if (hv > 0.01f)
             {
-                using (var b = new SolidBrush(Alpha(Theme.Hover, index == _sel ? enterA * 1f : enterA * 0.85f)))
+                using (var b = new SolidBrush(Alpha(Theme.Hover, enterA * hv)))
                 using (var p = Theme.RoundRect(row, 8f))
                     g.FillPath(b, p);
             }
@@ -307,18 +337,22 @@ namespace ProxyPicker.UI
 
             float x = sw.Right + 14;
             bool showState = r.Running > 0;
-            float rightW = showState ? 66f : 16f;
+            float rightW = showState ? (r.Coverage == 2 ? 78f : 66f) : 16f;
             var nameRect = new RectangleF(x, row.Y + 7, row.Width - (x - row.X) - rightW - 14, 20);
             Draw.Text(g, r.Name, _fName, Alpha(Theme.Fg, enterA), nameRect);
 
             if (showState)
             {
-                // 绿点 + 数量，比「运行中 · 3」更轻
+                // 绿点 = 内核真的看得到它；橙点 = 进程在跑但流量没进内核，勾了也没用。
+                // 以前只有「运行中」一种状态，系统代理模式下会让人以为配置生效了。
+                bool blind = r.Coverage == 2;
+                Color tone = blind ? Theme.Warn : Theme.Ok;
+                string label = blind ? "没走代理" : (r.Running > 1 ? r.Running + " 个" : "运行中");
                 float dotY = row.Y + 16;
-                using (var b = new SolidBrush(Alpha(Theme.Ok, enterA)))
-                    g.FillEllipse(b, row.Right - 54, dotY, 5f, 5f);
-                Draw.Text(g, r.Running > 1 ? r.Running + " 个" : "运行中", _fTag, Alpha(Theme.Ok, enterA),
-                    new RectangleF(row.Right - 46, row.Y + 8, 38, 17), Draw.Right);
+                using (var b = new SolidBrush(Alpha(tone, enterA)))
+                    g.FillEllipse(b, row.Right - (blind ? 66 : 54), dotY, 5f, 5f);
+                Draw.Text(g, label, _fTag, Alpha(tone, enterA),
+                    new RectangleF(row.Right - (blind ? 58 : 46), row.Y + 8, blind ? 56 : 38, 17), Draw.Right);
             }
 
             var subRect = new RectangleF(x, row.Y + 29, row.Width - (x - row.X) - 30, 17);
@@ -403,6 +437,7 @@ namespace ProxyPicker.UI
                 }
                 else _tip.Hide(this);
                 Invalidate();
+                Wake();   // 高亮是渐入的，得让动画表跑起来
             }
             Cursor = idx >= 0 ? Cursors.Hand : Cursors.Default;
         }
@@ -419,6 +454,7 @@ namespace ProxyPicker.UI
                 {
                     _sel = idx;
                     Invalidate();
+                    Wake();
                     ContextRequested(this, new RowEventArgs { Row = _rows[idx], Screen = PointToScreen(e.Location) });
                 }
                 return;
@@ -432,6 +468,7 @@ namespace ProxyPicker.UI
             _drag = false;
             if (_pressed) Capture = true;
             Invalidate();
+            Wake();
         }
 
         protected override void OnMouseUp(MouseEventArgs e)

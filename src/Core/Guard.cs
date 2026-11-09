@@ -24,15 +24,32 @@ namespace ProxyPicker.Core
             public int RuleCount;
             public int ProcessRules;
             public readonly List<string> Missing = new List<string>();
+            /// <summary>目录规则（PROCESS-PATH-REGEX）里没在内核中找到的条数。</summary>
+            public int MissingPathRules;
             public bool ViaRuleSet;        // 名单是靠老的 RULE-SET provider 生效的
             public bool HeadShortCircuit;  // 规则段中间出现 MATCH，后面的规则永远走不到
             public int MatchIndex = -1;    // 第一条 MATCH 的位置（-1 = 没有）
+            public int LastProcessIndex = -1; // 最后一条 PROCESS-NAME 的位置
+            public bool FirstRuleIsMatch;   // 第一条规则就是 MATCH（空名单白名单模式）
             public bool Ipv6On;            // 内核开着 IPv6 = 流量可以从物理网卡直出
             public string FindProcess = "";
+            public string Mode = "";
             public string Policy = "";
+            /// <summary>内核里的规则存在、但策略与名单不一致的条数。</summary>
+            public int WrongPolicy;
+            public readonly List<string> WrongPolicyNames = new List<string>();
         }
 
         public static Intent Audit(IEnumerable<string> wanted)
+        {
+            return Audit(wanted, null);
+        }
+
+        /// <summary>
+        /// policies：名单里每条的名字 → 期望策略。只有显式写了 DIRECT / 组名时才核对；
+        /// PP-FIXED 的目标要运行时才知道，交给 Apply 的回读，不在这里猜。
+        /// </summary>
+        public static Intent Audit(IEnumerable<string> wanted, Dictionary<string, string> policies)
         {
             var it = new Intent();
             var cfg = Mihomo.GetJson("/configs", 6000);
@@ -40,21 +57,30 @@ namespace ProxyPicker.Core
 
             it.Ipv6On = Json.Bool(cfg, "ipv6", false);
             it.FindProcess = Json.Str(cfg, "find-process-mode") ?? "";
+            it.Mode = Json.Str(cfg, "mode") ?? "";
 
             var rules = Profile.ReadRules();
             it.RuleCount = rules.Count;
             if (rules.Count == 0) { it.Error = "内核没有返回规则表"; return it; }
             it.Ok = true;
+            it.FirstRuleIsMatch = rules[0].Type != null &&
+                rules[0].Type.Equals("Match", StringComparison.OrdinalIgnoreCase);
 
             var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var presentPolicy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < rules.Count; i++)
             {
                 var r = rules[i];
                 string type = r.Type ?? "";
-                if (type.Equals("ProcessName", StringComparison.OrdinalIgnoreCase))
+                // PROCESS-NAME / PROCESS-PATH / PROCESS-PATH-REGEX 都算「按进程分流」，
+                // 目录规则的目的是把辅助进程一起包含进来，不能在对账时被当成不存在。
+                if (type.StartsWith("Process", StringComparison.OrdinalIgnoreCase))
                 {
                     it.ProcessRules++;
+                    it.LastProcessIndex = i;
                     if (!string.IsNullOrEmpty(r.Payload)) present.Add(r.Payload);
+                    if (!string.IsNullOrEmpty(r.Payload) && !string.IsNullOrEmpty(r.Proxy))
+                        presentPolicy[r.Payload] = r.Proxy;
                     if (!string.IsNullOrEmpty(r.Proxy)) it.Policy = r.Proxy;
                 }
                 else if (type.Equals("RuleSet", StringComparison.OrdinalIgnoreCase) &&
@@ -76,9 +102,31 @@ namespace ProxyPicker.Core
             {
                 foreach (var exe in wanted)
                 {
-                    string name = Profile.Normalize(exe);
+                    string raw = (exe ?? "").Trim();
+                    if (raw.Length == 0) continue;
+                    // 目录规则按原样比对：它是正则，不能走「补 .exe」的名字归一化。
+                    if (raw.StartsWith("(?", StringComparison.Ordinal) || raw.IndexOf('\\') >= 0)
+                    {
+                        if (!present.Contains(raw)) it.MissingPathRules++;
+                        continue;
+                    }
+                    string name = Profile.Normalize(raw);
                     if (name.Length == 0) continue;
-                    if (!present.Contains(name)) it.Missing.Add(name);
+                    if (!present.Contains(name)) { it.Missing.Add(name); continue; }
+                    // 规则在，但策略被改成了别的（例如期望 DIRECT，实际走了代理组）。
+                    string expect;
+                    if (policies != null && policies.TryGetValue(name, out expect) &&
+                        !string.IsNullOrEmpty(expect) &&
+                        !expect.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string actual;
+                        if (presentPolicy.TryGetValue(name, out actual) &&
+                            !actual.Equals(expect, StringComparison.OrdinalIgnoreCase))
+                        {
+                            it.WrongPolicy++;
+                            if (it.WrongPolicyNames.Count < 5) it.WrongPolicyNames.Add(name);
+                        }
+                    }
                 }
             }
             return it;
@@ -92,44 +140,95 @@ namespace ProxyPicker.Core
         /// </summary>
         public static string Judge(Intent it, int wantedCount, bool patchOnly)
         {
-            if (it == null || !it.Ok || wantedCount <= 0) return null;
+            if (it == null || !it.Ok) return null;
+
+            // 前置条件：全局模式或关掉进程识别时，规则根本不参与匹配（评审 R1-7 / R3-5）。
+            if (!string.IsNullOrEmpty(it.Mode) && !it.Mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
+                return "客户端当前是 " + it.Mode + " 模式，规则不生效；请切回规则模式";
+            if (!string.IsNullOrEmpty(it.FindProcess) &&
+                !it.FindProcess.Equals("always", StringComparison.OrdinalIgnoreCase))
+                return "进程识别未开启（find-process-mode=" + it.FindProcess + "）";
 
             if (patchOnly)
             {
                 // 「只改勾的」本该保留订阅的全部规则；段首那条 MATCH 会把它们全挡死。
-                if (it.HeadShortCircuit && it.RuleCount > 2)
+                // 不能加 RuleCount > 2 的阈值：只有 [MATCH, PROCESS] 两条时它照样短路（复审 F-07）。
+                if (it.HeadShortCircuit)
                     return "配置里有一条提前的 MATCH，把订阅规则挡住了";
-                if (!it.ViaRuleSet && it.ProcessRules == 0)
+                if (wantedCount > 0 && !it.ViaRuleSet && it.ProcessRules == 0)
                     return "勾选的 " + wantedCount + " 条规则一条都不在内核里";
                 if (it.Missing.Count > 0)
-                    return "有 " + it.Missing.Count + " 个软件不在生效名单里";
+                    return "有 " + it.Missing.Count + " 个软件不在生效名单里：" + Sample(it.Missing);
+                if (it.WrongPolicy > 0)
+                    return "有 " + it.WrongPolicy + " 条规则的策略被改了：" + Sample(it.WrongPolicyNames);
+                if (it.MissingPathRules > 0)
+                    return "有 " + it.MissingPathRules + " 条软件目录规则没生效";
                 return null;
             }
 
-            // 「完全接管」下，名单要么是内联的 PROCESS-NAME，要么是老的 RULE-SET provider。
-            if (it.ViaRuleSet) return null;
-            if (it.ProcessRules == 0) return "勾选的 " + wantedCount + " 条规则一条都不在内核里";
-            if (it.Missing.Count > 0) return "有 " + it.Missing.Count + " 个软件不在生效名单里";
+            // 「完全接管」下必须是内联 PROCESS-NAME：残留的旧 RULE-SET provider 不能
+            // 当作「已生效」直接放行，后面的缺项 / MATCH 顺序 / 空名单校验都要跑完（复审 P2）。
+            if (wantedCount > 0 && it.ProcessRules == 0)
+                return "勾选的 " + wantedCount + " 条规则一条都不在内核里";
+            if (it.Missing.Count > 0) return "有 " + it.Missing.Count + " 个软件不在生效名单里：" + Sample(it.Missing);
+            if (it.WrongPolicy > 0)
+                return "有 " + it.WrongPolicy + " 条规则的策略被改了：" + Sample(it.WrongPolicyNames);
+            if (it.MissingPathRules > 0) return "有 " + it.MissingPathRules + " 条软件目录规则没生效";
+            // 空名单也要校验：白名单模式下第一条必须是直连兜底（评审 R3-5）。
+            if (wantedCount == 0 && !it.FirstRuleIsMatch) return "空名单下缺少直连兜底";
+            // 短路 MATCH 必须在所有 PROCESS-NAME 之后，否则勾了也直连。
+            if (it.MatchIndex >= 0 && it.MatchIndex <= it.LastProcessIndex)
+                return "直连兜底排在勾选规则前面";
             return null;
         }
 
+        /// <summary>只报数量用户没法行动；附前三个名字，至少知道先看哪个。</summary>
+        static string Sample(List<string> names)
+        {
+            if (names == null || names.Count == 0) return "";
+            string s = "";
+            for (int i = 0; i < names.Count && i < 3; i++)
+            {
+                if (s.Length > 0) s += "、";
+                s += names[i];
+            }
+            if (names.Count > 3) s += " 等";
+            return s;
+        }
+
+        /// <summary>只有用户主动开启「IPv6 防泄漏」时才会调用；默认路径不再碰这个键。</summary>
+        public static string EnsureIpv6Off(string yaml) { return SetIpv6(yaml, "false"); }
+
         /// <summary>
-        /// 把 ipv6: false 写进要推给内核的配置。
-        /// 只动顶层键，不碰 tun / dns 下面的同名项；已经关着就原样返回，保证幂等。
+        /// 关掉「IPv6 防泄漏」时把配置推回开启前的样子。
+        /// 没记过原值就原样返回 —— 宁可少动，也不要凭猜测改用户的全局设置。
         /// </summary>
-        public static string EnsureIpv6Off(string yaml)
+        public static string RestoreIpv6(string yaml, string original)
+        {
+            if (string.IsNullOrEmpty(original)) return yaml;
+            return SetIpv6(yaml, original);
+        }
+
+        /// <summary>
+        /// 设置顶层 ipv6 键。value 取 "true" / "false" / "absent"（删掉这一行）。
+        /// 只动顶层键，不碰 tun / dns 下面缩进的同名项；重复调用结果不变。
+        /// </summary>
+        public static string SetIpv6(string yaml, string value)
         {
             if (string.IsNullOrEmpty(yaml)) return yaml;
-            var lines = yaml.Replace("\r\n", "\n").Split('\n');
+            if (value != "true" && value != "false" && value != "absent") return yaml;
+            var list = new List<string>(yaml.Replace("\r\n", "\n").Split('\n'));
 
-            for (int i = 0; i < lines.Length; i++)
-                if (lines[i].StartsWith("ipv6:", StringComparison.Ordinal))
-                {
-                    lines[i] = "ipv6: false";
-                    return string.Join("\n", lines);
-                }
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (!list[i].StartsWith("ipv6:", StringComparison.Ordinal)) continue;
+                if (value == "absent") list.RemoveAt(i);
+                else list[i] = "ipv6: " + value;
+                return string.Join("\n", list);
+            }
 
-            var list = new List<string>(lines);
+            if (value == "absent") return string.Join("\n", list);
+
             int at = -1;
             for (int i = 0; i < list.Count; i++)
                 if (list[i].StartsWith("mode:", StringComparison.Ordinal)) { at = i + 1; break; }
@@ -140,11 +239,22 @@ namespace ProxyPicker.Core
                 int first = 0;
                 while (first < list.Count && (list[first].Trim().Length == 0 || list[first].TrimStart().StartsWith("#", StringComparison.Ordinal)))
                     first++;
-                list.Insert(first, "ipv6: false");
+                at = first;
             }
-            else list.Insert(at, "ipv6: false");
-
+            list.Insert(at, "ipv6: " + value);
             return string.Join("\n", list);
+        }
+
+        /// <summary>读顶层 ipv6 键，给自检用；没有这一行返回 "absent"。</summary>
+        public static string Ipv6Value(string yaml)
+        {
+            foreach (var line in (yaml ?? "").Replace("\r\n", "\n").Split('\n'))
+            {
+                if (!line.StartsWith("ipv6:", StringComparison.Ordinal)) continue;
+                string v = line.Substring(5).Trim().ToLowerInvariant();
+                return v == "true" || v == "false" ? v : "absent";
+            }
+            return "absent";
         }
 
         /// <summary>一句话摘要，供状态栏和诊断使用。</summary>

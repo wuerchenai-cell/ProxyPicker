@@ -19,6 +19,14 @@ namespace ProxyPicker.UI
         /// <summary>DPI 缩放因子（125% 屏 = 1.25）。绘制时统一 ScaleTransform，坐标按 96dpi 逻辑像素写。</summary>
         public static float S { get; private set; }
 
+        /// <summary>窗口被拖到另一块不同 DPI 的屏幕时，按新 DPI 重新计算缩放与字体。</summary>
+        public static void SetScale(float s)
+        {
+            if (s < 1f) s = 1f;
+            if (s > 2.5f) s = 2.5f;
+            S = s;
+        }
+
         [DllImport("user32.dll")]
         static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref int pvParam, uint fWinIni);
 

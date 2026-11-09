@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- 目标 .NET Framework 4.8：Windows 10/11 自带，换机不用装运行时，编译产物约 20 KB -->
+    <!-- 目标 .NET Framework 4.8：Windows 10/11 自带，换机不用装运行时，单 exe 约 900 KB -->
     <OutputType>WinExe</OutputType>
     <TargetFramework>net48</TargetFramework>
     <LangVersion>latest</LangVersion>
@@ -18,12 +18,14 @@
     <Product>ProxyPicker</Product>
     <AssemblyTitle>ProxyPicker</AssemblyTitle>
     <Company>ProxyPicker</Company>
-    <Version>1.0.0</Version>
+    <Version>1.2.4</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
+    <!-- 只用来读内核进程的命令行（-d 数据目录），换机时靠它找到非常规安装位置 -->
+    <Reference Include="System.Management" />
     <EmbeddedResource Include="Assets\ProxyPicker.ico" />
   </ItemGroup>
 

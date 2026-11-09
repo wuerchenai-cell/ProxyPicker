@@ -16,6 +16,8 @@ namespace ProxyPicker
         [STAThread]
         static void Main(string[] args)
         {
+            // 命令行帮助里有中文；控制台按 UTF-8 输出，避免中文变问号 / 乱码。
+            try { Console.OutputEncoding = Encoding.UTF8; } catch { }
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += (s, e) => CrashLog.Report(e.Exception, "界面未处理异常", false);
             AppDomain.CurrentDomain.UnhandledException += (s, e) =>
@@ -36,12 +38,126 @@ namespace ProxyPicker
             Environment.ExitCode = 1;
             CrashLog.Write(ex, "命令行执行失败");
             if (string.IsNullOrEmpty(output)) return;
-            try { File.WriteAllText(output + ".err", ex.ToString(), new UTF8Encoding(false)); }
+            // 第四个会落盘的入口也要脱敏，避免 .err 文件被贴出去时带出本机路径（复审 P3）。
+            try { File.WriteAllText(output + ".err", Core.Redactor.Apply(ex.ToString()), new UTF8Encoding(false)); }
             catch (Exception writeError) { CrashLog.Write(writeError, "写命令行错误文件失败"); }
+        }
+
+        /// <summary>认识的开关白名单；拼错时不能悄悄打开图形界面（复审 P3）。</summary>
+        const string KnownFlags = "|--scan|--dryrun|--payload|--apply|--restore|--list|--checkupdate|--version|--selftest|--raw|--pipes|--api|--audit|--diag|--cleanlegacy|";
+
+        /// <summary>各命令行开关至少需要几个参数（含开关本身）。</summary>
+        static int MinArgs(string flag)
+        {
+            switch (flag)
+            {
+                case "--dryrun":
+                case "--api": return 3;
+                case "--raw": return 4;
+                case "--apply": return 3;   // 必须是 --apply <输出文件> --yes
+                default: return 2;
+            }
         }
 
         static void Run(string[] args)
         {
+            // 开关统一小写：以前 --Apply 能通过合法性检查，却因为后面按大小写比较
+            // 直接落到 GUI，脚本拿到 exit 0 以为执行了（复审 F-20）。
+            if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal))
+                args[0] = args[0].ToLowerInvariant();
+
+            // --apply 少了 --yes：以前被下面「参数不足」的通用校验先拦下，
+            // 脚本只拿到一段用法文字、拿不到结果文件。现在先给它一个明确的 ok=False。
+            if (args.Length >= 2 && args[0] == "--apply")
+            {
+                bool okFlag = false;
+                foreach (var a in args) if (a.Equals("--yes", StringComparison.OrdinalIgnoreCase)) okFlag = true;
+                if (!okFlag)
+                {
+                    try
+                    {
+                        System.IO.File.WriteAllText(args[1],
+                            "ok=False\nmsg=--apply 会真实修改客户端分流，请加 --yes 确认后再执行\n",
+                            new System.Text.UTF8Encoding(false));
+                    }
+                    catch { }
+                    Console.Error.WriteLine("--apply 需要 --yes 确认");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+            }
+
+            // 所有命令行开关都必须带输出文件：只敲 --selftest 时不能悄悄打开图形界面，
+            // 否则脚本会误以为「自检跑了且通过」（评审 R1-9）。
+            if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal) && args[0] != "--tray")
+            {
+                int need = MinArgs(args[0]);
+                bool known = KnownFlags.IndexOf("|" + args[0] + "|", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool outputIsOption = args.Length >= 2 && args[1].StartsWith("--", StringComparison.Ordinal);
+                if (!known || args.Length < need || outputIsOption)
+                {
+                    Console.Error.WriteLine("参数不合法或不足：ProxyPicker.exe " + args[0] +
+                        " 需要 " + (need - 1) + " 个参数（第 1 个必须是输出文件路径）");
+                    Console.Error.WriteLine("示例：ProxyPicker.exe --selftest selftest.txt");
+                    Console.Error.WriteLine("可用开关：" + KnownFlags.Replace("|", " ").Trim());
+                    Console.Error.WriteLine("说明：--apply 还会真实修改客户端分流，必须写成 --apply 结果.txt --yes。");
+                    Environment.ExitCode = 1;
+                    return;
+                }
+            }
+
+            // 进程识别排查：只读列出每个 exe 的完整路径、同名冲突和同目录相关进程。
+            // 用法：--scan <输出.txt>。不结束、不重启任何进程，不改任何配置。
+            if (args.Length >= 2 && args[0] == "--scan")
+            {
+                var procs = Core.Scanner.Scan();
+                var scan = new StringBuilder();
+                scan.AppendLine("进程识别摘要 · 共 " + procs.Count + " 种 exe");
+                int conflicts = 0, withPeers = 0;
+                foreach (var kv in procs)
+                {
+                    var p = kv.Value;
+                    if (p.NameConflict) conflicts++;
+                    if (p.DirPeers.Count > 0) withPeers++;
+                    scan.AppendLine(kv.Key + "  进程 " + p.Count + " · 路径 " + p.AllPaths.Count
+                        + " · 相关 " + string.Join(",", p.DirPeers.ToArray())
+                        + (p.TreePeers.Count > 0 ? " · 安装目录内 " + string.Join(",", p.TreePeers.ToArray()) : ""));
+                    foreach (string path in p.AllPaths) scan.AppendLine("    " + path);
+                }
+                scan.AppendLine();
+                scan.AppendLine("同名冲突 " + conflicts + " 个 · 有同目录相关进程 " + withPeers + " 个");
+                File.WriteAllText(args[1], Core.Redactor.Apply(scan.ToString()), new UTF8Encoding(false));
+                return;
+            }
+
+            // 旧版 profile 注入检测 / 清理：只处理带 ProxyPicker 明确标记的扩展，先备份再删。
+            // 用法：--cleanlegacy <输出.txt> [--yes]。
+            if (args.Length >= 2 && args[0] == "--cleanlegacy")
+            {
+                try
+                {
+                    bool yes = false;
+                    foreach (var a in args) if (a.Equals("--yes", StringComparison.OrdinalIgnoreCase)) yes = true;
+                    System.Collections.Generic.List<Core.LegacyCleanup.Hit> hits;
+                    string report = Core.LegacyCleanup.Report(out hits);
+                    string result;
+                    if (!yes)
+                    {
+                        result = report + "\n未加 --yes：只检测，没有改动任何文件。";
+                    }
+                    else
+                    {
+                        string msg;
+                        bool ok = Core.LegacyCleanup.Clean(out msg);
+                        result = report + "\n清理结果：" + (ok ? "成功" : "失败") + " · " + msg;
+                        if (!ok) Environment.ExitCode = 1;
+                    }
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(result), new System.Text.UTF8Encoding(false));
+                }
+                catch (Exception ex) { CliFailure(args[1], ex); }
+                return;
+            }
+
             // 自检出口：拿「别人电脑上的配置」试跑一次规则生成，看会不会用错策略组。
             // 用法：--dryrun <输入.yaml> <输出.yaml>。只读输入，不碰本机任何配置。
             if (args.Length >= 3 && args[0] == "--dryrun")
@@ -64,8 +180,9 @@ namespace ProxyPicker
                     System.IO.File.WriteAllText(args[2] + ".info",
                         "策略组共 " + groups.Count + " 个：" + string.Join(" | ", groups.ToArray()) + "\n" +
                         "选中策略：" + policy + (reused ? "（复用了已有的 PP-FIXED）" : "（自动挑的）") + "\n" +
-                        "分流模式：" + (patch ? "只改勾的（原规则保留）" : "完全接管（原规则让位）") + "\n" +
-                        "输出长度：" + payload.Length + "\n",
+                        "分流模式：" + (patch ? "订阅兼容（原规则保留）" : "代理白名单（其余直连）") + "\n" +
+                        "输出长度：" + payload.Length + "\n" +
+                        "注意：输出是完整配置，可能含 secret / 订阅地址，不要公开分享。\n",
                         new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
@@ -84,6 +201,10 @@ namespace ProxyPicker
                     var items = Core.Profile.Load();
                     string payload = Core.Profile.BuildPayload(Core.Paths.ClashYaml, items);
                     System.IO.File.WriteAllText(args[1], payload, new System.Text.UTF8Encoding(false));
+                    // 这是完整配置，可能含控制密钥和订阅地址；不能当成可公开的诊断文件。
+                    System.IO.File.WriteAllText(args[1] + ".info",
+                        "注意：本文件是完整配置（用于逐字节比对），可能含 secret / 订阅地址，不要公开分享。\n",
+                        new System.Text.UTF8Encoding(false));
                     System.Console.Out.Write("items=" + items.Count + " chars=" + payload.Length);
                 }
                 catch (Exception ex)
@@ -97,16 +218,42 @@ namespace ProxyPicker
             // 幂等：名单不变时结果与现状一致，用于验证 C# 侧链路。
             if (args.Length >= 2 && args[0] == "--apply")
             {
+                // 这是唯一会改分流的命令，必须显式确认；失败要映射成非 0 退出码（评审 R1-10 / R6-7）。
+                bool confirmed = false;
+                foreach (var a in args) if (a.Equals("--yes", StringComparison.OrdinalIgnoreCase)) confirmed = true;
+                if (!confirmed)
+                {
+                    System.IO.File.WriteAllText(args[1],
+                        "ok=False\nmsg=--apply 会真实修改客户端分流，请加 --yes 确认后再执行\n",
+                        new System.Text.UTF8Encoding(false));
+                    Console.Error.WriteLine("--apply 需要 --yes 确认");
+                    Environment.ExitCode = 1;
+                    return;
+                }
                 try
                 {
+                    // 只有真正要应用/写名单时才迁移旧版名单；--list 之类的只读命令不写盘。
+                    Core.Paths.MigrateLegacyList();
                     var items = Core.Profile.Load();
+                    if (Core.Profile.LastLoadFailed)
+                        throw new InvalidOperationException(Core.Profile.LastLoadError + "；已停止 --apply，避免推送空名单");
                     var res = Core.Profile.Apply(items);
                     System.IO.File.WriteAllText(args[1],
                         "ok=" + res.Ok + "\nmsg=" + res.Message + "\nrules=" + res.RuleCount + "\nms=" + res.Ms + "\nitems=" + items.Count,
                         new System.Text.UTF8Encoding(false));
+                    if (!res.Ok) Environment.ExitCode = 1;
                 }
                 catch (Exception ex)
                 {
+                    // 即使读取阶段就失败，也要给调用方一个明确的 ok=False 结果文件，
+                    // 不能只留 .err（脚本会以为命令没跑）。
+                    try
+                    {
+                        System.IO.File.WriteAllText(args[1],
+                            "ok=False\nmsg=" + Core.Redactor.Apply(ex.Message) + "\n",
+                            new System.Text.UTF8Encoding(false));
+                    }
+                    catch { }
                     CliFailure(args[1], ex);
                 }
                 return;
@@ -151,7 +298,8 @@ namespace ProxyPicker
                             pi != null ? pi.Path : (ii != null ? ii.Path : "")
                         }));
                     }
-                    System.IO.File.WriteAllText(args[1], sb.ToString(), new System.Text.UTF8Encoding(false));
+                    // 清单里带完整安装路径（会含用户目录），同样要脱敏再落盘（第四轮自查）。
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(sb.ToString()), new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -211,7 +359,7 @@ namespace ProxyPicker
             {
                 try
                 {
-                    string result = Core.Discovery.SelfTest();
+                    string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest();
                     System.IO.File.WriteAllText(args[1], result, new System.Text.UTF8Encoding(false));
                     if (result.Contains("FAIL  ")) Environment.ExitCode = 1;
                 }
@@ -223,13 +371,28 @@ namespace ProxyPicker
             }
 
             // 自检出口：直接向内核发一次请求，把原始响应（含状态行与头部）写文件。
+            // 输出先过脱敏器（R7-5）：管道实例 ID、用户目录、节点名不随文件外泄。
             // 用法：ProxyPicker.exe --raw <输出文件> <方法> <路径>
             if (args.Length >= 4 && args[0] == "--raw")
             {
                 try
                 {
+                    // --raw 自称「只读」，但以前任何方法都能发，等于绕过 --apply --yes。
+                    // 非 GET/HEAD 必须显式 --yes，避免一条 PUT/DELETE 悄悄改内核配置。
+                    string method = (args[2] ?? "").Trim().ToUpperInvariant();
+                    bool confirmed = false;
+                    foreach (var a in args) if (a.Equals("--yes", StringComparison.OrdinalIgnoreCase)) confirmed = true;
+                    if (method != "GET" && method != "HEAD" && !confirmed)
+                    {
+                        System.IO.File.WriteAllText(args[1],
+                            "ok=False\nmsg=--raw 的 " + method + " 请求会修改内核配置，请加 --yes 确认\n",
+                            new System.Text.UTF8Encoding(false));
+                        Console.Error.WriteLine("--raw " + method + " 需要 --yes 确认");
+                        Environment.ExitCode = 1;
+                        return;
+                    }
                     var r = Core.Mihomo.RequestRaw(args[2], args[3], null, 15000);
-                    System.IO.File.WriteAllText(args[1], r, new System.Text.UTF8Encoding(false));
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(r), new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -243,8 +406,11 @@ namespace ProxyPicker
             {
                 try
                 {
-                    var all = Core.Mihomo.EnumNamedPipes();
-                    System.IO.File.WriteAllText(args[1], string.Join("\n", all.ToArray()), new System.Text.UTF8Encoding(false));
+                    var all = Core.Mihomo.EnumKernelPipes();
+                    // 只列内核相关的管道；名字末尾是这台机器的实例标识，不能原样带出去（第四轮自查）。
+                    System.IO.File.WriteAllText(args[1],
+                        Core.Redactor.MaskPipeList(string.Join("\n", all.ToArray())),
+                        new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -254,6 +420,7 @@ namespace ProxyPicker
             }
 
             // 自检出口：直接向内核发一次请求，把原始响应写文件。只读（只用 GET）。
+            // 输出先过脱敏器（R7-5）：节点名、UUID、访问主机、完整路径不外泄。
             // 用法：ProxyPicker.exe --api <输出文件> <路径>   例：--api out.json /proxies
             if (args.Length >= 3 && args[0] == "--api")
             {
@@ -261,7 +428,7 @@ namespace ProxyPicker
                 {
                     var r = Core.Mihomo.Request("GET", args[2], null, 15000);
                     string text = "status=" + r.Status + "\nms=" + r.Ms + "\nerror=" + (r.Error ?? "-") + "\n\n" + r.Body;
-                    System.IO.File.WriteAllText(args[1], text, new System.Text.UTF8Encoding(false));
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(text), new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -283,8 +450,10 @@ namespace ProxyPicker
 
                     var sb = new System.Text.StringBuilder();
                     sb.AppendLine("ProxyPicker " + typeof(Program).Assembly.GetName().Version + " 规则对账");
-                    sb.AppendLine("分流模式：" + (Core.Settings.PatchOnly ? "只改勾的" : "完全接管"));
+                    sb.AppendLine("分流模式：" + (Core.Settings.PatchOnly ? "订阅兼容" : "代理白名单"));
                     sb.AppendLine("名单条数：" + wanted.Count);
+                    if (Core.Profile.LastSkippedLines > 0)
+                        sb.AppendLine("名单告警：" + Core.Profile.LastSkippedLines + " 行无法解析，已跳过（请检查名单文件 payload: 列表格式）");
                     if (a.Error != null) sb.AppendLine("读内核失败：" + a.Error);
                     sb.AppendLine("内核规则：" + a.RuleCount + " 条（内联 PROCESS-NAME " + a.ProcessRules + " 条）");
                     sb.AppendLine("生效形态：" + (a.ProcessRules > 0
@@ -292,9 +461,10 @@ namespace ProxyPicker
                         : (a.ViaRuleSet ? "RULE-SET provider" : "没有")));
                     sb.AppendLine("提前的 MATCH：" + (a.HeadShortCircuit
                         ? "有，在第 " + (a.MatchIndex + 1) + " 条（共 " + a.RuleCount + " 条）"
-                          + (Core.Settings.PatchOnly ? " —— 只改勾的模式下属异常" : " —— 完全接管下按设计如此")
+                          + (Core.Settings.PatchOnly ? " —— 订阅兼容下属于异常" : " —— 代理白名单下按设计如此")
                         : "无"));
-                    sb.AppendLine("IPv6：" + (a.Ipv6On ? "开着（流量可从物理网卡直出）" : "关"));
+                    sb.AppendLine("IPv6：" + (a.Ipv6On ? "内核开着" : "内核关")
+                        + " · 防泄漏开关：" + (Core.Settings.Ipv6GuardOn ? "开（保存时写入 ipv6: false）" : "关（归客户端接管，ProxyPicker 不修改）"));
                     sb.AppendLine("find-process-mode：" + (string.IsNullOrEmpty(a.FindProcess) ? "未知" : a.FindProcess));
                     sb.AppendLine("不在生效名单里的：" + (a.Missing.Count == 0 ? "无" : string.Join("、", a.Missing.ToArray())));
                     sb.AppendLine("判定：" + (Core.Guard.Judge(a, wanted.Count, Core.Settings.PatchOnly) ?? "一致，不用动"));
@@ -302,7 +472,9 @@ namespace ProxyPicker
                     string recent = Core.AuditLog.Recent(20);
                     sb.Append(recent.Length == 0 ? "（暂无）\n" : recent);
 
-                    System.IO.File.WriteAllText(args[1], sb.ToString(), new System.Text.UTF8Encoding(false));
+                    // 文档承诺 --audit 可以放心贴给能帮忙的人：最近动作里可能有异常消息，
+                    // 异常里常带本机路径，用户名不能原文带出去（第四轮自查）。
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(sb.ToString()), new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -311,12 +483,31 @@ namespace ProxyPicker
                 return;
             }
 
+            // 收尾出口：把内核里的自家规则撤掉（退出时会自动做，这里给脚本 / 不打开界面时用）。
+            // 只删自己的块，不动订阅和勾选名单，所以下次打开还是原来的选择。
+            if (args.Length >= 2 && args[0] == "--restore")
+            {
+                try
+                {
+                    string msg;
+                    bool ok = Core.Profile.LeaveNoTrace(out msg);
+                    File.WriteAllText(args[1],
+                        "ok=" + ok + "\nmsg=" + (ok ? "已撤掉内核里的规则块（IPv6 也已恢复）" : msg),
+                        new System.Text.UTF8Encoding(false));
+                    if (!ok) Environment.ExitCode = 1;
+                }
+                catch (Exception ex) { CliFailure(args[1], ex); }
+                return;
+            }
+
             // 自检出口：输出环境诊断（客户端识别、控制面、内核状态）。只读。
+            // 输出先过脱敏器（R7-4）：使用说明让用户把这份文件贴出去求助，
+            // 用户名、数据目录、管道实例 ID、节点名不能原文带出去。
             if (args.Length >= 2 && args[0] == "--diag")
             {
                 try
                 {
-                    System.IO.File.WriteAllText(args[1], Core.Discovery.Diagnose(), new System.Text.UTF8Encoding(false));
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(Core.Discovery.Diagnose()), new System.Text.UTF8Encoding(false));
                 }
                 catch (Exception ex)
                 {
@@ -404,7 +595,8 @@ namespace ProxyPicker
                     text.AppendLine(error.GetType().FullName + ": " + message);
                     text.AppendLine(error.StackTrace ?? "（异常尚未抛出，无调用栈）");
                 }
-                string entry = text.ToString();
+                // 日志可能被用户贴到 Issue：管道实例 ID、用户目录、节点名先打码（评审 R3-11）。
+                string entry = Core.Redactor.Apply(text.ToString());
                 lock (Gate)
                 {
                     return AppendFallback(Core.Paths.LogPath, () => Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "proxypicker.log"), entry);

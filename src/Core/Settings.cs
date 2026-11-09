@@ -14,8 +14,10 @@ namespace ProxyPicker.Core
     /// </summary>
     internal static class Settings
     {
-        public const string ModeWhitelist = "whitelist";   // 完全接管：不勾的一律直连，订阅原规则整段让位
-        public const string ModePatch = "patch";           // 只改勾的：在规则最前面插几行，其余原样保留
+        // 代理白名单（核心模式）：只有勾选的软件走代理，未勾选的一律直连。
+        public const string ModeWhitelist = "whitelist";
+        // 订阅兼容（高级模式）：只在规则最前面插勾选项，未勾选的继续走订阅原有规则。
+        public const string ModePatch = "patch";
 
         public sealed class Data
         {
@@ -26,10 +28,22 @@ namespace ProxyPicker.Core
             public HashSet<string> Hidden = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             public bool FirstRun = true;
             public int Tab;
-            public string Mode = ModePatch;                   // 默认只改勾的：新手/别人电脑上不破坏原有订阅
+            // 全新用户的默认模式：只有点名的软件走代理，其余直连 —— 这才是产品定位。
+            // 已有 settings.json 的用户不会被这个默认值影响，见 Load() 里的老配置兼容分支。
+            public string Mode = ModeWhitelist;
             public bool TrayHintShown;                        // 「—」的托盘气泡只弹一次
             public bool UpdateCheck = true;                   // 检查更新总开关（只发一个 GET，不带任何本机信息）
             public long UpdateCheckedAt;                      // 上次检查的 UTC ticks，0 = 从没查过
+            // IPv6 防泄漏是「用户主动开启」的高级选项，默认关。
+            // 原因：Clash Verge 新版把 ipv6 收归应用设置接管，扩展配置/推送全文里写它
+            // 会被丢弃并弹橙色警告；更不该在用户只想给微信设直连时顺手改全局。
+            public bool Ipv6Guard;
+            // 开启前记下的内核原值："" 未知 / "true" / "false" / "absent"。
+            // 关闭开关时按它把配置推回去，不把用户的原设置永久改掉。
+            public string Ipv6Original = "";
+            // 第一次保存前记下的 find-process-mode："" 未知 / "always" / "smart" / "strict" / "off" / "absent"。
+            // 退出还原必须恢复成用户原值，不能把 always 永久留下（复审 F-04）。
+            public string FindProcessOriginal = "";
         }
 
         static Data _data;
@@ -59,8 +73,67 @@ namespace ProxyPicker.Core
             {
                 Current.Mode = string.Equals(mode, ModeWhitelist, StringComparison.OrdinalIgnoreCase)
                     ? ModeWhitelist : ModePatch;
-                Save();
             }
+            Save();
+        }
+
+        public static bool Ipv6GuardOn { get { lock (Gate) return Current.Ipv6Guard; } }
+
+        /// <summary>用户主动开关「IPv6 防泄漏」。开启前先记下内核原值，关掉时才能推回去。</summary>
+        public static void SetIpv6Guard(bool on)
+        {
+            // 网络请求放在锁外：内核不响应时最多等 4 秒，不能把保存线程一起卡住（评审 N1）。
+            if (on) CaptureIpv6Original();
+            lock (Gate) { Current.Ipv6Guard = on; }
+            if (!Save()) throw new InvalidOperationException("保存 IPv6 设置失败：" + LastSaveError);
+        }
+
+        /// <summary>把「改之前」的 IPv6 状态记一次，之后不再覆盖；读不到就留空，不猜。</summary>
+        public static void CaptureIpv6Original()
+        {
+            lock (Gate) { if (!string.IsNullOrEmpty(Current.Ipv6Original)) return; }
+            string value;
+            try
+            {
+                var cfg = Mihomo.GetJson("/configs", 4000);
+                value = cfg == null ? "" : (Json.Bool(cfg, "ipv6", false) ? "true" : "false");
+            }
+            catch { value = ""; }
+            lock (Gate)
+            {
+                var d = Current;
+                if (!string.IsNullOrEmpty(d.Ipv6Original)) return;
+                d.Ipv6Original = value;
+            }
+            Save();
+        }
+
+        /// <summary>
+        /// 记下第一次保存前的 find-process-mode。读不到就留空等下次重试，
+        /// 绝不能把「读失败」记成 absent —— 那会在退出时删掉用户本来有的设置。
+        /// </summary>
+        public static void CaptureFindProcessOriginal()
+        {
+            lock (Gate) { if (!string.IsNullOrEmpty(Current.FindProcessOriginal)) return; }
+            string value = null;
+            try
+            {
+                var cfg = Mihomo.GetJson("/configs", 4000);
+                if (cfg != null)
+                {
+                    string v = Json.Str(cfg, "find-process-mode");
+                    value = string.IsNullOrEmpty(v) ? "absent" : v;
+                }
+            }
+            catch { value = null; }
+            if (value == null) return;
+            lock (Gate)
+            {
+                var d = Current;
+                if (!string.IsNullOrEmpty(d.FindProcessOriginal)) return;
+                d.FindProcessOriginal = value;
+            }
+            Save();
         }
 
         public static string FilePath
@@ -86,34 +159,56 @@ namespace ProxyPicker.Core
             }
         }
 
-        public static void Save()
+        public static string LastSaveError = "";
+
+        /// <summary>
+        /// 锁内先取一份不可变快照再序列化；UI 同时改排序/集合时不会写坏文件（评审 R6-9）。
+        /// 返回是否真的写成功，调用方可以据此提示失败，而不是假装成功。
+        /// </summary>
+        public static bool Save()
         {
             lock (Gate)
             {
-                if (_data == null) return;
+                if (_data == null) return true;
+                string temp = null;
                 try
                 {
+                    var d = _data;
+                    string sortMode = d.SortMode, mode = d.Mode, ipv6Original = d.Ipv6Original ?? "";
+                    string findProcessOriginal = d.FindProcessOriginal ?? "";
+                    int tab = d.Tab;
+                    long checkedAt = d.UpdateCheckedAt;
+                    bool firstRun = d.FirstRun, trayHint = d.TrayHintShown,
+                         updateCheck = d.UpdateCheck, ipv6Guard = d.Ipv6Guard;
+                    var order = new List<string>(d.Order);
+                    var usage = new Dictionary<string, int>(d.Usage, StringComparer.OrdinalIgnoreCase);
+                    var lastUsed = new Dictionary<string, long>(d.LastUsed, StringComparer.OrdinalIgnoreCase);
+                    var hidden = new List<string>(d.Hidden);
+
                     var sb = new StringBuilder();
                     sb.Append("{\n");
-                    sb.Append("  \"sortMode\": ").Append(Json.Quote(_data.SortMode)).Append(",\n");
-                    sb.Append("  \"mode\": ").Append(Json.Quote(_data.Mode)).Append(",\n");
-                    sb.Append("  \"tab\": ").Append(_data.Tab).Append(",\n");
-                    sb.Append("  \"firstRun\": ").Append(_data.FirstRun ? "true" : "false").Append(",\n");
-                    sb.Append("  \"trayHintShown\": ").Append(_data.TrayHintShown ? "true" : "false").Append(",\n");
-                    sb.Append("  \"updateCheck\": ").Append(_data.UpdateCheck ? "true" : "false").Append(",\n");
-                    sb.Append("  \"updateCheckedAt\": ").Append(_data.UpdateCheckedAt).Append(",\n");
+                    sb.Append("  \"sortMode\": ").Append(Json.Quote(sortMode)).Append(",\n");
+                    sb.Append("  \"mode\": ").Append(Json.Quote(mode)).Append(",\n");
+                    sb.Append("  \"tab\": ").Append(tab).Append(",\n");
+                    sb.Append("  \"firstRun\": ").Append(firstRun ? "true" : "false").Append(",\n");
+                    sb.Append("  \"trayHintShown\": ").Append(trayHint ? "true" : "false").Append(",\n");
+                    sb.Append("  \"updateCheck\": ").Append(updateCheck ? "true" : "false").Append(",\n");
+                    sb.Append("  \"updateCheckedAt\": ").Append(checkedAt).Append(",\n");
+                    sb.Append("  \"ipv6Guard\": ").Append(ipv6Guard ? "true" : "false").Append(",\n");
+                    sb.Append("  \"ipv6Original\": ").Append(Json.Quote(ipv6Original)).Append(",\n");
+                    sb.Append("  \"findProcessOriginal\": ").Append(Json.Quote(findProcessOriginal)).Append(",\n");
 
                     sb.Append("  \"order\": [");
-                    for (int i = 0; i < _data.Order.Count; i++)
+                    for (int i = 0; i < order.Count; i++)
                     {
                         if (i > 0) sb.Append(", ");
-                        sb.Append(Json.Quote(_data.Order[i]));
+                        sb.Append(Json.Quote(order[i]));
                     }
                     sb.Append("],\n");
 
                     sb.Append("  \"usage\": {");
                     int n = 0;
-                    foreach (var kv in _data.Usage)
+                    foreach (var kv in usage)
                     {
                         if (n++ > 0) sb.Append(", ");
                         sb.Append(Json.Quote(kv.Key)).Append(": ").Append(kv.Value);
@@ -122,7 +217,7 @@ namespace ProxyPicker.Core
 
                     sb.Append("  \"lastUsed\": {");
                     n = 0;
-                    foreach (var kv in _data.LastUsed)
+                    foreach (var kv in lastUsed)
                     {
                         if (n++ > 0) sb.Append(", ");
                         sb.Append(Json.Quote(kv.Key)).Append(": ").Append(kv.Value);
@@ -131,7 +226,7 @@ namespace ProxyPicker.Core
 
                     sb.Append("  \"hidden\": [");
                     n = 0;
-                    foreach (var v in _data.Hidden)
+                    foreach (var v in hidden)
                     {
                         if (n++ > 0) sb.Append(", ");
                         sb.Append(Json.Quote(v));
@@ -139,24 +234,28 @@ namespace ProxyPicker.Core
                     sb.Append("]\n}\n");
 
                     string path = FilePath;
-                    string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                    try
+                    temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    byte[] bytes = new UTF8Encoding(false).GetBytes(sb.ToString());
+                    using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
-                        byte[] bytes = new UTF8Encoding(false).GetBytes(sb.ToString());
-                        using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                        {
-                            stream.Write(bytes, 0, bytes.Length);
-                            stream.Flush(true);
-                        }
-                        if (File.Exists(path)) File.Replace(temp, path, null);
-                        else File.Move(temp, path);
+                        stream.Write(bytes, 0, bytes.Length);
+                        stream.Flush(true);
                     }
-                    finally
-                    {
-                        if (File.Exists(temp)) File.Delete(temp);
-                    }
+                    if (File.Exists(path)) File.Replace(temp, path, null);
+                    else File.Move(temp, path);
+                    LastSaveError = "";
+                    return true;
                 }
-                catch (Exception ex) { CrashLog.Write(ex, "保存偏好失败"); }
+                catch (Exception ex)
+                {
+                    LastSaveError = ex.Message;
+                    CrashLog.Write(ex, "保存偏好失败");
+                    return false;
+                }
+                finally
+                {
+                    if (temp != null && File.Exists(temp)) { try { File.Delete(temp); } catch { } }
+                }
             }
         }
 
@@ -167,8 +266,8 @@ namespace ProxyPicker.Core
             string path;
             try { path = FilePath; } catch { return d; }
 
-            // 没有 settings.json = 这台电脑第一次跑（多半是朋友拿到分享包）。
-            // 这种场景下默认「只改勾的」，不去动别人订阅里原有的几百条规则。
+            // 没有 settings.json = 全新用户（多半是朋友刚拿到分享包），
+            // 用产品定位的默认模式：代理白名单，只有点名的软件走代理。
             if (!File.Exists(path)) return d;
 
             try
@@ -178,9 +277,11 @@ namespace ProxyPicker.Core
                 var root = Json.AsObject(Json.Parse(File.ReadAllText(path, Encoding.UTF8)));
                 if (root == null) throw new FormatException("偏好必须是 JSON 对象");
 
-                // 只兼容解析成功且缺 mode 的旧对象；损坏文件不能悄悄升级成完全接管。
+                // 已有配置文件才是「老用户」：缺 mode 字段是 v1.0.x 以前留下的配置，
+                // 那时默认就是订阅兼容，必须原样保持，绝不因升级悄悄改成代理白名单。
+                // 损坏文件也不能悄悄升级成完全接管 —— 直接判失败走下面的保守回退。
                 string split = Json.Str(root, "mode");
-                if (!root.ContainsKey("mode")) d.Mode = ModeWhitelist;
+                if (!root.ContainsKey("mode")) d.Mode = ModePatch;
                 else if (split == ModePatch || split == ModeWhitelist) d.Mode = split;
                 else throw new FormatException("偏好的分流模式无效");
 
@@ -194,6 +295,12 @@ namespace ProxyPicker.Core
                 if (root.TryGetValue("trayHintShown", out v) && v is bool) d.TrayHintShown = (bool)v;
                 if (root.TryGetValue("updateCheck", out v) && v is bool) d.UpdateCheck = (bool)v;
                 if (root.TryGetValue("updateCheckedAt", out v) && v is double) d.UpdateCheckedAt = (long)(double)v;
+                if (root.TryGetValue("ipv6Guard", out v) && v is bool) d.Ipv6Guard = (bool)v;
+                string ipv6Orig = Json.Str(root, "ipv6Original");
+                if (ipv6Orig == "true" || ipv6Orig == "false" || ipv6Orig == "absent") d.Ipv6Original = ipv6Orig;
+                string fpmOrig = Json.Str(root, "findProcessOriginal");
+                if (fpmOrig == "always" || fpmOrig == "smart" || fpmOrig == "strict" ||
+                    fpmOrig == "off" || fpmOrig == "absent") d.FindProcessOriginal = fpmOrig;
 
                 Dictionary<string, object> obj;
                 if (root.TryGetValue("order", out v))
@@ -233,8 +340,10 @@ namespace ProxyPicker.Core
             }
             catch (Exception ex)
             {
-                CrashLog.Write(ex, "读取偏好失败，保留原文件并使用默认值");
-                return new Data();
+                CrashLog.Write(ex, "读取偏好失败，保留原文件并使用保守默认值");
+                // 文件读坏了不能当成全新用户：那会悄悄切成代理白名单，
+                // 把用户原本所有未点名的软件全改成直连。保守回退到订阅兼容。
+                return new Data { Mode = ModePatch };
             }
             return d;
         }

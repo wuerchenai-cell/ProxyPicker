@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
@@ -218,27 +219,62 @@ namespace ProxyPicker.UI
             }
         }
 
-        /// <summary>迷你折线：两条通道的速率走势，作为摘要卡的背景装饰。</summary>
-        public static void Spark(Graphics g, float[] data, RectangleF r, Color color, float peak)
+        /// <summary>
+        /// 固定纵轴：同一个历史速率永远得到同一个高度，与当前峰值无关。
+        /// 16 MiB/s 以上封顶；对数刻度兼顾空闲时的小流量和下载时的大流量。
+        /// </summary>
+        public static float SparkHeight(float bytesPerSecond)
         {
-            if (data == null || data.Length < 2 || r.Width <= 4) return;
-            if (peak <= 0.0001f) peak = 1f;
+            const double reference = 16.0 * 1024.0 * 1024.0;
+            double v = bytesPerSecond < 0 ? 0 : bytesPerSecond;
+            double h = Math.Log(1.0 + v / 1024.0) / Math.Log(1.0 + reference / 1024.0);
+            return (float)Math.Max(0.0, Math.Min(1.0, h));
+        }
 
-            var pts = new PointF[data.Length];
-            float step = r.Width / (data.Length - 1);
-            for (int i = 0; i < data.Length; i++)
+        /// <summary>
+        /// 迷你走势图。横轴固定 1 秒一格、纵轴固定对数刻度，历史点不做二次归一化。
+        /// 只有最右边「正在形成」的一段会在两个真实样本间插值，避免每秒垂直跳一次；
+        /// 一旦它成为历史，高度和相对水平间距就固定，只随时间整体向左平移。
+        /// </summary>
+        public static void Spark(Graphics g, float[] data, long[] at, long axis, long periodMs, int slots,
+            RectangleF r, Color color, float pulse = 0f)
+        {
+            if (data == null || at == null || data.Length < 2 || at.Length != data.Length) return;
+            if (r.Width <= 4 || slots < 2) return;
+            if (periodMs < 200) periodMs = 1000;
+
+            float step = r.Width / (slots - 1);
+            float pxPerMs = step / periodMs;
+            int n = data.Length;
+            var heights = new float[n];
+            for (int i = 0; i < n; i++) heights[i] = SparkHeight(data[i]);
+
+            // 新样本刚到达时先从上一个高度出发，在一个固定采样周期内平滑到位。
+            // 只改最新点；倒数第二个及更早的历史点绝不参与这份插值。
+            long age = axis - at[n - 1];
+            float t = age <= 0 ? 0f : age >= periodMs ? 1f : age / (float)periodMs;
+            heights[n - 1] = heights[n - 2] + (heights[n - 1] - heights[n - 2]) * t;
+
+            var pts = new List<PointF>(n + 1);
+            for (int i = 0; i < n; i++)
             {
-                float v = data[i] < 0 ? 0 : data[i];
-                float h = (float)Math.Log(1 + v / peak * 9.0) / 2.302585f; // log 压缩，小流量也看得见
-                if (h > 1f) h = 1f;
-                pts[i] = new PointF(r.X + step * i, r.Bottom - 1.5f - h * (r.Height - 3f));
+                float x = r.Right - (axis - at[i]) * pxPerMs;
+                if (x < r.X - step) continue;
+                if (x > r.Right) x = r.Right;
+                pts.Add(new PointF(x, r.Bottom - 1.5f - heights[i] * (r.Height - 3f)));
             }
+            if (pts.Count < 2) return;
 
+            var head = pts[pts.Count - 1];
+            if (head.X < r.Right - 0.5f) pts.Add(new PointF(r.Right, head.Y));
+
+            var state = g.Save();
+            g.SetClip(r);
             using (var path = new GraphicsPath())
             {
-                path.AddLines(pts);
+                path.AddLines(pts.ToArray());
                 var fill = (GraphicsPath)path.Clone();
-                fill.AddLine(pts[pts.Length - 1].X, r.Bottom, r.X, r.Bottom);
+                fill.AddLine(r.Right, r.Bottom, pts[0].X, r.Bottom);
                 fill.CloseFigure();
                 using (var b = new LinearGradientBrush(r,
                     Color.FromArgb(52, color), Color.FromArgb(0, color), 90f))
@@ -251,9 +287,19 @@ namespace ProxyPicker.UI
                     g.DrawPath(pen, path);
                 }
             }
+            g.Restore(state);
 
+            if (pulse > 0.01f)
+            {
+                float k = pulse > 1f ? 1f : pulse;
+                float rad = 2.6f + (1f - k) * 6.5f;
+                int alpha = (int)(95 * k * k);
+                if (alpha > 2)
+                    using (var pen = new Pen(Color.FromArgb(alpha, color), 1.1f))
+                        g.DrawEllipse(pen, head.X - rad, head.Y - rad, rad * 2f, rad * 2f);
+            }
             using (var b = new SolidBrush(Color.FromArgb(190, color)))
-                g.FillEllipse(b, pts[pts.Length - 1].X - 1.8f, pts[pts.Length - 1].Y - 1.8f, 3.6f, 3.6f);
+                g.FillEllipse(b, head.X - 1.8f, head.Y - 1.8f, 3.6f, 3.6f);
         }
 
         /// <summary>拖动排序的抓手（悬停时才显示，暗示「这行能拖」）。</summary>

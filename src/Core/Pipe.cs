@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
@@ -17,7 +18,14 @@ namespace ProxyPicker.Core
         const uint GENERIC_READ = 0x80000000;
         const uint GENERIC_WRITE = 0x40000000;
         const uint OPEN_EXISTING = 3;
+        const int MaxResponseBytes = 16 * 1024 * 1024;
         static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        // 整个「连接 -> 写 -> 读」共用一个总时限，避免服务端不读大配置时长期卡住（评审 R6-6）。
+        readonly Stopwatch _clock = Stopwatch.StartNew();
+        int _deadlineMs = 15000;
+        public void SetDeadline(int ms) { _deadlineMs = Math.Max(1000, ms); }
+        long RemainingMs { get { long left = _deadlineMs - _clock.ElapsedMilliseconds; return left > 0 ? left : 0; } }
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
@@ -34,7 +42,24 @@ namespace ProxyPicker.Core
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool CloseHandle(IntPtr hObject);
 
+        // Windows Vista 起可用：从已连接的客户端句柄反查「管道服务端」的 PID。
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetNamedPipeServerProcessId(IntPtr hNamedPipe, out uint serverProcessId);
+
         IntPtr _h = InvalidHandle;
+
+        /// <summary>管道另一端的进程 ID；拿不到就抛错，调用方必须停止发送 Secret。</summary>
+        public int ServerProcessId
+        {
+            get
+            {
+                uint pid;
+                if (!GetNamedPipeServerProcessId(_h, out pid))
+                    throw new IOException("读取管道服务端 PID 失败（Win32 错误 " +
+                        Marshal.GetLastWin32Error() + "）");
+                return (int)pid;
+            }
+        }
 
         public static PipeConnection Open(string pipeFullName)
         {
@@ -53,6 +78,8 @@ namespace ProxyPicker.Core
             int offset = 0;
             while (offset < data.Length)
             {
+                if (RemainingMs <= 0)
+                    throw new TimeoutException("控制管道写入超过总时限（" + _deadlineMs + " ms）");
                 int remain = data.Length - offset;
                 byte[] chunk;
                 if (offset == 0)
@@ -72,7 +99,7 @@ namespace ProxyPicker.Core
             }
         }
 
-        /// <summary>读到对方关闭为止；超时会关句柄让阻塞的 ReadFile 立即返回。</summary>
+        /// <summary>读到对方关闭为止；总时限与响应大小都有上限，超时关句柄打断阻塞的 ReadFile。</summary>
         public byte[] ReadToEnd(int timeoutMs)
         {
             var ms = new MemoryStream();
@@ -86,13 +113,19 @@ namespace ProxyPicker.Core
                     bool ok = ReadFile(h, buf, (uint)buf.Length, out n, IntPtr.Zero);
                     if (!ok || n == 0) break;
                     ms.Write(buf, 0, (int)n);
+                    if (ms.Length > MaxResponseBytes)
+                        throw new IOException("控制管道响应超过 16 MiB，已中断");
                 }
             });
-            if (!task.Wait(timeoutMs))
+            int wait = (int)Math.Min(Math.Max(1, timeoutMs), Math.Max(1, RemainingMs));
+            if (!task.Wait(wait))
             {
                 Dispose();
-                throw new TimeoutException("控制管道响应超时（" + timeoutMs + " ms）");
+                throw new TimeoutException("控制管道响应超时（" + wait + " ms）");
             }
+            task.Wait();   // 把读线程里的大小上限异常抛回调用方
+            if (RemainingMs <= 0)
+                throw new TimeoutException("控制管道请求超过总时限（" + _deadlineMs + " ms）");
             return ms.ToArray();
         }
 

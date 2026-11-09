@@ -2,13 +2,18 @@
 
 只让「你勾选的软件」走代理 —— 一个给 Clash / mihomo 系客户端用的**按进程分流**小面板。
 
-单文件 exe，约 900 KB，不需要安装、不写注册表、不碰你的订阅。
+单文件 exe，约 960 KB，不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
 
 [**下载最新版**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
 [直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
 [更新记录](CHANGELOG.md)
 
+> 当前最新 Release 为 **v1.2.4**（2026-11-09），上面两个链接给的就是这一版。
+> 程序里的「检查更新」只在远端版本号比本机大时才提示，不会把人引去下载旧包。
+
 ![主界面](docs/img/main.png)
+
+*界面截图摄于 v1.0.0：布局一致，按钮文字与默认模式说明以 v1.2.4 正文为准。*
 
 ---
 
@@ -26,18 +31,25 @@ ProxyPicker 干的就是这件事。点几个开关，点保存，程序把 `PRO
 ## 特点
 
 - **改完不用重启浏览器**：保存时只关闭「本次改动到的软件」的旧连接，其他连接（下载、长连接）不断。
-- **两种分流模式，随时可切**
+- **两种分流模式，随时可切**（新机器默认代理白名单；已有配置不会被升级覆盖）
   | 模式 | 勾选的软件 | 没勾选的软件 | 适合谁 |
   |---|---|---|---|
-  | 只改勾的（新机器默认） | 走代理 | 完全按订阅原规则走 | 别人用 / 不想动订阅 |
-  | 完全接管 | 走代理 | 一律直连 | 只想让少数软件出网 |
+  | 代理白名单（核心，新机器默认） | 走代理 | 一律直连 | 只想让少数软件出网 |
+  | 订阅兼容（高级） | 走代理 | 继续按订阅原规则走 | 不想动订阅 / 老用户 |
 - **自己发现 + 自己补回**：每 30 秒核对一次「我插的规则还在不在」（收进托盘也不停）。
   换订阅、重启客户端、改设置都会把规则冲掉，这时会自己补回去并留一句提示。
-- **顺手关掉 IPv6 泄漏**：TUN 的 IPv6 是内网段，Windows 不会拿它当公网源地址，
-  IPv6 流量会从物理网卡直出、把真实 IP 露给双栈网站。程序在推送路径上强制 `ipv6: false` 并回读确认。
+- **不越权改全局设置**：IPv6 归客户端自己管（Clash Verge 新版把 `ipv6` 列为应用设置接管字段，
+  外部再写会被丢弃并弹橙色警告），所以程序默认一个字都不碰。
+  确需防泄漏时，可在帮助面板里主动打开「IPv6 防泄漏」：改前记下原值，关掉即恢复。
 - **换电脑直接用**：自动识别 Clash Verge Rev / Clash Verge / Clash Nyanpasu / Mihomo Party /
   FlClash / Clash for Windows / 裸 mihomo。
-- **看得见出口**：摘要卡上写的是「勾选的软件现在实际走哪个节点」，换节点 10 秒内自己更新。
+- **多个客户端会选择运行中的那个**：不再按目录顺序拿第一份配置。按「内核命令行指向 >
+  客户端进程 > 控制端口 > 配置更新时间」打分；`--diag` 会列出全部候选、得分和选择依据。
+  两个同时在跑时仍建议只留一个。
+- **看得见真实出口**：流量与出口一律以 mihomo 返回的 `chains`（实际链路）为准；
+  用户勾选只代表「预期」。两者不一致会在摘要卡提示，并在「复制诊断」里逐条列出。
+- **识别边界说得清**：同名 exe 来自不同目录会提示（勾一个会连带命中另一个），同目录的辅助进程
+  （Electron helper、更新器）由安装目录规则自动覆盖，不用手动逐个勾；右键仍可查看完整路径、同名冲突和同目录进程，另有只读 `--scan` 排查命令。
 
 ![帮助面板](docs/img/help.png)
 
@@ -52,8 +64,8 @@ ProxyPicker 干的就是这件事。点几个开关，点保存，程序把 `PRO
 **前提**：这台电脑上本来就有 Clash Verge 之类的客户端、并且正在运行。
 这个工具**不带代理**，它只决定「谁走代理」。
 
-> 第一次运行可能被 Windows SmartScreen 拦一下（exe 没有数字签名）：
-> 点「更多信息」→「仍要运行」。源码全在这个仓库里，可以自己编译。
+> 第一次运行可能被 Windows SmartScreen 拦一下（exe 用的是自签名证书，Windows 不认识这个发布者）：
+> 点「更多信息」→「仍要运行」。源码全在这个仓库里，可以自己编译；签名说明见下文。
 
 详细说明见 [docs/使用说明.md](docs/使用说明.md)。
 
@@ -74,6 +86,11 @@ ProxyPicker 干的就是这件事。点几个开关，点保存，程序把 `PRO
 不会。程序只读本机配置文件和控制面接口，运行时唯一的对外请求是「检查更新」时发给 GitHub API 的一个 GET，
 不带任何本机信息；把 `settings.json` 里的 `"updateCheck"` 改成 `false` 就完全不联网。
 
+**Q：Clash Verge 弹「扩展配置或脚本写入了由应用设置接管的字段 ipv6，这些值已被丢弃」？**
+这是客户端的提示，不是 ProxyPicker 报错。新版 Clash Verge 把 `ipv6` 收归自己的应用设置，
+早期版本在 Merge 扩展里留下的 `ipv6: false` 会被它丢弃并弹橙色条。删掉 merge 文件里那一行即可；
+ProxyPicker 现在默认完全不写这个字段。要真正开关 IPv6，请在 Clash Verge 设置界面里改。
+
 **Q：支持 macOS / Linux 吗？**
 不支持。命名管道、注册表开机自启、WinForms 自绘界面都是 Windows 专用。
 
@@ -92,11 +109,31 @@ dotnet build src\ProxyPicker.csproj -c Release
 只读自检出口（不改任何配置）：
 
 ```bat
-ProxyPicker.exe --selftest 自检.txt     :: 规则生成 23 项
+ProxyPicker.exe --selftest 自检.txt     :: 通用性 91 项 + 控制接口安全 20 项（共 111 项）
 ProxyPicker.exe --dryrun 配置.yaml 输出.yaml whitelist
+ProxyPicker.exe --scan 进程识别.txt     :: 只读列出路径、同名冲突、辅助进程（已脱敏）
 ProxyPicker.exe --version 版本.txt
 ProxyPicker.exe --checkupdate 更新.txt
+ProxyPicker.exe --cleanlegacy 清理.txt  :: 只检测旧版 profile 注入，不清理
 ```
+
+所有命令行开关都必须带输出文件路径；只敲 `--selftest` 会打印用法并返回非 0，不会再悄悄打开面板。
+`--apply`、`--cleanlegacy --yes` 会真实修改客户端配置，必须加 `--yes` 确认；
+`--raw` 默认只允许 GET/HEAD，非只读方法同样要 `--yes`：
+
+```bat
+ProxyPicker.exe --apply 结果.txt --yes   :: 按当前勾选名单推送规则；ok=False 时退出码非 0
+```
+
+其余开关（含 `--diag`、`--payload`、`--audit`、`--api`、`--raw`）都不写配置。
+
+**关于数字签名**：v1.1.0 起 Release 的 exe 带 Authenticode 签名（SHA-256）。用的是自签名证书
+`CN=ProxyPicker Development Signing`，指纹 `90361B0827F82D434A62CBEBE13D50ECB78D6CE8`，
+公钥证书 `ProxyPicker-selfsigned.cer` 随包提供，可用 `Get-AuthenticodeSignature ProxyPicker.exe` 核对签名者指纹。
+
+自签名只能证明「文件没被改过」，不能证明发布者身份：Windows SmartScreen **仍会**提示「未知发布者」
+（点「更多信息」→「仍要运行」）。要彻底消除提示必须购买 OV / EV 代码签名证书，这一步需要证书机构实名与付费，
+当前未做。每个 Release 都会公布附件的 SHA-256 并对应固定的源码提交，可自行编译核对哈希。
 
 ---
 

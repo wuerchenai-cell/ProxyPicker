@@ -32,6 +32,9 @@ namespace ProxyPicker.Core
         {
             string line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] "
                           + (kind ?? "INFO") + " " + (text ?? "");
+            // 记之前先脱敏：失败原因里常带本机路径和用户名，而这个账本是要给人看的
+            // （--audit 会把它贴出来，崩溃日志那边也是脱敏的，两边保持一致）。
+            line = Redactor.Apply(line);
             lock (Gate)
             {
                 _recent.Add(line);

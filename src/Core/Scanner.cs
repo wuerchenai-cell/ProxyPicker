@@ -14,8 +14,20 @@ namespace ProxyPicker.Core
         public sealed class ProcInfo
         {
             public string Exe;
-            public string Path;
+            public string Path;                 // 其中一个完整路径，用于「打开文件位置」
             public int Count;
+            /// <summary>同名 exe 的所有完整路径。多于一条 = 不同软件撞名，规则会一起命中。</summary>
+            public readonly HashSet<string> AllPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            public bool NameConflict { get { return AllPaths.Count > 1; } }
+            /// <summary>同一安装目录里也在运行的其它 exe（Electron helper / 更新器 / 子进程）。</summary>
+            public readonly List<string> DirPeers = new List<string>();
+
+            /// <summary>
+            /// 安装根目录**下面几层子目录**里也在运行的 exe。
+            /// Antigravity 的 language_server.exe 在 resources\bin\，只做「同目录」会漏掉它，
+            /// 而调用 Google OAuth 的正是这个进程 —— 漏掉就等于登录必然失败（实测 EOF）。
+            /// </summary>
+            public readonly List<string> TreePeers = new List<string>();
         }
 
         const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -35,12 +47,23 @@ namespace ProxyPicker.Core
         public static Dictionary<string, ProcInfo> Scan()
         {
             var map = new Dictionary<string, ProcInfo>(StringComparer.OrdinalIgnoreCase);
+            // 进程数超过 4096 时按 needed 扩容重试；仍装不下就明确报错，
+            // 绝不静默返回空名单（评审 R5-5）。
             uint[] pids = new uint[4096];
-            uint needed;
-            if (!EnumProcesses(pids, (uint)(pids.Length * sizeof(uint)), out needed)) return map;
-
+            uint needed = 0;
+            for (int attempt = 0; attempt < 5; attempt++)
+            {
+                if (!EnumProcesses(pids, (uint)(pids.Length * sizeof(uint)), out needed))
+                    throw new InvalidOperationException("读取进程列表失败（Win32 错误 " + Marshal.GetLastWin32Error() + "）");
+                if (needed < (uint)(pids.Length * sizeof(uint))) break;
+                if (pids.Length >= 65536)
+                    throw new InvalidOperationException("进程数达到扫描上限 65536，结果可能不完整；已中止而不是静默返回空名单");
+                pids = new uint[pids.Length * 2];
+            }
             int count = (int)(needed / sizeof(uint));
             var sb = new StringBuilder(1024);
+            // 先按目录记住「这个目录里跑过哪些 exe」，第二遍才能给每个软件找出辅助进程。
+            var byDir = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < count; i++)
             {
                 uint pid = pids[i];
@@ -62,10 +85,101 @@ namespace ProxyPicker.Core
                         map[exe] = info;
                     }
                     info.Count++;
+                    info.AllPaths.Add(full);
+
+                    string dir = slash >= 0 ? full.Substring(0, slash) : "";
+                    if (dir.Length == 0 || IsSystemDir(dir)) continue;
+                    HashSet<string> inDir;
+                    if (!byDir.TryGetValue(dir, out inDir))
+                    {
+                        inDir = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        byDir[dir] = inDir;
+                    }
+                    inDir.Add(exe);
                 }
                 finally { CloseHandle(h); }
             }
+
+            // 主进程与辅助进程的关联只做「同目录」这一层启发式，不建进程树：
+            // 系统目录里几百个 exe 互相之间毫无关系，跳过；每个软件最多记 8 个，避免刷屏。
+            foreach (var kv in map)
+            {
+                foreach (string full in kv.Value.AllPaths)
+                {
+                    int slash = full.LastIndexOf('\\');
+                    string dir = slash >= 0 ? full.Substring(0, slash) : "";
+                    if (dir.Length == 0 || IsSystemDir(dir)) continue;
+                    HashSet<string> inDir;
+                    if (!byDir.TryGetValue(dir, out inDir)) continue;
+                    foreach (string peer in inDir)
+                    {
+                        if (kv.Value.DirPeers.Count >= 8) break;
+                        if (string.Equals(peer, kv.Key, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!kv.Value.DirPeers.Contains(peer)) kv.Value.DirPeers.Add(peer);
+                    }
+                }
+            }
+
+            CollectTreePeers(map, byDir);
             return map;
+        }
+
+        /// <summary>
+        /// 安装根目录的子目录关联（第二层）。
+        /// 只在「exe 自己的目录」往下找 2 层，所以不会把同一盘里别的软件算进来；
+        /// Program Files / 系统目录 / 盘符根这类公共根一律跳过，避免认成一片。
+        /// </summary>
+        static void CollectTreePeers(Dictionary<string, ProcInfo> map, Dictionary<string, HashSet<string>> byDir)
+        {
+            foreach (var kv in map)
+            {
+                foreach (string full in kv.Value.AllPaths)
+                {
+                    if (kv.Value.TreePeers.Count >= 8) break;
+                    int slash = full.LastIndexOf('\\');
+                    string root = slash >= 0 ? full.Substring(0, slash) : "";
+                    if (root.Length == 0 || IsSystemDir(root) || IsSharedRoot(root)) continue;
+                    string prefix = root + "\\";
+                    foreach (var d in byDir)
+                    {
+                        if (kv.Value.TreePeers.Count >= 8) break;
+                        if (!d.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                        // 深度：根目录往下最多 2 层（resources\bin 正好两层）
+                        string rel = d.Key.Substring(prefix.Length);
+                        int depth = 0;
+                        foreach (char c in rel) if (c == '\\') depth++;
+                        if (depth > 1) continue;
+                        foreach (string peer in d.Value)
+                        {
+                            if (kv.Value.TreePeers.Count >= 8) break;
+                            if (string.Equals(peer, kv.Key, StringComparison.OrdinalIgnoreCase)) continue;
+                            if (kv.Value.DirPeers.Contains(peer)) continue;
+                            if (kv.Value.TreePeers.Contains(peer)) continue;
+                            kv.Value.TreePeers.Add(peer);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>公共安装根：在这里做目录树关联会把无关软件全算成 helper。</summary>
+        static bool IsSharedRoot(string dir)
+        {
+            string d = (dir ?? "").TrimEnd('\\').ToLowerInvariant();
+            if (d.Length <= 2) return true;                       // C: / D:
+            return d.EndsWith(@"\program files") || d.EndsWith(@"\program files (x86)")
+                || d.EndsWith(@"\programdata") || d.EndsWith(@"\users")
+                || d.EndsWith(@"\appdata\local") || d.EndsWith(@"\appdata\roaming")
+                || d.EndsWith(@"\appdata\local\programs");
+        }
+
+        public static bool IsSystemDir(string dir)
+        {
+            string d = dir.ToLowerInvariant();
+            return d.Contains(@"\windows\system32") || d.Contains(@"\windows\syswow64")
+                || d.EndsWith(@"\windows") || d.Contains(@"\windows\winsxs")
+                || d.Contains(@"\windows\systemapps") || d.Contains(@"\windows\immersivecontrolpanel")
+                || d.Contains(@"\programdata\microsoft");
         }
     }
 
@@ -99,6 +213,8 @@ namespace ProxyPicker.Core
             const string uninstall = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
             ScanRegistryRoot(map, Registry.LocalMachine, uninstall);
             ScanRegistryRoot(map, Registry.CurrentUser, uninstall);
+            // 只登记在 32 位卸载表里的软件（Chrome / WPS / Keil 等）也要扫到（评审 R4-7）。
+            ScanRegistryRoot(map, Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall");
         }
 
         static void ScanRegistryRoot(Dictionary<string, InstalledInfo> map, RegistryKey root, string path)
@@ -375,6 +491,25 @@ namespace ProxyPicker.Core
             "extension-host.exe", "coocare.exe", "ksolaunch.exe",
             "phoneexperiencehost.exe", "systemoptimizer.exe", "reconsentnotification.exe",
         };
+
+        /// <summary>
+        /// 多个软件共用的解释器/运行时。作为「辅助进程」时绝不能写成裸进程名规则，
+        /// 否则勾一个 Electron 软件会把机器上所有 node.exe 一起代理（复审 F-09 实测 13 个）。
+        /// 它们仍可以由目录整树规则覆盖，也允许用户主动勾选主程序。
+        /// </summary>
+        static readonly HashSet<string> SharedRuntimes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "node.exe", "node64.exe", "node_repl.exe", "python.exe", "python3.exe", "pythonw.exe",
+            "java.exe", "javaw.exe", "ruby.exe", "perl.exe", "php.exe",
+            "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe",
+            "language_server.exe", "language_server_linux", "electron.exe",
+            "msedgewebview2.exe", "webviewhost.exe",
+        };
+
+        public static bool IsSharedRuntime(string exe)
+        {
+            return SharedRuntimes.Contains((exe ?? "").Trim());
+        }
 
         public static bool IsInfrastructure(string exe)
         {

@@ -22,27 +22,32 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
-        /// 勾选名单文件。优先放在客户端数据目录的 pp_rules\ 下（方便人工核对）；
-        /// 目录不可写时退回本程序的 LocalAppData。真正的生效不依赖这个文件——
-        /// 规则是内联进 payload 推送的，这份文件只是可读的账本和还原依据。
+        /// 勾选名单固定放本程序自己的目录：换客户端 / 重装不会丢（评审 R5-3）。
+        /// 只读命令不再在客户端数据目录里创建 pp_rules\（评审 R5-6）。
+        /// 老版本把名单写在客户端目录下，这里做一次性迁移，绝不覆盖已有的新名单。
+        /// 真正的生效不依赖这个文件——规则是内联进 payload 推送的，它只是账本和还原依据。
         /// </summary>
         public static string ListPath
         {
-            get
+            get { return Path.Combine(OwnDir, "pp-whitelist.yaml"); }
+        }
+
+        /// <summary>
+        /// 老版本把名单写在客户端目录下，这里做一次性迁移，绝不覆盖已有新名单。
+        /// 只有 GUI / --apply 会调用；--list / --scan 这类只读命令不能因为读路径就写盘。
+        /// </summary>
+        public static void MigrateLegacyList()
+        {
+            string own = ListPath;
+            try
             {
+                if (File.Exists(own)) return;
                 string dir = ClashDir;
-                if (!string.IsNullOrEmpty(dir))
-                {
-                    try
-                    {
-                        string target = Path.Combine(dir, "pp_rules");
-                        Directory.CreateDirectory(target);
-                        return Path.Combine(target, "pp-whitelist.yaml");
-                    }
-                    catch { }
-                }
-                return Path.Combine(OwnDir, "pp-whitelist.yaml");
+                if (string.IsNullOrEmpty(dir)) return;
+                string legacy = Path.Combine(dir, "pp_rules", "pp-whitelist.yaml");
+                if (File.Exists(legacy)) File.Copy(legacy, own, false);
             }
+            catch { }
         }
 
         public static string OwnDir
