@@ -234,6 +234,11 @@ namespace ProxyPicker
                 {
                     // 只有真正要应用/写名单时才迁移旧版名单；--list 之类的只读命令不写盘。
                     Core.Paths.MigrateLegacyList();
+                    // 没有名单文件＝用户从没表达过分流意图。不能让命令行凭空推出一份
+                    // 「空白名单接管」还把文件建出来，否则界面下次打开会误以为用户要全部直连。
+                    if (!System.IO.File.Exists(Core.Paths.ListPath))
+                        throw new InvalidOperationException("没有找到勾选名单（" + Core.Paths.ListPath +
+                            "）。请先在界面里保存一次名单，再用 --apply 应用");
                     var items = Core.Profile.Load();
                     if (Core.Profile.LastLoadFailed)
                         throw new InvalidOperationException(Core.Profile.LastLoadError + "；已停止 --apply，避免推送空名单");
@@ -359,7 +364,8 @@ namespace ProxyPicker
             {
                 try
                 {
-                    string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest();
+                    string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest()
+                                  + Core.Traffic.SelfTest();
                     System.IO.File.WriteAllText(args[1], result, new System.Text.UTF8Encoding(false));
                     if (result.Contains("FAIL  ")) Environment.ExitCode = 1;
                 }

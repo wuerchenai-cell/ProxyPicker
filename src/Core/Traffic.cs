@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 
@@ -56,6 +58,8 @@ namespace ProxyPicker.Core
             public bool Judged;
             /// <summary>预期与实际不一致的软件数，界面据此提示「分流异常」。</summary>
             public int Mismatch;
+            /// <summary>本次规则生效前就建立的旧连接数：仍计入网速，但不参与对账。</summary>
+            public int StaleIgnored;
             /// <summary>不一致的明细：哪个 exe、预期什么、实际什么、下一步做什么。</summary>
             public readonly List<MismatchItem> Mismatches = new List<MismatchItem>();
             /// <summary>每个 exe 的实测链路汇总，供诊断信息逐条列出。</summary>
@@ -72,7 +76,9 @@ namespace ProxyPicker.Core
             /// <summary>逐条列出「预期出口 / 实际出口 / 判定」，给一键诊断用。</summary>
             public string DescribeOutbound()
             {
-                if (Routes.Count == 0) return "（这一轮内核没看到任何连接）\n";
+                if (Routes.Count == 0)
+                    return "（这一轮没有「本次规则生效后」建立的连接；旧连接 "
+                        + StaleIgnored + " 条已排除）\n";
                 var sb = new StringBuilder();
                 foreach (var kv in Routes.OrderBy(k => k.Key, StringComparer.OrdinalIgnoreCase))
                 {
@@ -98,6 +104,8 @@ namespace ProxyPicker.Core
                     sb.AppendLine(kv.Key + "  预期 " + (rt.Expected ? "代理" : "直连")
                         + " · 实际 " + actual + " · " + verdict);
                 }
+                if (StaleIgnored > 0)
+                    sb.AppendLine("（另有 " + StaleIgnored + " 条本次规则生效前的旧连接，未参与对账）");
                 return sb.ToString();
             }
         }
@@ -131,6 +139,44 @@ namespace ProxyPicker.Core
         static long _prevTicks;
         static readonly object Gate = new object();
 
+        static DateTime _pushedUtc;
+
+        /// <summary>规则成功推给内核时记一次「生效时刻」，由 Profile.Apply 调用。</summary>
+        public static void NotePush() { _pushedUtc = DateTime.UtcNow; }
+
+        /// <summary>
+        /// 对账基线：优先取最近一次推送；从没推送过就取本进程启动时间。
+        /// 只用进程启动时间也够挡住「上次会话留下的长连接」，推送后则更精确。
+        /// </summary>
+        static DateTime BaselineUtc
+        {
+            get
+            {
+                if (_pushedUtc != DateTime.MinValue) return _pushedUtc;
+                try { return Process.GetCurrentProcess().StartTime.ToUniversalTime(); }
+                catch { return DateTime.MinValue; }
+            }
+        }
+
+        /// <summary>解析 mihomo 连接里的 start（ISO 8601，通常带 +08:00），统一换算成 UTC。</summary>
+        internal static bool TryParseStartUtc(string text, out DateTime utc)
+        {
+            utc = DateTime.MinValue;
+            if (string.IsNullOrEmpty(text)) return false;
+            DateTimeOffset dto;
+            if (!DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out dto))
+                return false;
+            utc = dto.UtcDateTime;
+            return true;
+        }
+
+        /// <summary>基线未知时不排除任何连接；规则生效前建立的连接一律算「旧」。</summary>
+        internal static bool IsStale(DateTime startUtc, DateTime baselineUtc)
+        {
+            return baselineUtc != DateTime.MinValue && startUtc < baselineUtc;
+        }
+
         /// <param name="judgeMismatch">
         /// 是否把「预期与实际不符」判为异常。订阅兼容模式下未勾选的软件按订阅规则走，
         /// 走代理本来就是合法的，所以那种模式不判定。
@@ -139,6 +185,7 @@ namespace ProxyPicker.Core
         {
             var s = new Sample();
             s.Judged = judgeMismatch;
+            DateTime baseline = BaselineUtc;
             var root = Mihomo.GetJson("/connections", 8000);
             if (root == null)
             {
@@ -199,7 +246,18 @@ namespace ProxyPicker.Core
                 bool expected = proxyExes != null && proxyExes.Contains(exe);
                 Chain chain = ChainOf(d);
 
-                if (exe.Length > 0)
+                // 规则只对「新连接」生效：mihomo 不会给已经连上的连接重新匹配。
+                // 推送前建立的长连接（浏览器 WebSocket / 推送 / keep-alive）一直保持旧链路，
+                // 算进对账就会出现「勾了走代理，实测多数直连」的假警报（实机 2026-11-10）。
+                DateTime startUtc;
+                bool stale = TryParseStartUtc(Json.Str(d, "start"), out startUtc)
+                             && IsStale(startUtc, baseline);
+
+                if (exe.Length > 0 && stale)
+                {
+                    s.StaleIgnored++;      // 仍计入实时网速，只是不参与出口判定
+                }
+                else if (exe.Length > 0)
                 {
                     Route rt;
                     if (!s.Routes.TryGetValue(exe, out rt))
@@ -253,7 +311,7 @@ namespace ProxyPicker.Core
                         Node = rt.Node,
                         Reason = rt.Expected ? "勾了走代理，实测多数连接走直连" : "没勾选，实测多数连接走了代理",
                         Action = rt.Expected
-                            ? "重新保存一次；若仍异常，确认客户端 find-process-mode=always"
+                            ? "重新保存一次；若仍异常，确认客户端 find-process-mode 不是 off（strict 正常）"
                             : "检查是否被目录规则或订阅规则接管，必要时取消该目录规则"
                     });
                 }
@@ -317,6 +375,43 @@ namespace ProxyPicker.Core
             double d;
             if (v is string && double.TryParse((string)v, out d)) return d;
             return 0;
+        }
+
+        /// <summary>自检：把「旧连接排除」和「派生预期」两条口径锁住，防止改回去又报假异常。</summary>
+        public static string SelfTest()
+        {
+            var sb = new StringBuilder();
+            int pass = 0, total = 0;
+            Action<string, bool> check = (name, ok) =>
+            {
+                total++;
+                if (ok) pass++;
+                sb.AppendLine((ok ? "PASS  " : "FAIL  ") + name);
+            };
+
+            DateTime t;
+            check("T1 带 +08:00 的连接时间能换算成 UTC",
+                TryParseStartUtc("2026-11-10T12:37:18.18825+08:00", out t) &&
+                t.Year == 2026 && t.Month == 11 && t.Day == 10 && t.Hour == 4 && t.Minute == 37);
+            check("T2 空时间不参与排除", !TryParseStartUtc("", out t));
+            check("T3 乱码时间不参与排除", !TryParseStartUtc("not-a-time", out t));
+            var now = new DateTime(2026, 11, 10, 5, 0, 0, DateTimeKind.Utc);
+            check("T4 早于本次推送的连接算旧", IsStale(now.AddMinutes(-10), now));
+            check("T5 晚于本次推送的连接算新", !IsStale(now.AddMinutes(10), now));
+            check("T6 同一时刻不算旧", !IsStale(now, now));
+            check("T7 基线未知时不排除任何连接", !IsStale(now.AddYears(-1), DateTime.MinValue));
+
+            // 派生进程（helper / 登录窗口 / 本程序自身）被算进预期后，
+            // 实测走代理就不再被判成「没勾选却走代理」。
+            string verdict;
+            bool bad;
+            TryVerdict(new Route { Expected = true, Proxy = 4, Direct = 0 }, out verdict, out bad);
+            check("T8 派生进程走代理不算异常", !bad && verdict == "正常");
+            TryVerdict(new Route { Expected = true, Proxy = 0, Direct = 0 }, out verdict, out bad);
+            check("T9 没有可用样本时不下结论", !bad && verdict == "链路未知");
+
+            sb.AppendLine(pass + "/" + total + " 流量对账口径通过");
+            return sb.ToString();
         }
 
         public static void Reset()

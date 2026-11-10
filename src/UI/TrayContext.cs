@@ -90,16 +90,19 @@ namespace ProxyPicker.UI
                 _form.ShowPanel();
                 _form.AllDirectPublic();   // 现在会直接保存，不再只改内存
             });
+            menu.Items.Add("手动添加软件…", null, (s, e) => _form.AddExeManuallyPublic());
             menu.Items.Add("复制诊断信息", null, (s, e) => _form.CopyDiagnosticsPublic());
             menu.Items.Add("还原上次保存前的配置", null, (s, e) =>
             {
                 if (MessageBox.Show(
-                    "把客户端配置还原到上次保存前，并清空勾选名单。\n确定要还原吗？",
+                    "把客户端配置还原到上次保存前，并清除 ProxyPicker 的接管状态（勾选名单）。\n" +
+                    "还原后后台看守不会再自动接管。\n确定要还原吗？",
                     "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 string msg;
                 bool ok = Core.Profile.Rollback(out msg);
-                if (ok) _form.AfterRollback();   // 同步内存勾选，别让看守把还原撤销
-                MessageBox.Show(ok ? "已还原为上次保存前的配置，界面已同步刷新" : msg,
+                if (ok) _form.AfterRollback();   // 同步内存勾选 + 作废在途看守，别让还原被撤销
+                // 成功时也要显示 msg：旧版备份、名单删除失败这类警告不能吞掉。
+                MessageBox.Show(ok ? (string.IsNullOrEmpty(msg) ? "已还原为上次保存前的配置" : msg) : msg,
                     "ProxyPicker", MessageBoxButtons.OK,
                     ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
             });
@@ -138,11 +141,25 @@ namespace ProxyPicker.UI
                 }
                 catch { }
             };
+            // 发现新版本时弹系统托盘通知：窗口收起来了 / --tray 后台启动也看得见。
+            // 气泡点一下只打开面板，下载始终由用户自己决定（本程序绝不自动下载覆盖自己）。
+            _form.TrayBalloon = (title, text) =>
+            {
+                try { _icon.ShowBalloonTip(8000, title, text, ToolTipIcon.Info); }
+                catch { }
+            };
+            _icon.BalloonTipClicked += (s, e) => { try { _form.ShowPanel(); } catch { } };
+
             // 点窗口「×」也走退出（并还原内核），不再静默藏进托盘：
             // 用户关掉窗口却还有进程在后台，正是「我明明关了它怎么还在跑」的来源。
             _form.CloseRequested += ExitApp;
 
             if (showOnStart) ShowPanel();
+            // 放在托盘图标和气泡委托都就绪之后：后台启动也会自检，且提示能真的弹出来。
+            // 必须排进消息队列再跑 —— 此刻 Application.Run 还没启动，
+            // 直接调 async 方法会捕获不到 UI 同步上下文，网络回调落回线程池线程。
+            try { _form.BeginInvoke(new Action(() => _form.StartAutoUpdateCheck())); }
+            catch { _form.StartAutoUpdateCheck(); }
         }
 
         /// <summary>explorer 重启后重新注册托盘图标。</summary>

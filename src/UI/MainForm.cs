@@ -53,7 +53,7 @@ namespace ProxyPicker.UI
              _fTab, _fTabActive, _fRate, _fTiny, _fHelp, _fHelpTitle;
         Font _fPill;   // 出口胶囊，懒加载
 
-        enum Btn { None, Save, Direct, Refresh, Close, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate }
+        enum Btn { None, Save, Direct, Refresh, Close, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch }
         Btn _hover = Btn.None;
         int _tab;
         int _hoverTab = -1;
@@ -76,9 +76,15 @@ namespace ProxyPicker.UI
         string _lastEnvWarn;       // 上次弹过的多客户端提醒文字；同一条不重复弹
         bool _updateBusy;
         bool _updateSessionDone;  // 本次运行已经自动查过一次，别每次打开面板都去问
+        string _notifiedVersion;  // 本次运行已为哪个版本弹过提示，避免联网复查重复打扰
+        // 真正推给内核的代理名单（含 helper / 登录窗口 / 本程序自身等派生规则）。
+        // 对账的「预期」必须用它，只用界面勾选会把自己放行的进程报成异常（实机 2026-11-10）。
+        volatile HashSet<string> _effectiveProxy;
 
         /// <summary>点了「—」之后由托盘那边弹一次气泡，告诉用户窗口去哪了。首次才弹。</summary>
         public Action TrayHint;
+        /// <summary>发现新版本时由托盘弹系统通知；窗口收在托盘里也看得见。</summary>
+        public Action<string, string> TrayBalloon;
 
         Profile.KernelState _state = new Profile.KernelState();
         List<AppRow> _all = new List<AppRow>();
@@ -392,12 +398,8 @@ namespace ProxyPicker.UI
                     Theme.Accent, 2);
             }
 
-            // 版本检查放在最后，不挡面板出现；一次运行只查一次，查过就不再打扰
-            if (!_updateSessionDone)
-            {
-                _updateSessionDone = true;
-                if (Updater.Enabled && Settings.ShouldCheckUpdate(24)) CheckUpdateAsync(false);
-            }
+            // 版本检查改在托盘就绪后由 StartAutoUpdateCheck() 触发（含 --tray 后台启动），
+            // 不再依赖用户点开面板；这里只负责把面板显示出来。
         }
 
         public void HideToTray()
@@ -552,7 +554,11 @@ namespace ProxyPicker.UI
                 var exes = new List<string>(_savedProxy);
                 // 名单里现在混有两类条目：进程名和目录正则。目录条目不能当成 exe 名参与对账。
                 if (exes.Count == 0) exes = Profile.Load().Where(i => !i.IsPathRule).Select(i => i.Exe).ToList();
-                if (exes.Count == 0) return;
+                // 空名单是正式支持的配置（「全部直连」），不能当成「无需看守」直接返回。
+                // 用名单文件本身表达意图：文件不存在＝新装/刚还原、从未表达过意图，看守不推；
+                // 文件存在但 payload 为空＝用户明确要全部直连，必须继续对账维护段首 MATCH（外部评审 F2）。
+                // 不引入独立状态位，避免它过期、崩溃后残留或和用户手动撤销分叉。
+                if (exes.Count == 0 && !Profile.HasSavedIntent) return;
 
                 owns = true;
                 _watching = true;
@@ -581,10 +587,12 @@ namespace ProxyPicker.UI
                     SetStatus("客户端当前是「" + audit.Mode + "」模式，按软件分流不生效；请切回规则模式", Theme.Warn);
                     return;
                 }
+                // mihomo：always=强制查进程、strict=按需查（默认，PROCESS 规则正常生效）、off=关闭。
+                // 只有 off 才该放弃补回；以前把 strict 也当成没开，默认 Verge Rev 下规则永远补不回来（F1）。
                 if (audit.Ok && !string.IsNullOrEmpty(audit.FindProcess) &&
-                    !audit.FindProcess.Equals("always", StringComparison.OrdinalIgnoreCase))
+                    audit.FindProcess.Equals("off", StringComparison.OrdinalIgnoreCase))
                 {
-                    SetStatus("客户端没开进程识别（" + audit.FindProcess + "），按软件分流不生效", Theme.Warn);
+                    SetStatus("客户端关掉了进程识别（find-process-mode=off），按软件分流不生效", Theme.Warn);
                     return;
                 }
 
@@ -620,6 +628,9 @@ namespace ProxyPicker.UI
             {
                 if (!UiAlive || _busy) return;
                 if (_modeChanged) return;   // 模式切换还没保存，任何自动补回都不能推新模式
+                // 推送前最后确认一次意图：托盘还原会删掉名单文件，
+                // 已启动的旧任务不能因为它重新创建接管状态。
+                if (!Profile.HasSavedIntent) return;
                 owns = true;
                 BeginBusy();
                 _lastRepairAt = DateTime.UtcNow;
@@ -754,7 +765,36 @@ namespace ProxyPicker.UI
             }
             catch { roots = null; }
 
-            return Profile.Compose(proxy, null, peers, roots, policies);
+            var items = Profile.Compose(proxy, null, peers, roots, policies);
+
+            // 登录窗口例外：ChatGPT 桌面版这类 MSIX 应用把 OAuth / 人机验证放进共享的
+            // WebView2 运行时（msedgewebview2.exe），它不在软件目录里、也不在用户勾选名单里。
+            // 完全接管下没勾的一律落到 MATCH,DIRECT，登录请求被直连送出去 → 登不上；
+            // 关掉本软件后规则撤销、回到订阅原规则，就又好了（用户实机报告）。
+            // 这里作为派生规则放行：只在「完全接管 + 用户确实勾了软件」时生效，
+            // 不写进名单、取消全部勾选即消失；订阅兼容模式本来就没有短路 MATCH，不需要它。
+            if (!Settings.PatchOnly && proxy.Count > 0 && Settings.LoginWindowProxyOn &&
+                !items.Any(i => i.Exe.Equals("msedgewebview2.exe", StringComparison.OrdinalIgnoreCase)))
+            {
+                items.Add(new Profile.Item("msedgewebview2.exe", "PP-FIXED") { Derived = true });
+            }
+
+            // 「启动自检更新」是本程序自己发的那个 GET。完全接管下没勾的一律落到
+            // MATCH,DIRECT，GitHub 连不上就等于没有这个功能；所以只给本程序放行这一条。
+            // 关掉 settings.json 里的 updateCheck 即不再出网，规则也会自动消失。
+            if (!Settings.PatchOnly && proxy.Count > 0 && Settings.Current.UpdateCheck &&
+                !items.Any(i => i.Exe.Equals("proxypicker.exe", StringComparison.OrdinalIgnoreCase)))
+            {
+                items.Add(new Profile.Item("proxypicker.exe", "PP-FIXED") { Derived = true });
+            }
+
+            // 对账的「预期」必须是真正下发的东西：helper、登录窗口、本程序自身
+            // 都是派生规则，只用界面勾选会把它们报成「没勾选却走代理」。
+            var eff = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var it in items) if (!it.IsPathRule) eff.Add(it.Exe);
+            _effectiveProxy = eff;
+
+            return items;
         }
 
         sealed class Pack
@@ -775,6 +815,8 @@ namespace ProxyPicker.UI
             var names = new List<string>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var k in policy.Keys) if (seen.Add(k)) names.Add(k);
+            // 手动添加的 exe 必须参与每次重建，否则刷新一次就「消失」（外部评审 #2）。
+            foreach (var k in Settings.CustomExes) if (seen.Add(k)) names.Add(k);
             foreach (var k in Catalog.Offline) if (seen.Add(k)) names.Add(k);
             foreach (var kv in procs)
                 if (!seen.Contains(kv.Key) && Catalog.IsUserApp(kv.Key, kv.Value.Path) && seen.Add(kv.Key)) names.Add(kv.Key);
@@ -807,7 +849,9 @@ namespace ProxyPicker.UI
                 {
                     Exe = exe,
                     Name = name,
-                    Description = hint + Catalog.Description(exe),
+                    Description = Settings.IsCustomExe(exe)
+                        ? ("手工添加" + (hint.Length > 0 ? " · " + hint : ""))
+                        : hint + Catalog.Description(exe),
                     NameConflict = info != null && info.NameConflict,
                     AllPaths = info != null ? new List<string>(info.AllPaths) : new List<string>(),
                     Peers = info != null ? new List<string>(info.DirPeers) : new List<string>(),
@@ -818,7 +862,7 @@ namespace ProxyPicker.UI
                     Known = pol != null,
                     Policy = pol ?? "",
                     Common = Catalog.IsCommon(exe) || (inst != null && Catalog.IsCommonByInstall(inst.Name)) ||
-                             Settings.UsageOf(exe) > 0,
+                             Settings.UsageOf(exe) > 0 || Settings.IsCustomExe(exe),
                     Anim = proxy ? 1f : 0f,
                     Usage = Settings.UsageOf(exe),
                     LastUsed = Settings.LastUsedOf(exe)
@@ -905,11 +949,16 @@ namespace ProxyPicker.UI
                 });
                 if (!UiAlive) return;
 
+                // 推送成功就把内存名单对齐（外部评审 F4）：回读校验失败时内核其实已经改了，
+                // 若仍拿旧名单去对账，看守会把用户刚取消勾选的软件又补回来。
+                if (pack.Apply.Pushed)
+                {
+                    _savedProxy = now;
+                    _list.SavedProxy = now;
+                }
                 if (pack.Apply.Ok)
                 {
                     _modeChanged = false;   // 模式切换直到这次保存成功才算落地
-                    _savedProxy = now;
-                    _list.SavedProxy = now;
                     foreach (var r in _all)
                     {
                         if (r.Proxy && !r.Known) Settings.Touch(r.Exe);
@@ -1283,7 +1332,12 @@ namespace ProxyPicker.UI
                 // 流量采样与「刷新软件列表」互不阻塞；否则刷新期间曲线必然断一拍。
                 // 每十次采样顺手检查出口（约 10 秒），两个请求各自防重入。
                 if (++_outTick % 10 == 0) CheckOutbound();
-                var set = new HashSet<string>(_all.Where(r => r.Proxy).Select(r => r.Exe), StringComparer.OrdinalIgnoreCase);
+                // 「预期」用真正推给内核的名单（含派生规则），不是界面上勾了几个。
+                // 首次保存前还没有下发记录，才退回界面勾选。
+                var effective = _effectiveProxy;
+                var set = effective != null && effective.Count > 0
+                    ? effective
+                    : new HashSet<string>(_all.Where(r => r.Proxy).Select(r => r.Exe), StringComparer.OrdinalIgnoreCase);
                 // 只有「代理白名单」模式下预期出口才明确：订阅兼容里未勾选的软件
                 // 按订阅规则走代理是合法的，判成异常反而会一直误报。
                 var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly));
@@ -1486,6 +1540,9 @@ namespace ProxyPicker.UI
         // ---------------------------------------------------------------- 布局
 
         RectangleF SummaryRect { get { return new RectangleF(18, SummaryTop, WinW - 36, SummaryH); } }
+
+        /// <summary>摘要卡第二行。有分流异常时整行可点击，打开完整明细。</summary>
+        RectangleF MismatchRect { get { return new RectangleF(32, SummaryTop + 33, 205, 16); } }
         RectangleF SparkRect
         {
             get
@@ -1623,15 +1680,13 @@ namespace ProxyPicker.UI
             // 「勾了却没生效」比「现在有几个进程可见」重要得多。
             if (_mismatch > 0)
             {
-                // 直接报出前两个软件名：用户看到「异常 1 个」却不知道是哪个，
-                // 等于没提示。完整列表在帮助面板第一行和「复制诊断信息」里。
-                string names = string.Join("、", _mismatchItems.Take(2).Select(i => i.Exe).ToArray());
-                if (string.IsNullOrEmpty(names)) names = "点「?」看明细";
-                rest = "分流异常 " + _mismatch + " 个：" + names + (_mismatch > 2 ? " 等" : "");
+                // 异常一多，把名字往这一行里塞必然显示不全（用户实机反馈）。
+                // 改成「数量 + 可点击入口」：完整清单在 ShowMismatchDialog 里逐条列出，
+                // 帮助面板和「复制诊断」也都能拿到全量，不再用「… 等」糊过去。
+                rest = "分流异常 " + _mismatch + " 个 · 点这里看全部";
             }
             else if (_visibleProcs > 0) rest += " · 可见 " + _visibleProcs + " 个";
-            Draw.Text(g, rest, _fSmall, _mismatch > 0 ? Theme.Warn : Theme.Dim,
-                new RectangleF(32, SummaryTop + 33, 205, 16));
+            Draw.Text(g, rest, _fSmall, _mismatch > 0 ? Theme.Warn : Theme.Dim, MismatchRect);
 
             // 第三行：左边内核状态，右边用胶囊直接摆出「勾选软件实际走哪个节点」。
             //
@@ -1816,22 +1871,22 @@ namespace ProxyPicker.UI
                 // 把「哪个软件、什么原因、下一步」直接摆在帮助面板第一屏，
                 // 不再让用户自己去猜「分流异常 1 个」是哪一个。
                 var lines = new List<string>();
-                foreach (var m in _mismatchItems.Take(1))
+                foreach (var m in _mismatchItems.Take(3))
                     lines.Add(m.Exe + "：预期" + (m.Expected ? "代理" : "直连") + "，实际 "
                         + m.Proxy + " 代理 / " + m.Direct + " 直连。" + m.Reason + "；" + m.Action);
-                if (_mismatchItems.Count > 1)
-                    lines.Add("另外 " + (_mismatchItems.Count - 1) + " 个，点「复制诊断」看完整列表。");
-                firstTitle = "分流异常 " + _mismatch + " 个（点「复制诊断」可复制全部）";
+                if (_mismatchItems.Count > 3)
+                    lines.Add("还有 " + (_mismatchItems.Count - 3) + " 个，回主界面点「分流异常」看完整清单。");
+                firstTitle = "分流异常 " + _mismatch + " 个（主界面可点开全部）";
                 firstBody = string.Join("  ", lines.ToArray());
             }
 
             string[][] items =
             {
                 new[] { firstTitle, firstBody },
-                new[] { "四个标签只是在换视角", "常用放高频软件；全部里能找到所有已安装程序；以后新装的软件，下次打开会自动出现。" },
+                new[] { "四个标签只是在换视角", "常用只放高频和已选软件；找不到就切「全部」（标签上有总数）或在搜索框输名字。绿色版、MSIX、脚本类软件可能扫不到，托盘菜单「手动添加软件…」可手选 exe，加过一次会一直留着。" },
                 new[] { "顺序可以拖", "按住任意一行上下拖动即可排序；点标签右侧按钮，能切回「智能」按使用习惯自动排。" },
                 new[] { "右键有更多", "看完整路径、复制进程名；同名冲突和相关辅助进程会提示，也能一键一起勾上。" },
-                new[] { "换电脑直接用", "新电脑默认「代理白名单」：只有勾的走代理，其余直连。想按订阅规则分流，点下面按钮切「订阅兼容」。" }
+                new[] { "换电脑直接用", "默认「代理白名单」：只有勾的走代理，其余直连；想按订阅分流点下面切「订阅兼容」。登录窗口（WebView2）已自动放行，避免 ChatGPT 登不上。每次启动自动查一次新版本，有新版会弹托盘通知；要关掉把 settings.json 的 loginWindowProxy / updateCheck 设为 false。" }
             };
 
             float y = 142;
@@ -1915,7 +1970,7 @@ namespace ProxyPicker.UI
             if (i == 0) return "常用";
             if (i == 1) return "已选 " + _all.Count(r => r.Proxy);
             if (i == 2) return "运行中";
-            return "全部";
+            return "全部 " + _all.Count;
         }
 
         void Magnifier(Graphics g, float cx, float cy, float r, Color color)
@@ -1945,6 +2000,7 @@ namespace ProxyPicker.UI
                 return HelpCard.Contains(x, y) ? Btn.None : Btn.HelpClose;
             }
 
+            if (_mismatch > 0 && MismatchRect.Contains(x, y)) return Btn.Mismatch;
             if (CloseRect.Contains(x, y)) return Btn.Close;
             if (MinRect.Contains(x, y)) return Btn.Min;
             if (RefreshRect.Contains(x, y)) return Btn.Refresh;
@@ -1993,6 +2049,7 @@ namespace ProxyPicker.UI
             if (b == Btn.HelpMode) { ToggleMode(); return; }
             if (b == Btn.HelpIpv6) { ToggleIpv6Guard(); return; }
             if (b == Btn.HelpUpdate) { VersionClick(); return; }
+            if (b == Btn.Mismatch) { ShowMismatchDialog(); return; }
 
             int tab = HitTab(e.Location);
             if (tab >= 0) { _tab = tab; Settings.Current.Tab = tab; Settings.Save(); RebuildVisible(true); return; }
@@ -2000,6 +2057,40 @@ namespace ProxyPicker.UI
             {
                 ReleaseCapture(); SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(HTCAPTION), IntPtr.Zero);
             }
+        }
+
+        /// <summary>
+        /// 分流异常完整清单。摘要卡只有一行，异常一多必然放不下（用户实机反馈），
+        /// 这里逐条列全：哪个软件、预期什么、实测什么、为什么、下一步怎么办。
+        /// MessageBox 的文本可直接 Ctrl+C 复制，便于贴到 issue 里排查。
+        /// </summary>
+        void ShowMismatchDialog()
+        {
+            if (_mismatchItems == null || _mismatchItems.Count == 0)
+            {
+                SetStatus("当前没有分流异常", Theme.Dim);
+                return;
+            }
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("共 " + _mismatchItems.Count + " 个软件的「实际链路」与「生效规则」不一致：");
+            sb.AppendLine();
+            int n = 0;
+            foreach (var m in _mismatchItems)
+            {
+                n++;
+                sb.AppendLine(n + ") " + m.Exe);
+                sb.AppendLine("   预期：" + (m.Expected ? "走代理" : "直连")
+                    + "   实测：" + m.Proxy + " 条代理 / " + m.Direct + " 条直连"
+                    + (string.IsNullOrEmpty(m.Node) ? "" : "   节点：" + m.Node));
+                sb.AppendLine("   原因：" + m.Reason);
+                sb.AppendLine("   下一步：" + m.Action);
+                sb.AppendLine();
+            }
+            sb.AppendLine("统计只算本次规则生效后新建的连接；之前建立的长连接已排除，");
+            sb.AppendLine("程序自动放行的辅助进程已按「走代理」计入预期，不会再误报。");
+            sb.AppendLine("按 Ctrl+C 可复制这份清单；帮助面板的「复制诊断」还带内核状态。");
+            MessageBox.Show(this, sb.ToString(), "分流异常明细（" + _mismatchItems.Count + " 个）",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         void OpenHelp()
@@ -2140,11 +2231,12 @@ namespace ProxyPicker.UI
                 if (!UiAlive) return;
 
                 _update = info;
-                Settings.MarkUpdateChecked();   // 失败也记：离线时不要每次打开面板都白等 6 秒
+                // 失败也记时间（但 4 小时后重试）；成功则缓存远端版本供离线复提醒。
+                Settings.MarkUpdateChecked(info.Ok, info.Latest, info.Url);
                 if (info.Ok && info.Newer)
                 {
                     AuditLog.Record("UPDATE", "发现新版本 v" + info.Latest);
-                    Toast("有新版本 v" + info.Latest, "点帮助面板里的版本号去下载", Theme.Accent, 2);
+                    NotifyNewVersion(info.Latest);
                 }
                 else if (manual)
                 {
@@ -2164,6 +2256,49 @@ namespace ProxyPicker.UI
             }
         }
 
+        /// <summary>
+        /// 程序一启动（托盘就绪后）就调一次。两件事：
+        /// ① 用上次查到的远端版本先提醒一次 —— 24 小时节流期间不联网也能提示，
+        ///    用户不必「记得自己去点检查更新」；
+        /// ② 到了检查间隔才真发那个 GET。窗口收在托盘 / --tray 后台启动同样会跑。
+        /// </summary>
+        public void StartAutoUpdateCheck()
+        {
+            if (_updateSessionDone) return;
+            _updateSessionDone = true;
+            if (!Updater.Enabled || !Settings.Current.UpdateCheck) return;
+
+            string cached = Settings.CachedLatestVersion;
+            if (!string.IsNullOrEmpty(cached) && Updater.NewerThan(cached, Updater.Current))
+            {
+                string url = Settings.CachedLatestUrl;
+                if (string.IsNullOrEmpty(url))
+                    url = "https://github.com/" + Updater.RepoSlug + "/releases";
+                _update = new Updater.Info
+                {
+                    Ok = true, Newer = true,
+                    Latest = Updater.Clean(cached),
+                    Url = url
+                };
+                NotifyNewVersion(_update.Latest);
+            }
+            if (Settings.ShouldCheckUpdate(24)) CheckUpdateAsync(false);
+        }
+
+        /// <summary>同一个版本每次运行只提醒一次，避免缓存提示 + 联网复查重复打扰。</summary>
+        void NotifyNewVersion(string version)
+        {
+            if (string.IsNullOrEmpty(version) || _notifiedVersion == version) return;
+            _notifiedVersion = version;
+            Toast("有新版本 v" + version, "点版本号打开下载页；托盘也会弹通知", Theme.Accent, 2);
+            var bubble = TrayBalloon;
+            if (bubble != null)
+            {
+                try { bubble("ProxyPicker 有新版本 v" + version, "当前 v" + Updater.CurrentText + " · 点这条通知打开面板"); }
+                catch { }
+            }
+        }
+
         /// <summary>托盘菜单里的「检查更新」入口。</summary>
         public void CheckUpdatePublic()
         {
@@ -2174,6 +2309,58 @@ namespace ProxyPicker.UI
         /// <summary>托盘「复制诊断信息」走同一个入口，保证脱敏口径一致。</summary>
         public void CopyDiagnosticsPublic() { CopyDiagnostics(); }
 
+        /// <summary>托盘菜单入口：补上自动扫描的四类盲区。</summary>
+        public void AddExeManuallyPublic()
+        {
+            ShowPanel();
+            AddExeManually();
+        }
+
+        /// <summary>
+        /// 自动扫描只有四个来源（已保存名单 / 内置清单 / 运行进程 / 注册表与开始菜单），
+        /// 绿色版、MSIX、游戏目录、脚本类 bot 会漏。手选路径只记进程名并持久化到
+        /// settings.json 的 custom，刷新列表时仍在；规则按进程名匹配，路径仅用于显示，
+        /// 文件以后挪走也不影响分流。
+        /// </summary>
+        void AddExeManually()
+        {
+            using (var dlg = new OpenFileDialog
+            {
+                Title = "手动添加软件（选它的 .exe 主程序）",
+                Filter = "可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*",
+                CheckFileExists = true,
+                Multiselect = false
+            })
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                string path = dlg.FileName;
+                string exe = Profile.Normalize(System.IO.Path.GetFileName(path));
+                if (string.IsNullOrEmpty(exe)) return;
+
+                bool existed = false;
+                foreach (var r in _all)
+                    if (r.Exe.Equals(exe, StringComparison.OrdinalIgnoreCase))
+                    {
+                        existed = true;
+                        r.Common = true;
+                        if (string.IsNullOrEmpty(r.Path)) r.Path = path;
+                        break;
+                    }
+                Settings.AddCustomExe(exe);
+                if (!existed)
+                    _all.Add(new AppRow
+                    {
+                        Exe = exe,
+                        Name = System.IO.Path.GetFileNameWithoutExtension(path),
+                        Description = "手工添加",
+                        Path = path,
+                        Common = true
+                    });
+                RebuildVisible(true);
+                SetStatus("已添加 " + exe + "；勾选后点「保存」生效", Theme.Accent);
+            }
+        }
+
         /// <summary>
         /// 托盘「还原上次保存前的配置」成功后同步界面内存状态：
         /// 旧勾选还在内存里的话，30 秒看守会把刚还原的配置又补回去（复审 P2）。
@@ -2181,6 +2368,9 @@ namespace ProxyPicker.UI
         public void AfterRollback()
         {
             if (!UiAlive) return;
+            // 作废所有在途看守结果：还原那一刻可能已有一次对账跑到一半，
+            // 不改 revision 的话它会按旧结论把刚还原的规则重新推回去（外部评审 P0）。
+            _revision++;
             _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _list.SavedProxy = _savedProxy;
             foreach (var r in _all) { r.Proxy = false; r.Known = false; }

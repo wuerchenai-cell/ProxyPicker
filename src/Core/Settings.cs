@@ -34,6 +34,11 @@ namespace ProxyPicker.Core
             public bool TrayHintShown;                        // 「—」的托盘气泡只弹一次
             public bool UpdateCheck = true;                   // 检查更新总开关（只发一个 GET，不带任何本机信息）
             public long UpdateCheckedAt;                      // 上次检查的 UTC ticks，0 = 从没查过
+            public bool UpdateLastOk;                         // 上次有没有真的问到；没问到就早点重试
+            // 上次查到的远端版本 / Release 页面。24 小时节流期间不联网，
+            // 但每次启动仍能用它再提醒一次 —— 用户不必「记得自己去点检查更新」。
+            public string LatestVersion = "";
+            public string LatestUrl = "";
             // IPv6 防泄漏是「用户主动开启」的高级选项，默认关。
             // 原因：Clash Verge 新版把 ipv6 收归应用设置接管，扩展配置/推送全文里写它
             // 会被丢弃并弹橙色警告；更不该在用户只想给微信设直连时顺手改全局。
@@ -44,6 +49,19 @@ namespace ProxyPicker.Core
             // 第一次保存前记下的 find-process-mode："" 未知 / "always" / "smart" / "strict" / "off" / "absent"。
             // 退出还原必须恢复成用户原值，不能把 always 永久留下（复审 F-04）。
             public string FindProcessOriginal = "";
+            // 完全接管下，登录窗口 / 内嵌网页跑在共享的 WebView2 运行时里（msedgewebview2.exe），
+            // 用户通常不会勾它，于是被 MATCH,DIRECT 判成直连 —— ChatGPT / Codex 这类
+            // MSIX 应用的 OAuth、人机验证请求出不去，表现就是「开着本软件登不上、关掉就好」。
+            // 默认作为派生规则随已勾选软件一起放行；不写进名单，取消全部勾选即自动消失。
+            // 不想要这个例外时：把本项改成 false，或切到「订阅兼容」模式（未勾的按订阅原规则走）。
+            public bool LoginWindowProxy = true;
+            // 用户手动添加的 exe：自动扫描只有 4 个来源（运行进程 / 注册表与开始菜单 /
+            // 内置清单 / 已保存名单），绿色版、MSIX、游戏目录、脚本类 bot 会漏。
+            // 手选的进程名单独持久化，刷新列表时仍要出现，否则下次打开又「消失」。
+            public List<string> Custom = new List<string>();
+            // 原值快照（find-process-mode / ipv6）是在哪一份客户端配置下捕获的。
+            // 换客户端或换配置后旧快照就过期了，必须重新捕获，不能拿来覆盖用户的新设置。
+            public string RestoreSource = "";
         }
 
         static Data _data;
@@ -79,6 +97,12 @@ namespace ProxyPicker.Core
 
         public static bool Ipv6GuardOn { get { lock (Gate) return Current.Ipv6Guard; } }
 
+        /// <summary>完全接管时是否放行登录窗口（WebView2 共享运行时）。默认开，可在 settings.json 关闭。</summary>
+        public static bool LoginWindowProxyOn
+        {
+            get { lock (Gate) return Current.LoginWindowProxy; }
+        }
+
         /// <summary>用户主动开关「IPv6 防泄漏」。开启前先记下内核原值，关掉时才能推回去。</summary>
         public static void SetIpv6Guard(bool on)
         {
@@ -88,9 +112,121 @@ namespace ProxyPicker.Core
             if (!Save()) throw new InvalidOperationException("保存 IPv6 设置失败：" + LastSaveError);
         }
 
+        // ---------------------------------------------------------------- 原值快照 / 手工条目
+
+        /// <summary>当前生效的客户端配置路径，作为「原值快照属于谁」的标识；探测不到返回空，不动快照。</summary>
+        static string SourceKey()
+        {
+            try
+            {
+                string p = Paths.ClashYaml;
+                return string.IsNullOrEmpty(p) ? "" : p.Trim().ToLowerInvariant();
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>
+        /// 换客户端 / 换配置后旧快照就过期了，不能拿去覆盖用户的新设置。
+        /// 只在这时清；同一次接管里连续保存不会重复捕获，避免把工具自己写的 always 记成原值。
+        /// </summary>
+        static void EnsureRestoreSource()
+        {
+            string key = SourceKey();
+            if (key.Length == 0) return;
+            lock (Gate)
+            {
+                var d = Current;
+                if (!string.IsNullOrEmpty(d.RestoreSource) &&
+                    !d.RestoreSource.Equals(key, StringComparison.OrdinalIgnoreCase))
+                {
+                    d.Ipv6Original = "";
+                    d.FindProcessOriginal = "";
+                }
+                d.RestoreSource = key;
+            }
+            Save();
+        }
+
+        /// <summary>从磁盘订阅文本里读 find-process-mode；没有这一行返回 "absent"，传 null 返回 null。</summary>
+        internal static string ParseFindProcessFromYaml(string yaml)
+        {
+            if (yaml == null) return null;
+            foreach (var raw in yaml.Replace("\r\n", "\n").Split('\n'))
+            {
+                string t = raw.Trim();
+                if (t.StartsWith("find-process-mode:", StringComparison.OrdinalIgnoreCase))
+                {
+                    string v = t.Substring("find-process-mode:".Length).Trim();
+                    int hash = v.IndexOf('#');           // 行内注释：always # 说明
+                    if (hash >= 0) v = v.Substring(0, hash).Trim();
+                    return v.Trim('\'', '"');
+                }
+            }
+            return "absent";
+        }
+
+        /// <summary>
+        /// 优先读磁盘客户端配置：本工具从不写它，永远是用户原始的基线。
+        /// 内核 /configs 可能已被上次接管改成 always，直接读会把工具自己的值当成原值
+        /// （那样退出时 fpmRestore=false，always 就永久留下了，正是 v1.2.3 修掉的 bug）。
+        /// </summary>
+        static string DiskFindProcessMode()
+        {
+            try
+            {
+                string p = Paths.ClashYaml;
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return null;
+                return ParseFindProcessFromYaml(File.ReadAllText(p, Encoding.UTF8));
+            }
+            catch { return null; }
+        }
+
+        /// <summary>退出 / 托盘还原成功后调用：这次接管已收尾，下次重新捕获当时的真实基线。</summary>
+        public static void ClearRestoreBaseline()
+        {
+            lock (Gate)
+            {
+                var d = Current;
+                d.Ipv6Original = "";
+                d.FindProcessOriginal = "";
+                d.RestoreSource = "";
+            }
+            Save();
+        }
+
+        public static List<string> CustomExes
+        {
+            get { lock (Gate) return new List<string>(Current.Custom); }
+        }
+
+        public static bool IsCustomExe(string exe)
+        {
+            if (string.IsNullOrEmpty(exe)) return false;
+            lock (Gate)
+            {
+                foreach (var s in Current.Custom)
+                    if (string.Equals(s, exe, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        public static void AddCustomExe(string exe)
+        {
+            if (string.IsNullOrEmpty(exe)) return;
+            lock (Gate)
+            {
+                bool has = false;
+                foreach (var s in Current.Custom)
+                    if (string.Equals(s, exe, StringComparison.OrdinalIgnoreCase)) { has = true; break; }
+                if (!has) Current.Custom.Add(exe);
+            }
+            Save();
+        }
+
         /// <summary>把「改之前」的 IPv6 状态记一次，之后不再覆盖；读不到就留空，不猜。</summary>
         public static void CaptureIpv6Original()
         {
+            EnsureRestoreSource();
             lock (Gate) { if (!string.IsNullOrEmpty(Current.Ipv6Original)) return; }
             string value;
             try
@@ -114,18 +250,24 @@ namespace ProxyPicker.Core
         /// </summary>
         public static void CaptureFindProcessOriginal()
         {
+            EnsureRestoreSource();
             lock (Gate) { if (!string.IsNullOrEmpty(Current.FindProcessOriginal)) return; }
-            string value = null;
-            try
+            // 磁盘订阅优先：本工具从不写客户端配置文件，它才是没被污染的用户基线。
+            // 只有磁盘读不到（例如裸 mihomo 用命令行参数指定）才退回内核 /configs。
+            string value = DiskFindProcessMode();
+            if (value == null)
             {
-                var cfg = Mihomo.GetJson("/configs", 4000);
-                if (cfg != null)
+                try
                 {
-                    string v = Json.Str(cfg, "find-process-mode");
-                    value = string.IsNullOrEmpty(v) ? "absent" : v;
+                    var cfg = Mihomo.GetJson("/configs", 4000);
+                    if (cfg != null)
+                    {
+                        string v = Json.Str(cfg, "find-process-mode");
+                        value = string.IsNullOrEmpty(v) ? "absent" : v;
+                    }
                 }
+                catch { value = null; }
             }
-            catch { value = null; }
             if (value == null) return;
             lock (Gate)
             {
@@ -176,14 +318,18 @@ namespace ProxyPicker.Core
                     var d = _data;
                     string sortMode = d.SortMode, mode = d.Mode, ipv6Original = d.Ipv6Original ?? "";
                     string findProcessOriginal = d.FindProcessOriginal ?? "";
+                    string restoreSource = d.RestoreSource ?? "";
+                    string latestVersion = d.LatestVersion ?? "", latestUrl = d.LatestUrl ?? "";
                     int tab = d.Tab;
                     long checkedAt = d.UpdateCheckedAt;
                     bool firstRun = d.FirstRun, trayHint = d.TrayHintShown,
-                         updateCheck = d.UpdateCheck, ipv6Guard = d.Ipv6Guard;
+                         updateCheck = d.UpdateCheck, ipv6Guard = d.Ipv6Guard,
+                         loginWindowProxy = d.LoginWindowProxy;
                     var order = new List<string>(d.Order);
                     var usage = new Dictionary<string, int>(d.Usage, StringComparer.OrdinalIgnoreCase);
                     var lastUsed = new Dictionary<string, long>(d.LastUsed, StringComparer.OrdinalIgnoreCase);
                     var hidden = new List<string>(d.Hidden);
+                    var custom = new List<string>(d.Custom);
 
                     var sb = new StringBuilder();
                     sb.Append("{\n");
@@ -194,9 +340,14 @@ namespace ProxyPicker.Core
                     sb.Append("  \"trayHintShown\": ").Append(trayHint ? "true" : "false").Append(",\n");
                     sb.Append("  \"updateCheck\": ").Append(updateCheck ? "true" : "false").Append(",\n");
                     sb.Append("  \"updateCheckedAt\": ").Append(checkedAt).Append(",\n");
+                    sb.Append("  \"updateLastOk\": ").Append(d.UpdateLastOk ? "true" : "false").Append(",\n");
+                    sb.Append("  \"latestVersion\": ").Append(Json.Quote(latestVersion)).Append(",\n");
+                    sb.Append("  \"latestUrl\": ").Append(Json.Quote(latestUrl)).Append(",\n");
                     sb.Append("  \"ipv6Guard\": ").Append(ipv6Guard ? "true" : "false").Append(",\n");
                     sb.Append("  \"ipv6Original\": ").Append(Json.Quote(ipv6Original)).Append(",\n");
                     sb.Append("  \"findProcessOriginal\": ").Append(Json.Quote(findProcessOriginal)).Append(",\n");
+                    sb.Append("  \"restoreSource\": ").Append(Json.Quote(restoreSource)).Append(",\n");
+                    sb.Append("  \"loginWindowProxy\": ").Append(loginWindowProxy ? "true" : "false").Append(",\n");
 
                     sb.Append("  \"order\": [");
                     for (int i = 0; i < order.Count; i++)
@@ -227,6 +378,15 @@ namespace ProxyPicker.Core
                     sb.Append("  \"hidden\": [");
                     n = 0;
                     foreach (var v in hidden)
+                    {
+                        if (n++ > 0) sb.Append(", ");
+                        sb.Append(Json.Quote(v));
+                    }
+                    sb.Append("],\n");
+
+                    sb.Append("  \"custom\": [");
+                    n = 0;
+                    foreach (var v in custom)
                     {
                         if (n++ > 0) sb.Append(", ");
                         sb.Append(Json.Quote(v));
@@ -295,12 +455,19 @@ namespace ProxyPicker.Core
                 if (root.TryGetValue("trayHintShown", out v) && v is bool) d.TrayHintShown = (bool)v;
                 if (root.TryGetValue("updateCheck", out v) && v is bool) d.UpdateCheck = (bool)v;
                 if (root.TryGetValue("updateCheckedAt", out v) && v is double) d.UpdateCheckedAt = (long)(double)v;
+                if (root.TryGetValue("updateLastOk", out v) && v is bool) d.UpdateLastOk = (bool)v;
+                d.LatestVersion = Json.Str(root, "latestVersion") ?? "";
+                d.LatestUrl = Json.Str(root, "latestUrl") ?? "";
                 if (root.TryGetValue("ipv6Guard", out v) && v is bool) d.Ipv6Guard = (bool)v;
                 string ipv6Orig = Json.Str(root, "ipv6Original");
                 if (ipv6Orig == "true" || ipv6Orig == "false" || ipv6Orig == "absent") d.Ipv6Original = ipv6Orig;
                 string fpmOrig = Json.Str(root, "findProcessOriginal");
                 if (fpmOrig == "always" || fpmOrig == "smart" || fpmOrig == "strict" ||
                     fpmOrig == "off" || fpmOrig == "absent") d.FindProcessOriginal = fpmOrig;
+                if (root.TryGetValue("restoreSource", out v) && v is string) d.RestoreSource = (string)v;
+                // v1.2.5 漏了这一项：字段有默认值却没写进 JSON，用户在 settings.json 里
+                // 把 loginWindowProxy 改成 false 根本不会被读到，登录窗口例外无法关闭。
+                if (root.TryGetValue("loginWindowProxy", out v) && v is bool) d.LoginWindowProxy = (bool)v;
 
                 Dictionary<string, object> obj;
                 if (root.TryGetValue("order", out v))
@@ -335,6 +502,16 @@ namespace ProxyPicker.Core
                         {
                             var s = item as string;
                             if (!string.IsNullOrEmpty(s)) d.Hidden.Add(s);
+                        }
+                }
+                if (root.TryGetValue("custom", out v))
+                {
+                    var arr = Json.AsArray(v);
+                    if (arr != null)
+                        foreach (var item in arr)
+                        {
+                            var s = item as string;
+                            if (!string.IsNullOrEmpty(s)) d.Custom.Add(s);
                         }
                 }
             }
@@ -431,13 +608,41 @@ namespace ProxyPicker.Core
                 if (!d.UpdateCheck) return false;
                 if (d.UpdateCheckedAt <= 0) return true;
                 long elapsed = DateTime.UtcNow.Ticks - d.UpdateCheckedAt;
-                return elapsed < 0 || elapsed > TimeSpan.FromHours(hours).Ticks;   // 系统时间被改过就再查一次
+                // 上次没问到（没网 / 被挡）时早点重试，别让一次离线拖成整整一天查不到。
+                double wait = d.UpdateLastOk ? hours : Math.Min(hours, 4);
+                return elapsed < 0 || elapsed > TimeSpan.FromHours(wait).Ticks;
             }
         }
 
-        public static void MarkUpdateChecked()
+        /// <summary>
+        /// 记一次检查结果：失败也记时间但缩短重试；成功时把远端版本缓存下来，
+        /// 供 24 小时节流期间每次启动「离线复提醒」，不需要重新联网。
+        /// </summary>
+        public static void MarkUpdateChecked(bool ok, string latest, string url)
         {
-            lock (Gate) { Current.UpdateCheckedAt = DateTime.UtcNow.Ticks; Save(); }
+            lock (Gate)
+            {
+                var d = Current;
+                d.UpdateCheckedAt = DateTime.UtcNow.Ticks;
+                d.UpdateLastOk = ok;
+                if (ok)
+                {
+                    d.LatestVersion = latest ?? "";
+                    d.LatestUrl = url ?? "";
+                }
+                Save();
+            }
+        }
+
+        /// <summary>上次查到的远端最新版本 / Release 页面（没查过就是空）。</summary>
+        public static string CachedLatestVersion
+        {
+            get { lock (Gate) return Current.LatestVersion ?? ""; }
+        }
+
+        public static string CachedLatestUrl
+        {
+            get { lock (Gate) return Current.LatestUrl ?? ""; }
         }
     }
 }

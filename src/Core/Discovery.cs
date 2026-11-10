@@ -736,9 +736,12 @@ namespace ProxyPicker.Core
             //    用户自己写在段首的 PROCESS-NAME（例如强制 DIRECT）一律原样保留。
             block = StripMarkedBlock(block);
             block = StripLegacyRuleSet(block);
-            // 段首的 MATCH,DIRECT 只可能是上次「完全接管」留下的短路：
-            // 正常订阅把 MATCH 写在最后。不清掉它，切回兼容模式后订阅规则永远匹配不到。
-            block = StripHeadMatch(block);
+            // 订阅兼容模式（patchOnly）必须原样保留段首 MATCH,DIRECT：
+            // 程序每次都从没被改过的磁盘订阅重新生成，这一条只可能是用户 / 订阅自己写的，
+            // 删掉会直接改变分流语义（外部评审 #4）。
+            // 完全接管模式仍清一次：自家规则本来就插在段首，旧兜底留着只是死规则，
+            // 且空名单场景依赖「段首只有一条 MATCH」的回读校验。
+            if (!patchOnly) block = StripHeadMatch(block);
             block = TrimBlankEdges(block);
 
             // 4. 缩进跟随原有规则：有的配置写 rules:\n  - xxx，插到顶格会让 YAML 变成非法结构。
@@ -786,7 +789,9 @@ namespace ProxyPicker.Core
                 // 必须把 MATCH,DIRECT 放到段首短路掉订阅规则（整体让位），而不是加到尾部：
                 //  - 放尾部时订阅规则仍先匹配，违背「全部直连」语义；
                 //  - 回读校验（Profile.cs:530）要求空名单首条是 Match，尾部会误报「缺少直连兜底」；
-                //  - StripHeadMatch 只清段首，尾部 MATCH 每次保存都会累加一条。
+                //  - 尾部的 MATCH 不在它该在的位置，StripHeadMatch 也够不着它。
+                //    注：不会「每次保存累加一条」——每次生成都以未被本工具改过的磁盘订阅为基线，
+                //    结果只推给内核、不回写磁盘（早期审查报告里的「累加」结论是误报）。
                 rebuilt.Insert(0, indent + "- MATCH,DIRECT");
             }
 
@@ -962,8 +967,8 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
-        /// 段首第一条规则就是 MATCH,DIRECT 时，只可能是上次接管留下的短路兜底：
-        /// 正常订阅把 MATCH 写在最后。切回兼容模式必须清掉它，否则后面订阅规则全被挡住。
+        /// 完全接管时清掉段首第一条 MATCH,DIRECT（自家规则会插到更前面）。
+        /// 只允许在 !patchOnly 下调用：订阅兼容模式里段首 MATCH 属于用户原始规则，不能动。
         /// </summary>
         static List<string> StripHeadMatch(List<string> block)
         {
@@ -1152,15 +1157,17 @@ namespace ProxyPicker.Core
             string patched = BuildPayload(dirty, items, "PP-FIXED", true);
             check("I 缺兜底时自动补回 MATCH", CountOccurrences(patched, "- MATCH,DIRECT") == 1, "");
 
-            // J. 磁盘配置被上一次接管写过（段首留着 MATCH,DIRECT），切回兼容时必须清掉，
-            //    否则那条短路规则会让后面所有订阅规则永远匹配不到 —— 切了等于没切。
+            // J. 更正旧假设：程序从不写客户端配置文件，每次生成都以干净磁盘订阅为基线，
+            //    所以段首的 MATCH,DIRECT 只能是用户 / 订阅自己写的。旧逻辑把它删掉再补到末尾，
+            //    会把「原本全部直连」的订阅改成后面的 DOMAIN 规则先生效，语义被悄悄改掉（外部评审 #4）。
             string polluted = "mode: rule\nproxies: []\nrules:\n- MATCH,DIRECT\n- DOMAIN-SUFFIX,google.com,🚀 节点选择\n";
             string clean = BuildPayload(polluted, items, "🚀 节点选择", true);
-            check("J 兼容模式清掉遗留的短路兜底",
-                clean.IndexOf("rules:\n- MATCH,DIRECT", StringComparison.Ordinal) < 0 &&
-                clean.IndexOf("DOMAIN-SUFFIX,google.com", StringComparison.Ordinal) >= 0, "");
-            check("J 兜底被挪到规则末尾",
-                clean.TrimEnd('\n').EndsWith("- MATCH,DIRECT", StringComparison.Ordinal), "");
+            check("J 兼容模式保留订阅自己的段首 MATCH",
+                clean.IndexOf("rules:\n# PP-BEGIN", StringComparison.Ordinal) >= 0 &&
+                clean.IndexOf("- MATCH,DIRECT\n- DOMAIN-SUFFIX,google.com", StringComparison.Ordinal) >= 0 &&
+                CountOccurrences(clean, "- MATCH,DIRECT") == 1, "");
+            check("J 兜底不再被挪到规则末尾",
+                !clean.TrimEnd('\n').EndsWith("- MATCH,DIRECT", StringComparison.Ordinal), "");
 
             // K. 更老的一种遗留：段首是 `RULE-SET,pp-whitelist`，它后面紧跟一条 MATCH,DIRECT。
             //    这条 MATCH 排第二、不是第一位，J 的判据抓不到，但它照样短路后面所有规则。
@@ -1286,6 +1293,77 @@ namespace ProxyPicker.Core
                 {
                     new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" }
                 }, null, false, false), "");
+            // N7b：明确保存过空名单时，段首 MATCH,DIRECT 是本工具写的，退出必须还原（外部评审 F2）。
+            // 这条锁住的是 ShouldRestore 的六参数重载，防止以后又把「空名单接管」误判成「没接管过」。
+            check("N7b 空名单接管后，内核只有 MATCH,DIRECT 也要还原",
+                Profile.ShouldRestore(true, new List<Profile.RuleInfo>
+                {
+                    new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" }
+                }, null, false, false, true), "");
+            check("N7c 从没表达过意图时不因一条用户 MATCH 误还原",
+                !Profile.ShouldRestore(true, new List<Profile.RuleInfo>
+                {
+                    new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" }
+                }, null, false, false, false), "");
+
+            // F1：strict 是 mihomo 默认档，段首 PROCESS 规则正常生效；只有 off 才算真的关闭。
+            // 以前 Judge 把「不是 always」一律判成没开，默认 Clash Verge Rev 下看守直接放弃补回。
+            var fpmStrict = new Guard.Intent
+            {
+                Ok = true, Mode = "rule", FindProcess = "strict",
+                FirstRuleIsMatch = true, MatchIndex = 1, LastProcessIndex = 0
+            };
+            check("F1-a strict 不再被判成进程识别关闭（看守会继续补回）",
+                Guard.Judge(fpmStrict, 0, false) == null, "");
+            var fpmOff = new Guard.Intent
+            {
+                Ok = true, Mode = "rule", FindProcess = "off",
+                FirstRuleIsMatch = true, MatchIndex = 1, LastProcessIndex = 0
+            };
+            string offVerdict = Guard.Judge(fpmOff, 0, false);
+            check("F1-b off 仍然判为进程识别关闭",
+                offVerdict != null && offVerdict.IndexOf("off", StringComparison.OrdinalIgnoreCase) >= 0, "");
+
+            // G1：订阅兼容模式不能删掉用户 / 订阅写在段首的 MATCH（外部评审 #4）。
+            string headMatchYaml = "mode: rule\nproxies: []\nrules:\n- MATCH,DIRECT\n- DOMAIN-SUFFIX,google.com,DIRECT\n";
+            string patchKeep = BuildPayload(headMatchYaml, new List<Profile.Item>(), "PP-FIXED", true);
+            check("G1-a 订阅兼容保留段首 MATCH,DIRECT",
+                patchKeep.IndexOf("- MATCH,DIRECT\n- DOMAIN-SUFFIX,google.com,DIRECT", StringComparison.Ordinal) >= 0, "");
+            string wlKeep = BuildPayload(headMatchYaml, new List<Profile.Item>(), "PP-FIXED", false);
+            check("G1-b 完全接管空名单仍只留一条段首 MATCH",
+                CountOccurrences(wlKeep, "- MATCH,DIRECT") == 1 &&
+                wlKeep.IndexOf("rules:\n- MATCH,DIRECT", StringComparison.Ordinal) >= 0, "");
+
+            // G2：备份来源核对（不匹配拒绝 / 旧备份放行但警告 / 匹配放行）。
+            string why;
+            check("G2-a 备份来源与当前配置一致时放行",
+                Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\a\config.yaml", true, out why) && why.Length == 0, "");
+            check("G2-b 备份来自另一份配置时拒绝还原",
+                !Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\b\config.yaml", true, out why) &&
+                why.IndexOf("另一份", StringComparison.Ordinal) >= 0, "");
+            check("G2-c 旧版无来源标记放行但必须警告",
+                Profile.BackupAllowed("", @"D:\b\config.yaml", false, out why) &&
+                why.IndexOf("旧版", StringComparison.Ordinal) >= 0, "");
+
+            // G3：手动还原＝删除名单文件。用临时文件覆盖，绝不碰真机名单。
+            string tmpIntent = Path.Combine(Path.GetTempPath(), "pp-selftest-" + Guid.NewGuid().ToString("N") + ".yaml");
+            try
+            {
+                File.WriteAllText(tmpIntent, "payload:\n");
+                string err;
+                bool gone = Profile.ClearIntentFile(tmpIntent, out err) && !File.Exists(tmpIntent) && err.Length == 0;
+                bool absentOk = Profile.ClearIntentFile(tmpIntent, out err) && err.Length == 0;
+                check("G3 删除名单文件后意图消失，重复删除也安全", gone && absentOk, "");
+            }
+            finally { try { if (File.Exists(tmpIntent)) File.Delete(tmpIntent); } catch { } }
+
+            // G4：find-process-mode 原值以磁盘订阅为准，不能把工具写的 always 当成基线。
+            check("G4-a 磁盘里的 strict 被正确读出",
+                Settings.ParseFindProcessFromYaml("mode: rule\nfind-process-mode: strict\nrules:\n") == "strict", "");
+            check("G4-b 磁盘里没有这一行判为 absent",
+                Settings.ParseFindProcessFromYaml("mode: rule\nrules:\n") == "absent", "");
+            check("G4-c 带引号与行内注释也能读",
+                Settings.ParseFindProcessFromYaml("find-process-mode: 'always' # note\n") == "always", "");
 
             // N8：用户自己写的 `# PP-BEGIN / # PP-END` 分区注释里如果只有 DIRECT 规则，
             //     不能当成工具块删掉（CodeArts F-02）。

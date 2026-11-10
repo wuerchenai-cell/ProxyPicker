@@ -40,9 +40,74 @@ namespace ProxyPicker.Core
             { Exe = pattern; Policy = policy; if (pathRule) PathRegex = pattern; }
         }
 
+        /// <summary>
+        /// 名单文件是否存在＝用户是否曾明确表达过分流意图。空名单保存时也会写出这个文件，
+        /// 所以它能天然区分「新装/刚还原，从没表达过意图」与「用户明确要全部直连」。
+        /// 看守据此决定要不要维护段首 MATCH，不引入会过期的独立状态位。
+        /// </summary>
+        public static bool HasSavedIntent
+        {
+            get { try { return File.Exists(Paths.ListPath); } catch { return false; } }
+        }
+
+        /// <summary>
+        /// 手动「还原」＝撤销接管意图。名单文件一旦删掉，看守就不会再按空名单补回
+        /// MATCH,DIRECT。用文件本身表达意图，不引入会过期 / 崩溃残留的独立状态位。
+        /// 抽成按路径操作是为了让自检能用临时文件覆盖，绝不碰真机名单。
+        /// </summary>
+        internal static bool ClearIntentFile(string path, out string error)
+        {
+            error = "";
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path)) File.Delete(path);
+                return true;
+            }
+            catch (Exception ex) { error = ex.Message; return false; }
+        }
+
+        public static bool ClearSavedIntent(out string error)
+        {
+            bool ok = ClearIntentFile(Paths.ListPath, out error);
+            if (ok)
+            {
+                LastGoodItems = new List<Item>();
+                LastLoadError = "";
+                LastSaveError = "";
+            }
+            return ok;
+        }
+
+        /// <summary>
+        /// 备份能不能推给当前客户端。旧版备份没有 .meta，一律放行但要求调用方明确警告；
+        /// 新版备份记录了来源配置路径，与当前路径不一致时拒绝，避免把 A 客户端的订阅推给 B。
+        /// </summary>
+        internal static bool BackupAllowed(string metaSource, string currentPath, bool metaExists, out string why)
+        {
+            why = "";
+            if (!metaExists || string.IsNullOrEmpty(metaSource))
+            {
+                why = "这份备份没有记录来源（旧版备份）";
+                return true;
+            }
+            if (string.IsNullOrEmpty(currentPath))
+            {
+                why = "当前探测不到客户端配置，无法核对备份来源";
+                return true;
+            }
+            if (!metaSource.Trim().Equals(currentPath.Trim(), StringComparison.OrdinalIgnoreCase))
+            {
+                why = "备份来自另一份客户端配置，已停止还原以免推错订阅";
+                return false;
+            }
+            return true;
+        }
+
         public sealed class ApplyOutcome
         {
             public bool Ok;
+            /// <summary>配置已成功推给内核（即使随后回读校验或名单写入失败）。界面据此同步内存名单。</summary>
+            public bool Pushed;
             public string Message;
             public int RuleCount;
             public long Ms;
@@ -486,6 +551,13 @@ namespace ProxyPicker.Core
                 result.Ms = sw.ElapsedMilliseconds;
                 return result;
             }
+            // 推送已经生效：后面无论名单写入还是回读校验是否成功，都不能让界面
+            // 继续拿旧名单去对账（否则看守会把用户刚取消勾选的软件又补回来，外部评审 F4）。
+            result.Pushed = true;
+            // 规则真正生效的时刻：此后建立的连接才参与「预期 vs 实际」对账。
+            // mihomo 不给已存在的连接重匹配规则，早于这一刻的长连接必须排除，
+            // 否则浏览器里挂着不关的 WebSocket 会一直报「勾了却走直连」的假警报。
+            Traffic.NotePush();
             // 只把「用户勾选的」写回名单；helper / 目录规则是推导出来的，不能落盘成
             // 独立条目，否则取消勾选主软件后它们仍会留在名单里继续代理（F-08）。
             var persist = new List<Item>();
@@ -552,8 +624,9 @@ namespace ProxyPicker.Core
                         string fpm = Json.Str(conf, "find-process-mode");
                         if (!string.IsNullOrEmpty(mode) && !mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
                         { good = false; whyBad = "客户端当前是 " + mode + " 模式，规则不生效，请切到规则模式"; }
-                        else if (!string.IsNullOrEmpty(fpm) && !fpm.Equals("always", StringComparison.OrdinalIgnoreCase))
-                        { good = false; whyBad = "进程识别未开启（find-process-mode=" + fpm + "）"; }
+                        // strict 是 mihomo 默认档，PROCESS-NAME 规则正常生效；只有 off 才是真的关闭（F1）。
+                        else if (!string.IsNullOrEmpty(fpm) && fpm.Equals("off", StringComparison.OrdinalIgnoreCase))
+                        { good = false; whyBad = "进程识别已关闭（find-process-mode=off）"; }
                     }
                 }
                 catch { }
@@ -617,16 +690,34 @@ namespace ProxyPicker.Core
                 Directory.CreateDirectory(dir);
                 string scrubbed = ScrubSecret(File.ReadAllText(configPath, Encoding.UTF8));
                 var utf8 = new UTF8Encoding(false);
+                string source = configPath ?? "";
 
                 string original = Path.Combine(dir, "original.yaml");
-                if (!File.Exists(original)) File.WriteAllText(original, scrubbed, utf8);
+                if (!File.Exists(original))
+                {
+                    File.WriteAllText(original, scrubbed, utf8);
+                    File.WriteAllText(original + ".meta", source, utf8);
+                }
 
                 string recent = Path.Combine(dir, "recent.yaml");
                 string prev2 = Path.Combine(dir, "recent-2.yaml");
                 string prev3 = Path.Combine(dir, "recent-3.yaml");
-                if (File.Exists(prev2)) File.Copy(prev2, prev3, true);
-                if (File.Exists(recent)) File.Copy(recent, prev2, true);
+                if (File.Exists(prev2)) { File.Copy(prev2, prev3, true); CopyBackupMeta(prev2, prev3); }
+                if (File.Exists(recent)) { File.Copy(recent, prev2, true); CopyBackupMeta(recent, prev2); }
                 File.WriteAllText(recent, scrubbed, utf8);
+                File.WriteAllText(recent + ".meta", source, utf8);
+            }
+            catch { }
+        }
+
+        /// <summary>备份轮转时来源标记一起走；旧备份没有标记就把目标的标记删掉，避免张冠李戴。</summary>
+        static void CopyBackupMeta(string fromYaml, string toYaml)
+        {
+            try
+            {
+                string from = fromYaml + ".meta", to = toYaml + ".meta";
+                if (File.Exists(from)) File.Copy(from, to, true);
+                else if (File.Exists(to)) File.Delete(to);
             }
             catch { }
         }
@@ -707,10 +798,16 @@ namespace ProxyPicker.Core
                 var live = ReadRules(out readOk);
                 // 复审 F-02：任一位置存在自家规则都算，不能只看首条；读失败必须按「有」处理。
                 bool fpmRestore = !string.IsNullOrEmpty(fpm) && !fpm.Equals("always", StringComparison.OrdinalIgnoreCase);
-                if (!ShouldRestore(readOk, live, mine, ipv6Restore, fpmRestore))
-                    return true;                   // 内核里本来就没有我们的东西，不必重载配置
+                // 完全接管 + 明确保存过空名单时，段首 MATCH,DIRECT 也是本工具留下的，必须一并撤掉。
+                bool emptyWhitelist = !Settings.PatchOnly && HasSavedIntent && mine.Count == 0;
+                if (!ShouldRestore(readOk, live, mine, ipv6Restore, fpmRestore, emptyWhitelist))
+                {
+                    Settings.ClearRestoreBaseline();   // 没接管过，也不该留着上一轮的过期基线
+                    return true;                       // 内核里本来就没有我们的东西，不必重载配置
+                }
                 var push = Mihomo.PushConfig(clean);
                 if (!push.Ok) { message = push.Error ?? ("HTTP " + push.Status); return false; }
+                Settings.ClearRestoreBaseline();       // 还原成功：这次接管收尾，下次重新捕获真实基线
                 return true;
             }
             catch (Exception ex) { message = ex.Message; return false; }
@@ -723,7 +820,27 @@ namespace ProxyPicker.Core
         internal static bool ShouldRestore(bool readOk, IEnumerable<RuleInfo> live, HashSet<string> mine,
                                            bool ipv6Restore, bool fpmRestore)
         {
+            return ShouldRestore(readOk, live, mine, ipv6Restore, fpmRestore, false);
+        }
+
+        /// <summary>
+        /// emptyWhitelist：用户明确保存过「一个都不勾／全部直连」。此时内核里只有本工具写的
+        /// 段首 MATCH,DIRECT，它既不是 PP-FIXED 也不在名单里，IsOwnRule 认不出来；
+        /// 若不单独判定，退出时会认为「没有我们的东西」而把全部直连状态留在内核里（外部评审 F2）。
+        /// </summary>
+        internal static bool ShouldRestore(bool readOk, IEnumerable<RuleInfo> live, HashSet<string> mine,
+                                           bool ipv6Restore, bool fpmRestore, bool emptyWhitelist)
+        {
             if (!readOk) return true;
+            if (emptyWhitelist && live != null)
+            {
+                foreach (var r in live)
+                {
+                    if (r == null) continue;
+                    if ((r.Type ?? "").Equals("Match", StringComparison.OrdinalIgnoreCase) &&
+                        (r.Proxy ?? "").Equals("DIRECT", StringComparison.OrdinalIgnoreCase)) return true;
+                }
+            }
             if (live != null)
             {
                 foreach (var r in live)
@@ -754,6 +871,25 @@ namespace ProxyPicker.Core
                     message = "没有找到备份（本程序还没在这台机器上保存过）";
                     return false;
                 }
+
+                // 备份来源核对：新版备份带 .meta，记录它是从哪份客户端配置拷出来的。
+                // 换过客户端 / 订阅之后，旧备份推给新内核会把订阅整个换掉，必须先拦住。
+                bool metaExists = File.Exists(chosen + ".meta");
+                string metaSource = "";
+                if (metaExists)
+                {
+                    try { metaSource = File.ReadAllText(chosen + ".meta", Encoding.UTF8).Trim(); }
+                    catch { metaExists = false; }
+                }
+                string currentCfg = Paths.ClashYaml;
+                string sourceWhy;
+                if (!BackupAllowed(metaSource, currentCfg, metaExists, out sourceWhy))
+                {
+                    message = sourceWhy + "（备份来源：" + metaSource + "；当前配置：" + currentCfg +
+                              "）。请先在界面里保存一次，再点还原。";
+                    return false;
+                }
+
                 string text = File.ReadAllText(chosen, Encoding.UTF8);
                 if (text.IndexOf("<备份时已移除", StringComparison.Ordinal) >= 0)
                 {
@@ -772,12 +908,21 @@ namespace ProxyPicker.Core
                     message = "推送备份失败：" + (push.Error ?? ("HTTP " + push.Status));
                     return false;
                 }
-                if (!Save(new List<Item>()))
+                // 关键：还原是「撤销接管意图」，必须删掉名单文件，不能写空名单。
+                // 写空名单时 HasSavedIntent 仍为 true，看守 30–90 秒后会按「用户要全部直连」
+                // 重新推回 MATCH,DIRECT，还原等于没做（外部评审 P0）。
+                string clearError;
+                bool cleared = ClearSavedIntent(out clearError);
+                if (cleared) Settings.ClearRestoreBaseline();
+                if (!cleared)
                 {
-                    message = "配置已还原，但勾选名单写入失败：" + LastSaveError;
-                    return false;
+                    message = "配置已还原，但勾选名单文件删除失败：" + clearError +
+                              "；请手动删除该文件后重启本程序，否则后台看守可能重新接管";
+                    return true;   // 内核已还原成功，界面仍要同步
                 }
-                message = "已还原为上次保存前的配置";
+                message = sourceWhy.Length > 0
+                    ? sourceWhy + "；已按当前配置还原，请确认订阅是否正确。"
+                    : "已还原为上次保存前的配置，接管状态已清除";
                 return true;
             }
             catch (Exception ex)

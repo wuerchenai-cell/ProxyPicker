@@ -659,7 +659,9 @@ namespace ProxyPicker.Core
                 // 地址是本机、但 /version 探不到：多半是客户端只开命名管道、没开 HTTP 端口，
                 // 属于「这条通道不可用」，不是安全事件，不能报成「已阻止发送密钥」。
                 // 只有非本机地址（上面 TryLoopbackEndpoint 拒绝）才需要硬阻止并给出安全提示。
-                if (!ProbeMihomo(ep)) return null;
+                // 只有「来自同一份客户端配置」的地址才允许带该配置的 Secret 重试；
+                // 下面那些猜出来的候选端口一律不带密钥，避免把 A 的 Secret 送到 B（评审 R6-2）。
+                if (!ProbeMihomo(ep, true)) return null;
                 _endpoint = ep;
                 return _endpoint;
             }
@@ -667,7 +669,7 @@ namespace ProxyPicker.Core
             string[] candidates = { "127.0.0.1:9090", "127.0.0.1:9097", "127.0.0.1:6170", "127.0.0.1:9091" };
             foreach (var ep in candidates)
             {
-                if (!ProbeMihomo(ep)) continue;
+                if (!ProbeMihomo(ep, false)) continue;
                 _endpoint = ep;
                 return _endpoint;
             }
@@ -701,8 +703,25 @@ namespace ProxyPicker.Core
             return true;
         }
 
-        /// <summary>无密钥探测 /version；这一步绝不会带 Authorization 头。</summary>
-        static bool ProbeMihomo(string ep)
+        /// <summary>
+        /// 探测 /version。mihomo 上游把 /version 注册在 authentication(secret) 中间件组内，
+        /// 配了 Secret 的实例对无密钥请求一律返 401 —— 以前这一步直接吞掉异常判「通道不可用」，
+        /// 导致只开 HTTP 控制口且设了 Secret 的客户端完全连不上（外部评审 F6）。
+        /// allowSecret=true 时（地址来自同一份客户端配置）才允许带密钥重试。
+        /// </summary>
+        static bool ProbeMihomo(string ep, bool allowSecret)
+        {
+            // 第一次绝不带 Authorization 头：没设 Secret 的实例不需要多余的信息披露。
+            if (ProbeVersion(ep, null)) return true;
+            if (!allowSecret) return false;
+            string secret = ReadSecret();
+            if (string.IsNullOrEmpty(secret)) return false;
+            // 401 只说明「需要认证」，不能据此认定服务可信：地址已被 TryLoopbackEndpoint
+            // 限定为本机回环，且带密钥重试后仍必须通过 LooksLikeMihomoVersion 校验响应体。
+            return ProbeVersion(ep, secret);
+        }
+
+        static bool ProbeVersion(string ep, string secret)
         {
             try
             {
@@ -713,6 +732,8 @@ namespace ProxyPicker.Core
                 req.Proxy = null;
                 req.KeepAlive = false;
                 req.AllowAutoRedirect = false;
+                if (!string.IsNullOrEmpty(secret))
+                    req.Headers["Authorization"] = "Bearer " + secret;
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 {
                     if (resp.StatusCode != HttpStatusCode.OK) return false;

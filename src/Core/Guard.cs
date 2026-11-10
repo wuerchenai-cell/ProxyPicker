@@ -145,9 +145,12 @@ namespace ProxyPicker.Core
             // 前置条件：全局模式或关掉进程识别时，规则根本不参与匹配（评审 R1-7 / R3-5）。
             if (!string.IsNullOrEmpty(it.Mode) && !it.Mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
                 return "客户端当前是 " + it.Mode + " 模式，规则不生效；请切回规则模式";
+            // mihomo 三档：always=强制查进程、strict=按需查（默认）、off=完全不查。
+            // 段首的 PROCESS-NAME 规则在 strict 下每条连接都会触发进程查询，所以只有 off 才算没开。
+            // 以前把非 always 一律当成关闭，默认 Clash Verge Rev（strict）下看守直接放弃补回（外部评审 F1）。
             if (!string.IsNullOrEmpty(it.FindProcess) &&
-                !it.FindProcess.Equals("always", StringComparison.OrdinalIgnoreCase))
-                return "进程识别未开启（find-process-mode=" + it.FindProcess + "）";
+                it.FindProcess.Equals("off", StringComparison.OrdinalIgnoreCase))
+                return "进程识别已关闭（find-process-mode=off）";
 
             if (patchOnly)
             {
