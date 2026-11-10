@@ -2,15 +2,15 @@
 
 只让「你勾选的软件」走代理 —— 一个给 Clash / mihomo 系客户端用的**按进程分流**小面板。
 
-单文件 exe，约 960 KB，不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
+单文件 exe，约 985 KB，不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
 
 [**下载最新版**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
 [直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
 [更新记录](CHANGELOG.md)
 
-> GitHub 当前最新 Release 仍是 **v1.2.4**（2026-11-09）；本仓库源码已是 **v1.3.1**，
-> 本地已打包、待实机复测后上传（v1.2.5 / v1.3.0 均未单独发布，其修复并入本版）。
-> 上面两个链接暂时仍指向 v1.2.4。
+> **v1.3.1 已发布**（2026-11-10）：上面两个下载链接指向的就是 v1.3.1，
+> Release 页面：https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v1.3.1
+> （v1.2.5 / v1.3.0 未单独发布，其修复并入本版）。
 > 程序里的「检查更新」只在远端版本号比本机大时才提示，不会把人引去下载旧包。
 
 ![主界面](docs/img/main.png)
