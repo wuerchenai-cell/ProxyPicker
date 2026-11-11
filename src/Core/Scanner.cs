@@ -296,13 +296,22 @@ namespace ProxyPicker.Core
             {
                 byte[] bytes = File.ReadAllBytes(link);
                 if (bytes.Length > 2 * 1024 * 1024) return found;
+                // .lnk 的 StringData 是 UTF-16，目标路径在 Unicode 解码结果里靠前；
+                // 二进制里还混着图标、工作目录等 EXE 字符串。以前把所有命中都当成
+                // 启动目标，容易把图标路径认成主程序（独立审阅第二轮）。
+                // 现在只取第一个可信命中，再交给同目录评分确认；ANSI 仅作老格式兜底。
                 string[] texts = { Encoding.Unicode.GetString(bytes), Encoding.Default.GetString(bytes) };
                 foreach (var text in texts)
                 {
                     foreach (Match m in ExePath.Matches(text))
                     {
                         string path = CleanPath(m.Value);
-                        if (File.Exists(path) && !found.Contains(path)) found.Add(path);
+                        if (!File.Exists(path)) continue;
+                        string lower = path.ToLowerInvariant();
+                        if (lower.Contains("uninstall") || lower.EndsWith("setup.exe") ||
+                            lower.Contains("\\update\\") || lower.Contains("\\crash")) continue;
+                        found.Add(path);
+                        return found;
                     }
                 }
             }

@@ -78,16 +78,62 @@ namespace ProxyPicker.Core
             return ok;
         }
 
+        /// <summary>配置文件内容指纹。Verge 下换订阅路径不变，只有内容能证明「还是当初那份」。</summary>
+        internal static string ConfigFingerprint(string configPath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(configPath) || !File.Exists(configPath)) return "";
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] hash = sha.ComputeHash(File.ReadAllBytes(configPath));
+                    var sb = new System.Text.StringBuilder(64);
+                    foreach (byte b in hash) sb.Append(b.ToString("x2"));
+                    return sb.ToString();
+                }
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>新版 .meta 两行：来源路径 + 备份时配置内容指纹。旧版只有一行路径。</summary>
+        internal static void WriteBackupMeta(string metaPath, string configPath)
+        {
+            File.WriteAllText(metaPath, (configPath ?? "") + "\n" + ConfigFingerprint(configPath),
+                             new UTF8Encoding(false));
+        }
+
+        /// <summary>兼容读取新旧两种 .meta；读不到或空行返回 false（按旧版备份处理）。</summary>
+        internal static bool ReadBackupMeta(string metaPath, out string source, out string fingerprint)
+        {
+            source = ""; fingerprint = "";
+            try
+            {
+                string[] lines = File.ReadAllText(metaPath, Encoding.UTF8)
+                                     .Replace("\r\n", "\n").Split('\n');
+                source = (lines[0] ?? "").Trim();
+                if (lines.Length > 1) fingerprint = (lines[1] ?? "").Trim();
+                return source.Length > 0;
+            }
+            catch { return false; }
+        }
+
         /// <summary>
-        /// 备份能不能推给当前客户端（fail-closed，三种情况一律拒绝并给原因）：
-        /// 1) 无 .meta（旧版备份）：不推整份原件，调用方改走 BuildCleanRollbackPayload 基于当前订阅重建；
-        /// 2) 当前探测不到配置：核对不了来源，停止；
-        /// 3) 来源与当前路径不一致：避免把 A 客户端的订阅推给 B。
+        /// 备份能不能整份推回（fail-closed）：
+        /// 1) 无 .meta / 无内容指纹（旧版备份）：改走基于当前订阅的干净重建；
+        /// 2) 探测不到当前配置：停止；
+        /// 3) 来源路径不一致：停止；
+        /// 4) 内容指纹不一致：订阅在保存之后被更新过（Clash Verge Rev 换订阅时路径不变，
+        ///    只比路径会漏掉这种情况），改走重建，绝不把旧快照推给内核。
         ///
-        /// 只有「有 .meta 且来源与当前路径一致」才放行整份推回。
-        /// 调用方必须先确认 currentPath 是否可信——探测不到就宁可停止还原。
+        /// 只有「路径一致 + 内容一致」才放行整份推回。调用方必须先确认 currentPath 可信。
         /// </summary>
         internal static bool BackupAllowed(string metaSource, string currentPath, bool metaExists, out string why)
+        {
+            return BackupAllowed(metaSource, currentPath, metaExists, "", "", out why);
+        }
+
+        internal static bool BackupAllowed(string metaSource, string currentPath, bool metaExists,
+                                           string metaFingerprint, string currentFingerprint, out string why)
         {
             why = "";
             if (!metaExists || string.IsNullOrEmpty(metaSource))
@@ -102,7 +148,19 @@ namespace ProxyPicker.Core
             }
             if (!metaSource.Trim().Equals(currentPath.Trim(), StringComparison.OrdinalIgnoreCase))
             {
-                why = "备份来自另一份客户端配置，已停止还原以免推错订阅";
+                why = "备份来自另一份客户端配置，已改用当前订阅重建配置，不整份推回";
+                return false;
+            }
+            // 独立审阅 v1.3.2 第二轮：Verge 的所有订阅都生成同一个 clash-verge.yaml，
+            // 路径永远相等；必须再比一次备份时的文件内容，否则更新订阅后还原会推回旧快照。
+            if (string.IsNullOrEmpty(metaFingerprint) || string.IsNullOrEmpty(currentFingerprint))
+            {
+                why = "这份备份没有记录配置内容指纹（旧版备份）；已改用当前订阅重建配置，不整份推回";
+                return false;
+            }
+            if (!metaFingerprint.Equals(currentFingerprint, StringComparison.OrdinalIgnoreCase))
+            {
+                why = "客户端配置在保存之后更新过，备份里的订阅已经过期；已改用当前订阅重建配置，不整份推回";
                 return false;
             }
             return true;
@@ -220,24 +278,42 @@ namespace ProxyPicker.Core
             try { lines = File.ReadAllLines(path, Encoding.UTF8); }
             catch (Exception ex) { error = "读取勾选名单失败：" + ex.Message; return false; }
 
-            bool inPayload = false;
-            bool sawPayload = false;
-            bool sawContent = false;
-            for (int lineNo = 0; lineNo < lines.Length; lineNo++)
+            List<int> bad;
+            bool ok = ParseWhitelistLines(lines, out items, out bad, out error);
+            LastSkippedLineNumbers.AddRange(bad);
+            LastSkippedLines = bad.Count;
+            return ok;
+        }
+
+        /// <summary>纯文本解析，供自检直接喂字符串，不碰真机名单文件（独立审阅第二轮）。</summary>
+        internal static bool ParseWhitelistLines(string[] lines, out List<Item> items,
+                                                 out List<int> badLines, out string error)
+        {
+            items = new List<Item>();
+            badLines = new List<int>();
+            error = "";
+            bool inPayload = false, sawPayload = false, sawContent = false;
+            for (int lineNo = 0; lineNo < (lines ?? new string[0]).Length; lineNo++)
             {
-                string raw = lines[lineNo];
-                string s = raw.Trim();
+                string s = (lines[lineNo] ?? "").Trim();
                 if (s.Length > 0 && !s.StartsWith("#", StringComparison.Ordinal)) sawContent = true;
                 if (s.StartsWith("payload:", StringComparison.Ordinal)) { inPayload = true; sawPayload = true; continue; }
-                if (!inPayload || !s.StartsWith("-", StringComparison.Ordinal)) continue;
+                if (!inPayload) continue;
+                if (s.Length == 0 || s.StartsWith("#", StringComparison.Ordinal)) continue;
+                // payload 段里的非空行必须是列表项。以前少了前导「-」的行被直接吞掉，
+                // 整份名单会静默变成空名单（语义＝全部直连），必须记成坏行。
+                if (!s.StartsWith("-", StringComparison.Ordinal))
+                {
+                    badLines.Add(lineNo + 1);
+                    continue;
+                }
                 string body = s.Substring(1).Trim().Trim('\'', '"');
                 string[] parts = body.Split(',');
-                // 兼容早期/手写的两字段写法：`PROCESS-NAME,chrome.exe` 视为 PP-FIXED。
-                // 只有「类型不认识 / 名字为空」才算坏行，避免把正常老名单判死。
-                bool nameRule = parts.Length >= 2 &&
+                // 兼容早期/手写的两字段写法；类型不认识 / 名字为空 / 字段过多都算坏行。
+                bool nameRule = (parts.Length == 2 || parts.Length == 3) &&
                     parts[0].Trim().Equals("PROCESS-NAME", StringComparison.OrdinalIgnoreCase) &&
                     parts[1].Trim().Length > 0;
-                bool pathRule = parts.Length >= 2 &&
+                bool pathRule = (parts.Length == 2 || parts.Length == 3) &&
                     parts[0].Trim().Equals("PROCESS-PATH-REGEX", StringComparison.OrdinalIgnoreCase) &&
                     parts[1].Trim().Length > 0;
                 if (nameRule)
@@ -246,15 +322,9 @@ namespace ProxyPicker.Core
                 else if (pathRule)
                     items.Add(new Item(parts[1].Trim(), parts.Length >= 3 && parts[2].Trim().Length > 0
                         ? parts[2].Trim() : "PP-FIXED", true) { Derived = true });
-                else
-                {
-                    // 手改坏了的行：不静默吞掉。保存前必须拦住，否则这一条会悄悄变直连。
-                    LastSkippedLineNumbers.Add(lineNo + 1);
-                }
+                else badLines.Add(lineNo + 1);
             }
-            LastSkippedLines = LastSkippedLineNumbers.Count;
-            // 文件里有内容、却连 payload: 段都没有：这不是空名单，是格式坏了。
-            // 继续当成空名单会推出一份「全部直连」，必须停下来（复审 F-04）。
+            // 文件里有内容、却连 payload: 段都没有：这不是空名单，是格式坏了（复审 F-04）。
             if (sawContent && !sawPayload)
             {
                 error = "勾选名单缺少 payload: 段，格式已损坏；已停止读取，避免把全部软件改成直连";
@@ -473,11 +543,13 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>当前配置里会用的策略名（界面显示用）。</summary>
-        public static string PolicyName()
+        /// <summary>策略组名。传入 knownConfigPath 时直接读本次保存已确认的那份配置，
+        /// 不再各自重新识别客户端（独立审阅第二轮：保存事务同源）。</summary>
+        public static string PolicyName(string knownConfigPath = null)
         {
             try
             {
-                string p = Paths.ClashYaml;
+                string p = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
                 if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "GLOBAL";
                 bool reused;
                 return Discovery.FindPolicy(File.ReadAllText(p, Encoding.UTF8), out reused);
@@ -490,7 +562,8 @@ namespace ProxyPicker.Core
         /// <summary>跨进程互斥：命令行 --apply 与界面保存不能交叉写名单 / 推配置（评审 R6-4）。
         /// autoRecover=true 时在锁内推送前再核一次接管意图，消除修复与托盘还原的竞态（评审 P1-②）；
         /// 订阅兼容模式同样核对名单文件——它是接管意图的唯一载体（评审 R1）。</summary>
-        public static ApplyOutcome Apply(List<Item> items, bool autoRecover = false)
+        public static ApplyOutcome Apply(List<Item> items, bool autoRecover = false,
+                                         string knownConfigPath = null)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using (var gate = new System.Threading.Mutex(false, @"Local\ProxyPicker.Apply"))
@@ -504,7 +577,7 @@ namespace ProxyPicker.Core
                     busy.Ms = sw.ElapsedMilliseconds;
                     return busy;
                 }
-                try { return ApplyCore(items, sw, autoRecover); }
+                try { return ApplyCore(items, sw, autoRecover, knownConfigPath); }
                 finally { try { gate.ReleaseMutex(); } catch { } }
             }
         }
@@ -539,7 +612,8 @@ namespace ProxyPicker.Core
         /// 评审 R1：`AutoRecoverStopped`（判定）与 `RevokedIntentMessage`（文案）在临界区内
         /// 引用，同时由 MainForm.RepairAsync 按同一常量识别「撤销」语义；
         /// Discovery.SelfTest G2d 也锁同一口径，三处不会漂移。</summary>
-        static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw, bool autoRecover)
+        static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw, bool autoRecover,
+                                      string knownConfigPath = null)
         {
             var result = new ApplyOutcome();
 
@@ -557,7 +631,9 @@ namespace ProxyPicker.Core
                 return result;
             }
 
-            string cfg = Paths.ClashYaml;
+            // 保存事务同源：调用方已确认配置路径时直接复用，整条链（原值捕获、
+            // payload 生成、推送、回读、连接快照与删除）只认这一份，不各自重新识别。
+            string cfg = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
             if (string.IsNullOrEmpty(cfg) || !File.Exists(cfg))
             {
                 result.Ok = false;
@@ -597,9 +673,10 @@ namespace ProxyPicker.Core
                 return result;
             }
             // 主动开了防泄漏但还没记原值（例如命令行直接保存）时，先补记一次。
-            if (Settings.Ipv6GuardOn) Settings.CaptureIpv6Original();
+            // 保存事务同源：原值捕获也用本次已确认的 cfg，不再各走一次 Detect。
+            if (Settings.Ipv6GuardOn) Settings.CaptureIpv6Original(cfg);
             // 第一次保存前记下客户端原本的 find-process-mode，退出时才能恢复原值。
-            Settings.CaptureFindProcessOriginal();
+            Settings.CaptureFindProcessOriginal(cfg);
 
             string payload;
             try
@@ -614,7 +691,7 @@ namespace ProxyPicker.Core
                 return result;
             }
 
-            result.Policy = PolicyName();
+            result.Policy = PolicyName(cfg);
             // 先推送；推送失败时磁盘名单保持原样，界面与内核不分叉（评审 R1-6 / R3-6）。
             // 评审 R4：本次保存已确认的订阅路径 cfg（由 Paths.ClashYaml 的 Detect 结果而来）
             // 作为 knownConfigPath 传下去，让整条推送链绑定/secret/controller 全部使用
@@ -703,18 +780,27 @@ namespace ProxyPicker.Core
                     { good = false; whyBad = "第 " + (i + 1) + " 条策略被改成 " + proxy; break; }
                 }
             }
-            if (good && items.Count == 0 && !Settings.PatchOnly &&
-                (rules.Count == 0 || !rules[0].Type.Equals("Match", StringComparison.OrdinalIgnoreCase)))
-            { good = false; whyBad = "空名单下缺少直连兜底"; }
-            // 复审 P2：回读也要核对短路 MATCH 的位置，不能只靠 30 秒后的看守兜底。
-            // 只检查「前 items.Count 条自家规则块」，避免误判订阅里自带的进程规则。
-            if (good && !Settings.PatchOnly && items.Count > 0)
+            // 独立审阅第二轮：默认「代理白名单」的硬约束——兜底 MATCH 必须存在、
+            // 策略必须是 DIRECT、位置必须在勾选规则之后。以前只在「恰好找到 MATCH」
+            // 时查位置，MATCH 消失或被改成 MATCH,PROXY 都会漏检，界面仍显示「名单已生效」。
+            // 兼容模式（patchOnly）下订阅规则原样保留，不适用这套自家规则约束。
+            if (good && !Settings.PatchOnly)
             {
-                int firstMatch = -1;
+                int firstMatch = -1, matchCount = 0;
+                string matchProxy = "";
                 for (int i = 0; i < rules.Count; i++)
-                    if ((rules[i].Type ?? "").Equals("Match", StringComparison.OrdinalIgnoreCase))
-                    { firstMatch = i; break; }
-                if (firstMatch >= 0 && firstMatch < items.Count)
+                {
+                    if (!(rules[i].Type ?? "").Equals("Match", StringComparison.OrdinalIgnoreCase)) continue;
+                    matchCount++;
+                    if (firstMatch < 0) { firstMatch = i; matchProxy = rules[i].Proxy ?? ""; }
+                }
+                if (matchCount == 0)
+                { good = false; whyBad = "缺少直连兜底 MATCH，未勾选的软件可能被代理"; }
+                else if (matchProxy.Length > 0 && !Profile.IsDirectPolicy(matchProxy))
+                { good = false; whyBad = "兜底 MATCH 的策略是 " + matchProxy + "，不是 DIRECT，白名单承诺不成立"; }
+                else if (items.Count == 0 && firstMatch != 0)
+                { good = false; whyBad = "空名单下缺少段首直连兜底"; }
+                else if (items.Count > 0 && firstMatch < items.Count)
                 { good = false; whyBad = "直连兜底排在勾选规则前面"; }
             }
             if (good)
@@ -797,7 +883,7 @@ namespace ProxyPicker.Core
                 if (!File.Exists(original))
                 {
                     File.WriteAllText(original, scrubbed, utf8);
-                    File.WriteAllText(original + ".meta", source, utf8);
+                    WriteBackupMeta(original + ".meta", source);
                 }
 
                 string recent = Path.Combine(dir, "recent.yaml");
@@ -806,7 +892,7 @@ namespace ProxyPicker.Core
                 if (File.Exists(prev2)) { File.Copy(prev2, prev3, true); CopyBackupMeta(prev2, prev3); }
                 if (File.Exists(recent)) { File.Copy(recent, prev2, true); CopyBackupMeta(recent, prev2); }
                 File.WriteAllText(recent, scrubbed, utf8);
-                File.WriteAllText(recent + ".meta", source, utf8);
+                WriteBackupMeta(recent + ".meta", source);
                 return true;
             }
             catch (Exception ex)
@@ -979,52 +1065,57 @@ namespace ProxyPicker.Core
                     return false;
                 }
 
-                // 备份来源核对：新版备份带 .meta，记录它是从哪份客户端配置拷出来的。
-                // 换过客户端 / 订阅之后，旧备份推给新内核会把订阅整个换掉，必须先拦住。
+                // 备份来源核对：新版 .meta 记「来源路径 + 备份时配置内容指纹」。
+                // 只比路径不够：Clash Verge Rev 换订阅时路径不变，内容变了，
+                // 旧快照整份推回去会把用户刚更新的订阅换掉（独立审阅第二轮）。
                 bool metaExists = File.Exists(chosen + ".meta");
-                string metaSource = "";
+                string metaSource = "", metaFingerprint = "";
                 if (metaExists)
+                    metaExists = ReadBackupMeta(chosen + ".meta", out metaSource, out metaFingerprint);
+
+                string currentCfg = Paths.ClashYaml;
+                string sourceWhy;
+                bool fullRestore = BackupAllowed(metaSource, currentCfg, metaExists,
+                                                 metaFingerprint, ConfigFingerprint(currentCfg),
+                                                 out sourceWhy);
+                if (!fullRestore)
                 {
-                    try { metaSource = File.ReadAllText(chosen + ".meta", Encoding.UTF8).Trim(); }
-                    catch { metaExists = false; }
+                    // 不推整份原件，改为基于当前订阅重建一份干净 payload：
+                    // 只剔除本工具的规则块，订阅原规则与用户设置逐字保留。
+                    string back = BuildCleanRollbackPayload(currentCfg);
+                    if (back == null)
+                    {
+                        message = sourceWhy + "；且当前订阅不可读（" + currentCfg + "），无法重建配置。" +
+                                  "请先启动客户端并保存一次，再点还原。";
+                        return false;
+                    }
+                    var rebuild = Mihomo.PushConfig(back, 15000, currentCfg);
+                    if (!rebuild.Ok)
+                    {
+                        message = "推送清理后的配置失败：" + (rebuild.Error ?? ("HTTP " + rebuild.Status));
+                        return false;
+                    }
+                    // 重建分支也必须如实汇报名单删除结果（独立审阅第二轮）：
+                    // 以前忽略返回值、无条件写「接管状态已清除」，删失败时看守会重新接管。
+                    string clearError2;
+                    bool cleared2 = ClearSavedIntent(out clearError2);
+                    if (cleared2) Settings.ClearRestoreBaseline();
+                    message = cleared2
+                        ? sourceWhy + "；已按当前订阅重建干净配置，接管状态已清除"
+                        : sourceWhy + "；内核规则已按当前订阅清除，但勾选名单文件删除失败：" + clearError2 +
+                          "。请手动删除该文件后重启本程序，否则后台看守可能重新接管";
+                    return true;
                 }
-            string currentCfg = Paths.ClashYaml;
-            string sourceWhy;
-            if (!BackupAllowed(metaSource, currentCfg, metaExists, out sourceWhy))
-            {
-                // 旧版备份（无 .meta）：不推整份原件 —— 那是「换客户端前的旧订阅」，
-                // 推回去等于把用户已经更新过的订阅整个换掉（外部评审 P1-③）。
-                // 改为基于当前订阅重建一份干净 payload：剔除本工具的规则块，
-                // 保留订阅原规则与用户设置。
-                string back = BuildCleanRollbackPayload(currentCfg);
-                if (back == null)
-                {
-                    message = sourceWhy + "；且当前订阅不可读（" + currentCfg + "），无法重建配置。" +
-                              "请先启动客户端并保存一次，再点还原。";
-                    return false;
-                }
-                var rebuild = Mihomo.PushConfig(back, 15000, currentCfg);   // 收尾批 P2-1
-                if (!rebuild.Ok)
-                {
-                    message = "推送清理后的配置失败：" + (rebuild.Error ?? ("HTTP " + rebuild.Status));
-                    return false;
-                }
-                message = sourceWhy + "；已按当前订阅重建干净配置，接管状态已清除";
-                string clearError2;
-                bool cleared2 = ClearSavedIntent(out clearError2);
-                if (cleared2) Settings.ClearRestoreBaseline();
-                return true;
-            }
 
                 string text = File.ReadAllText(chosen, Encoding.UTF8);
                 if (text.IndexOf("<备份时已移除", StringComparison.Ordinal) >= 0)
                 {
-                    // 收尾批 P2-2：改用统一的 Discovery.ReadController 解析（经 Mihomo.ReadSecret），
-                    // 且传入本次已确认的 currentCfg，不再另走一次 Paths.ClashYaml 的 Detect。
-                    string secret = Mihomo.ReadSecret(currentCfg);
-                    if (secret.Length == 0)
+                    // 区分「没读到 secret 行」和「合法的无认证配置 secret: ""」；
+                    // 后者是合法设置，不能当成密钥读取失败而中止还原。
+                    string secret;
+                    if (!Mihomo.TryReadSecret(currentCfg, out secret))
                     {
-                        message = "备份里的控制密钥已被移除，且读不到当前密钥；为安全起见已停止还原";
+                        message = "备份里的控制密钥已被移除，且当前配置读不到顶层 secret 行；为安全起见已停止还原";
                         return false;
                     }
                     text = System.Text.RegularExpressions.Regex.Replace(
@@ -1065,6 +1156,12 @@ namespace ProxyPicker.Core
             public string Type;
             public string Payload;
             public string Proxy;
+        }
+
+        /// <summary>兜底 MATCH 的策略必须是 DIRECT，否则「未勾选一律直连」不成立。</summary>
+        internal static bool IsDirectPolicy(string proxy)
+        {
+            return (proxy ?? "").Trim().Equals("DIRECT", StringComparison.OrdinalIgnoreCase);
         }
 
         public static List<RuleInfo> ReadRules()
@@ -1202,44 +1299,36 @@ namespace ProxyPicker.Core
             var rules = ReadRules();
             st.RuleCount = rules.Count;
 
-            // 名单生效有三种合法形态，都要认：
-            //  ① 内联：首条是 PROCESS-NAME（本工具推送后的形态）
-            //  ② RULE-SET：Clash Verge 重新加载配置后会退回这种形态，provider 文件就是名单
-            //  ③ 空名单：首条直接是 MATCH,DIRECT
-            if (rules.Count > 0)
+            // 独立审阅第二轮：Applied 必须能证明「本工具的规则确实在内核里」。
+            // 以前只看首条规则类型，订阅自己写在段首的 PROCESS-NAME 也会被误判为已生效，
+            // 导致刷新后本该立刻补回却跳过。
+            var diskItems = Load();
+            var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var it in diskItems) if (!string.IsNullOrEmpty(it.Exe)) mine.Add(it.Exe);
+            bool hasOwnRule = false, hasDirectFallback = false;
+            int firstDirectMatch = -1;
+            for (int i = 0; i < rules.Count; i++)
             {
-                var first = rules[0];
-                string type = first.Type ?? "";
-                if (type.Equals("ProcessName", StringComparison.OrdinalIgnoreCase)) st.Applied = true;
+                var r = rules[i];
+                string type = r.Type ?? "";
+                if (type.StartsWith("Process", StringComparison.OrdinalIgnoreCase) &&
+                    (mine.Contains(r.Payload ?? "") ||
+                     (r.Proxy ?? "").Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase))) hasOwnRule = true;
                 else if (type.Equals("RuleSet", StringComparison.OrdinalIgnoreCase) &&
-                         (first.Payload ?? "").IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0) st.Applied = true;
-                else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase) &&
-                         (first.Proxy ?? "").Equals("DIRECT", StringComparison.OrdinalIgnoreCase)) st.Applied = true;
+                         (r.Payload ?? "").IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0) hasOwnRule = true;
+                else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase) && IsDirectPolicy(r.Proxy))
+                { hasDirectFallback = true; if (firstDirectMatch < 0) firstDirectMatch = i; }
             }
+            // 空名单＝用户明确要「全部直连」，段首的 DIRECT 兜底本身就是生效证据。
+            bool emptyAllDirect = diskItems.Count == 0 && HasSavedIntent && firstDirectMatch == 0;
+            if (rules.Count > 0 && (hasOwnRule || emptyAllDirect) && hasDirectFallback)
+                st.Applied = true;
+            // 兼容模式下名单是空的＝本来就没有要生效的东西，不该提示「请保存一次」。
+            if (!st.Applied && Settings.PatchOnly && diskItems.Count == 0) st.Applied = true;
 
-            // 兼容模式下名单是空的 = 本来就没有要生效的东西。
-            // 这时候再显示「名单未生效，请保存一次」只会让人以为程序坏了。
-            if (!st.Applied && Settings.PatchOnly && Load().Count == 0) st.Applied = true;
-
-            // 首条是进程规则不代表整份配置生效：兼容模式下中间若提前出现 MATCH，
-            // 后面的订阅规则永远匹配不到。白名单模式的 MATCH 本来就该排在自家规则后，
-            // 不能一起判（复审 F-07）。
-            if (Settings.PatchOnly)
-            {
-                for (int i = 0; i < rules.Count; i++)
-                {
-                    if ((rules[i].Type ?? "").Equals("Match", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (i < rules.Count - 1)
-                        {
-                            st.Applied = false;
-                            st.Error = "规则里有一条提前的 MATCH，后面的规则不会生效";
-                        }
-                        break;
-                    }
-                }
-            }
-
+            // 兼容模式会原样保留订阅自带的段首 MATCH。那是订阅作者写的分流语义，
+            // 不是本工具的故障；以前在这里判「提前 MATCH → 未生效」，和规则生成器、
+            // 后台看守互相打架（独立审阅第二轮 P1），现在不再据此推翻 Applied。
             return st;
         }
 
@@ -1258,13 +1347,17 @@ namespace ProxyPicker.Core
             public int Attempted;
             public int Closed;
             public int Failed;
+            /// <summary>404 单独计数：既可能是连接自然结束，也可能是请求打到了别的内核。
+            /// 不再默默混进「已关闭」，便于诊断定向重连是否真的作用在同一个客户端上。</summary>
+            public int NotFound;
         }
 
         /// <summary>
         /// 推送新规则「之前」记录改动软件的旧连接 ID。
         /// 必须先快照再推送，这样不会误关推送后刚建立的新连接。
         /// </summary>
-        public static ConnectionSnapshot CaptureConnections(IEnumerable<string> changedExes)
+        public static ConnectionSnapshot CaptureConnections(IEnumerable<string> changedExes,
+                                                            string knownConfigPath = null)
         {
             var snap = new ConnectionSnapshot();
             var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1275,7 +1368,7 @@ namespace ProxyPicker.Core
             }
             if (wanted.Count == 0) return snap;
 
-            var root = Mihomo.GetJson("/connections");
+            var root = Mihomo.GetJson("/connections", 10000, knownConfigPath);
             if (root == null) { snap.Error = "读取旧连接失败"; return snap; }
             object rawConnections;
             if (!root.TryGetValue("connections", out rawConnections)) { snap.Error = "连接列表格式异常"; return snap; }
@@ -1302,25 +1395,28 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>只关闭快照里的旧连接；404 表示它已自然结束，不算失败。</summary>
-        public static ReconnectOutcome CloseCapturedConnections(ConnectionSnapshot snap)
+        public static ReconnectOutcome CloseCapturedConnections(ConnectionSnapshot snap,
+                                                               string knownConfigPath = null)
         {
             var outcome = new ReconnectOutcome();
             if (snap == null) return outcome;
             // 复审 F-17：以前逐条串行、每条 5 秒超时，改动 20 个软件时能卡到分钟级。
             // 现在 4 路并发、单条 2.5 秒；最坏耗时从 N×5s 降到 ceil(N/4)×2.5s。
-            int attempted = 0, closed = 0, failed = 0;
+            int attempted = 0, closed = 0, failed = 0, notFound = 0;
             System.Threading.Tasks.Parallel.ForEach(snap.Ids,
                 new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 4 },
                 id =>
                 {
                     System.Threading.Interlocked.Increment(ref attempted);
-                    var r = Mihomo.DeleteConnection(id, 2500);
-                    if (r.Ok || r.Status == 404) System.Threading.Interlocked.Increment(ref closed);
+                    var r = Mihomo.DeleteConnection(id, 2500, knownConfigPath);
+                    if (r.Ok) System.Threading.Interlocked.Increment(ref closed);
+                    else if (r.Status == 404) System.Threading.Interlocked.Increment(ref notFound);
                     else System.Threading.Interlocked.Increment(ref failed);
                 });
             outcome.Attempted = attempted;
             outcome.Closed = closed;
             outcome.Failed = failed;
+            outcome.NotFound = notFound;
             return outcome;
         }
 

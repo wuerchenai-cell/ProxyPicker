@@ -115,11 +115,11 @@ namespace ProxyPicker.Core
         // ---------------------------------------------------------------- 原值快照 / 手工条目
 
         /// <summary>当前生效的客户端配置路径，作为「原值快照属于谁」的标识；探测不到返回空，不动快照。</summary>
-        static string SourceKey()
+        static string SourceKey(string knownConfigPath = null)
         {
             try
             {
-                string p = Paths.ClashYaml;
+                string p = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
                 return string.IsNullOrEmpty(p) ? "" : p.Trim().ToLowerInvariant();
             }
             catch { return ""; }
@@ -129,9 +129,9 @@ namespace ProxyPicker.Core
         /// 换客户端 / 换配置后旧快照就过期了，不能拿去覆盖用户的新设置。
         /// 只在这时清；同一次接管里连续保存不会重复捕获，避免把工具自己写的 always 记成原值。
         /// </summary>
-        static void EnsureRestoreSource()
+        static void EnsureRestoreSource(string knownConfigPath = null)
         {
-            string key = SourceKey();
+            string key = SourceKey(knownConfigPath);
             if (key.Length == 0) return;
             lock (Gate)
             {
@@ -170,11 +170,11 @@ namespace ProxyPicker.Core
         /// 内核 /configs 可能已被上次接管改成 always，直接读会把工具自己的值当成原值
         /// （那样退出时 fpmRestore=false，always 就永久留下了，正是 v1.2.3 修掉的 bug）。
         /// </summary>
-        static string DiskFindProcessMode()
+        static string DiskFindProcessMode(string knownConfigPath = null)
         {
             try
             {
-                string p = Paths.ClashYaml;
+                string p = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
                 if (string.IsNullOrEmpty(p) || !File.Exists(p)) return null;
                 return ParseFindProcessFromYaml(File.ReadAllText(p, Encoding.UTF8));
             }
@@ -224,14 +224,14 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>把「改之前」的 IPv6 状态记一次，之后不再覆盖；读不到就留空，不猜。</summary>
-        public static void CaptureIpv6Original()
+        public static void CaptureIpv6Original(string knownConfigPath = null)
         {
-            EnsureRestoreSource();
+            EnsureRestoreSource(knownConfigPath);
             lock (Gate) { if (!string.IsNullOrEmpty(Current.Ipv6Original)) return; }
             string value;
             try
             {
-                var cfg = Mihomo.GetJson("/configs", 4000);
+                var cfg = Mihomo.GetJson("/configs", 4000, knownConfigPath);
                 value = cfg == null ? "" : (Json.Bool(cfg, "ipv6", false) ? "true" : "false");
             }
             catch { value = ""; }
@@ -248,18 +248,18 @@ namespace ProxyPicker.Core
         /// 记下第一次保存前的 find-process-mode。读不到就留空等下次重试，
         /// 绝不能把「读失败」记成 absent —— 那会在退出时删掉用户本来有的设置。
         /// </summary>
-        public static void CaptureFindProcessOriginal()
+        public static void CaptureFindProcessOriginal(string knownConfigPath = null)
         {
-            EnsureRestoreSource();
+            EnsureRestoreSource(knownConfigPath);
             lock (Gate) { if (!string.IsNullOrEmpty(Current.FindProcessOriginal)) return; }
             // 磁盘订阅优先：本工具从不写客户端配置文件，它才是没被污染的用户基线。
             // 只有磁盘读不到（例如裸 mihomo 用命令行参数指定）才退回内核 /configs。
-            string value = DiskFindProcessMode();
+            string value = DiskFindProcessMode(knownConfigPath);
             if (value == null)
             {
                 try
                 {
-                    var cfg = Mihomo.GetJson("/configs", 4000);
+                    var cfg = Mihomo.GetJson("/configs", 4000, knownConfigPath);
                     if (cfg != null)
                     {
                         string v = Json.Str(cfg, "find-process-mode");

@@ -100,9 +100,13 @@ namespace ProxyPicker.UI
         bool _autoRepaired;   // 本次会话是否已经自动补回过规则
         int _watchTick;
         bool _watching;
-        int _repairFails;     // 连续补回失败次数；对账一致时清零，连败 3 次就停手
+        int _repairFails;     // 连续补回失败次数；对账一致或推送成功时清零，连败 3 次就停手
         DateTime _lastRepairAt = DateTime.MinValue;
         int _ipv6Attempts;    // 只针对 IPv6 的补回次数：看到关就清零，连试 3 次不成就只记账
+        // 同一原因「推送成功但下一轮仍判异常」的连续次数：达到 3 次说明补回解决不了，
+        // 停手并提示人工保存，避免每 30 秒重复推送 + 重复弹提示（独立审阅第二轮 P1）。
+        string _lastRepairReason = "";
+        int _repairNoProgress;
         Traffic.Sample _traffic;
         // 界面显示值与内核采样值分开：采样每秒跳一次，显示值按时间连续逼近，
         // 数字不再「0 → 800 KB/s → 0」地瞬间变脸。
@@ -409,8 +413,9 @@ namespace ProxyPicker.UI
         }
 
         /// <summary>
-        /// 点标题栏「—」走这里。和「×」落点一样都是收起，区别只在要不要解释一句
-        /// 「窗口去哪了」——第一次点的人多半是想要它先消失，但也可能以为程序被关掉了。
+        /// 点标题栏「—」走这里：收进托盘，后台看守照常运行。
+        /// 点「×」不是收起，而是「还原内核配置并退出」（见 OnFormClosing）。
+        /// 这句旧注释曾把两个按钮写成一样，朋友版说明跟着写错了，现已更正。
         /// </summary>
         public void MinimizeToTray()
         {
@@ -608,9 +613,11 @@ namespace ProxyPicker.UI
                 if (ipv6Guard && why == null && audit.Ok && audit.Ipv6On && _ipv6Attempts < 3)
                     why = "已开启 IPv6 防泄漏，但内核 IPv6 仍开着";
 
-                if (why == null) { _repairFails = 0; return; }
+                if (why == null)
+                { _repairFails = 0; _repairNoProgress = 0; _lastRepairReason = ""; return; }
                 if ((DateTime.UtcNow - _lastRepairAt).TotalSeconds < 30) return;
                 if (_repairFails >= 3) return;
+                if (_repairNoProgress >= 3) return;   // 补回解决不了，等用户手动处理
 
                 if (ipv6Guard && audit.Ok && audit.Ipv6On) _ipv6Attempts++;
                 AuditLog.Record("WATCH", "发现不一致：" + why);
@@ -672,8 +679,20 @@ namespace ProxyPicker.UI
                 UpdateLogContext();
                 AuditLog.Record("REPAIR", "第 " + _repairFails + " 次补回成功：" + exes.Count
                     + " 条规则，内核现有 " + res.RuleCount + " 条；原因：" + why);
+                // 推送成功就清零失败数：以前只在「对账一致」时清零，跨模块误判会让
+                // 明明每次都推成功却累到 3 次后看守停摆。
+                _repairFails = 0;
+                if (why == _lastRepairReason) _repairNoProgress++;
+                else { _repairNoProgress = 0; _lastRepairReason = why; }
                 SetStatus("已自动补回 " + exes.Count + " 条规则", Theme.Dim);
-                Toast(title, why, Theme.Accent, 2);
+                if (_repairNoProgress >= 3)
+                {
+                    AuditLog.Record("WATCH", "同一问题连续 3 次补回仍未消失，暂停自动修复：" + why);
+                    Toast("自动补回没能稳定生效",
+                          "已经连续补回 3 次，问题仍在（" + why + "）；请点「保存并生效」手动处理",
+                          Theme.Warn, 1);
+                }
+                else Toast(title, why, Theme.Accent, 2);
             }
             catch (Exception ex)
             {
@@ -966,10 +985,13 @@ namespace ProxyPicker.UI
                 var pack = await Task.Run(() =>
                 {
                     var p = new SavePack();
-                    p.Snapshot = Profile.CaptureConnections(changed); // 先快照旧连接，再推新规则
-                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies));
+                    // 保存事务同源（独立审阅第二轮）：整条链只识别一次客户端，
+                    // 旧连接快照 / payload 生成 / 推送 / 回读 / 删除旧连接共享同一份配置。
+                    string cfg = Paths.ClashYaml;
+                    p.Snapshot = Profile.CaptureConnections(changed, cfg); // 先快照旧连接，再推新规则
+                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies), false, cfg);
                     if (p.Apply.Ok && changed.Count > 0 && p.Snapshot.Error == null)
-                        p.Reconnect = Profile.CloseCapturedConnections(p.Snapshot);
+                        p.Reconnect = Profile.CloseCapturedConnections(p.Snapshot, cfg);
                     return p;
                 });
                 if (!UiAlive) return;
@@ -1734,7 +1756,9 @@ namespace ProxyPicker.UI
             {
                 Draw.Text(g, meta, _fTiny, metaColor, new RectangleF(32, SummaryTop + 54, 96, 16));
 
-                string label = "出口 " + CleanEmoji(outb);
+                // 这个值来自默认代理策略组（没有 PP-FIXED 时是 GLOBAL），
+                // 不代表每个勾选软件各自的真实链路，所以不再叫「真实出口」。
+                string label = "默认出口 " + CleanEmoji(outb);
                 var fp = _fPill ?? (_fPill = Theme.Ui(9.5f));
                 float bw = Math.Min(g.MeasureString(label, fp).Width + 18f, 134f);
                 var pill = new RectangleF(242 - bw, SummaryTop + 52, bw, 20);
@@ -1744,7 +1768,10 @@ namespace ProxyPicker.UI
 
             // 右列：两条通道的实时速率 + 迷你走势
             float rx = 244, rw = WinW - 18 - 12 - rx;
-            Draw.Text(g, "代理", _fTiny, Theme.Dim, new RectangleF(rx, SummaryTop + 5, 26, 15));
+            // 链路未知时速率含按名单估算的部分，用「≈」明示，不冒充实测。
+            bool estimated = _traffic != null && _traffic.Estimated > 0;
+            Draw.Text(g, estimated ? "代理≈" : "代理", _fTiny, Theme.Dim,
+                      new RectangleF(rx - 10, SummaryTop + 5, 36, 15));
             Draw.Text(g, _traffic == null || !_traffic.Ok ? "—" :
                 "↓ " + Traffic.Speed(_rateProxyDown) + "   ↑ " + Traffic.Speed(_rateProxyUp),
                 _fRate, Theme.Accent, new RectangleF(rx + 28, SummaryTop + 4, rw - 28, 16), Draw.Right);
@@ -2400,6 +2427,9 @@ namespace ProxyPicker.UI
             // 不改 revision 的话它会按旧结论把刚还原的规则重新推回去（外部评审 P0）。
             _revision++;
             _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // 独立审阅第二轮：派生名单也要一起清。以前还原后 _effectiveProxy 还留着
+            // 上一次接管的「预期代理名单」，流量采样会拿旧预期去比新直连，误报分流异常。
+            _effectiveProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             _list.SavedProxy = _savedProxy;
             foreach (var r in _all) { r.Proxy = false; r.Known = false; }
             _state.Applied = false;
@@ -2417,7 +2447,29 @@ namespace ProxyPicker.UI
             string text = Discovery.Diagnose();
             // 出口核对：以 mihomo 返回的真实链路为准，逐条列「预期 / 实际 / 判定」。
             if (traffic != null && traffic.Ok)
+            {
                 text += "\n---- 出口核对（以内核连接链路为准）----\n" + traffic.DescribeOutbound();
+                if (traffic.Estimated > 0)
+                    text += "\n注：本轮有 " + traffic.Estimated +
+                            " 条连接读不出链路，速率含按名单估算的部分（面板显示「代理≈」）。";
+            }
+            text += "\n注：顶部「默认出口」取自默认代理策略组（无 PP-FIXED 时取 GLOBAL），" +
+                    "不一定等于每个勾选软件各自使用的策略组；逐条实际链路以上面的出口核对为准。";
+            // 自动挑组是启发式的，把「这次到底选了哪个组、是不是猜的」写进诊断，
+            // 用户能检查；想固定就在订阅里建一个 PP-FIXED 组（独立审阅第二轮）。
+            try
+            {
+                string cfgPath = Paths.ClashYaml;
+                if (!string.IsNullOrEmpty(cfgPath) && System.IO.File.Exists(cfgPath))
+                {
+                    bool reused;
+                    string group = Discovery.FindPolicy(System.IO.File.ReadAllText(cfgPath), out reused);
+                    text += "\n代理策略组：" + group +
+                            (reused ? "（沿用订阅里已有的 PP-FIXED）"
+                                    : "（自动挑选；想固定请在订阅里建一个 PP-FIXED 组）");
+                }
+            }
+            catch { }
             string recent = AuditLog.Recent(10);
             if (recent.Length > 0) text += "\n---- 最近动作 ----\n" + recent;
             return Redact(text);

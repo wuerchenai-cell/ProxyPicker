@@ -593,21 +593,55 @@ namespace ProxyPicker.Core
         /// 绑定链（Mihomo.Endpoint）复用它按 knownConfigPath 取值，避免第二套解析逻辑。</summary>
         internal static void ReadController(string cfg, out string secret, out string controller)
         {
+            bool found;
+            ReadController(cfg, out secret, out controller, out found);
+        }
+
+        /// <summary>剥掉 YAML 值的行尾注释与成对引号，不管缩进（调用方负责限定顶层）。</summary>
+        internal static string StripYamlComment(string value)
+        {
+            string s = (value ?? "").Trim();
+            if (s.Length == 0) return "";
+            if (s[0] == '\'' || s[0] == '"')
+            {
+                char q = s[0];
+                int end = s.IndexOf(q, 1);
+                return end > 0 ? s.Substring(1, end - 1) : s.Trim(q);
+            }
+            if (s[0] == '#') return "";
+            int hash = s.IndexOf(" #", StringComparison.Ordinal);
+            if (hash >= 0) s = s.Substring(0, hash);
+            return s.Trim();
+        }
+
+        /// <summary>
+        /// 只读顶层的 secret: / external-controller: 两行。
+        /// 独立审阅第二轮：以前先 Trim() 再逐行找，tun/dns 等嵌套块里的同名键会覆盖真正的
+        /// 控制密钥；行尾注释也会被当成密钥的一部分。现在要求行首无缩进。
+        /// secretFound 用来区分「读失败」和「合法的无认证配置 secret: ""」。
+        /// </summary>
+        internal static void ReadController(string cfg, out string secret, out string controller,
+                                            out bool secretFound)
+        {
             secret = "";
             controller = "";
+            secretFound = false;
             try
             {
                 foreach (var raw in File.ReadLines(cfg))
                 {
+                    if (string.IsNullOrEmpty(raw)) continue;
+                    if (raw[0] == ' ' || raw[0] == '\t') continue;   // 只认顶层
                     string line = raw.Trim();
                     if (line.StartsWith("#", StringComparison.Ordinal)) continue;
                     if (line.StartsWith("secret:", StringComparison.Ordinal))
                     {
-                        secret = line.Substring(7).Trim().Trim('\'', '"');
+                        secret = StripYamlComment(line.Substring(7));
+                        secretFound = true;
                     }
                     else if (line.StartsWith("external-controller:", StringComparison.Ordinal))
                     {
-                        string v = line.Substring("external-controller:".Length).Trim().Trim('\'', '"');
+                        string v = StripYamlComment(line.Substring("external-controller:".Length));
                         if (v.Length > 0 && v.IndexOf(':') > 0) controller = v;
                     }
                 }
@@ -792,7 +826,10 @@ namespace ProxyPicker.Core
             {
                 bool hasMatch = false;
                 foreach (var line in rebuilt)
-                    if (Compact(line).StartsWith("-MATCH,", StringComparison.OrdinalIgnoreCase)) { hasMatch = true; break; }
+                    // 独立审阅第二轮：用能剥引号 / 行尾注释的 RuleText 判定，
+                    // 以前 Compact(...).StartsWith("-MATCH,") 认不出 `- 'MATCH,DIRECT' # note`，
+                    // 会误判「没有兜底」而在尾部再追加一条，造成重复 MATCH。
+                    if (IsMatchDirect(line)) { hasMatch = true; break; }
                 if (!hasMatch) rebuilt.Add(indent + "- MATCH,DIRECT");
             }
             else if (items.Count == 0)
@@ -1323,7 +1360,8 @@ namespace ProxyPicker.Core
             var fpmStrict = new Guard.Intent
             {
                 Ok = true, Mode = "rule", FindProcess = "strict",
-                FirstRuleIsMatch = true, MatchIndex = 1, LastProcessIndex = 0
+                FirstRuleIsMatch = true, MatchIndex = 0, LastProcessIndex = -1,
+                MatchCount = 1, MatchProxy = "DIRECT"   // 白名单硬约束：兜底存在且为 DIRECT
             };
             check("F1-a strict 不再被判成进程识别关闭（看守会继续补回）",
                 Guard.Judge(fpmStrict, 0, false) == null, "");
@@ -1348,8 +1386,9 @@ namespace ProxyPicker.Core
 
             // G2：备份来源核对（不匹配拒绝 / 旧备份拒绝并走重建 / 匹配放行）。
             string why;
-            check("G2-a 备份来源与当前配置一致时放行",
-                Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\a\config.yaml", true, out why) && why.Length == 0, "");
+            check("G2-a 来源路径与内容指纹都一致时放行",
+                Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\a\config.yaml", true,
+                                      "fp-old", "fp-old", out why) && why.Length == 0, "");
             check("G2-b 备份来自另一份配置时拒绝还原",
                 !Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\b\config.yaml", true, out why) &&
                 why.IndexOf("另一份", StringComparison.Ordinal) >= 0, "");
@@ -1451,6 +1490,104 @@ namespace ProxyPicker.Core
                 try { if (File.Exists(g2eCfg)) File.Delete(g2eCfg); } catch { }
             }
 
+            // G2f：独立审阅第二轮的回归锁 —— 坏名单、备份内容指纹、看守误判、白名单硬约束。
+            string g2fCfg = Path.Combine(Path.GetTempPath(),
+                "pp-selftest-fp-" + Guid.NewGuid().ToString("N") + ".yaml");
+            string g2fMeta = g2fCfg + ".meta";
+            try
+            {
+                List<Profile.Item> parsed;
+                List<int> bad;
+                string perr;
+                Profile.ParseWhitelistLines(new[] {
+                    "# header", "payload:",
+                    "  - 'PROCESS-NAME,chrome.exe,PP-FIXED'",
+                    "  'PROCESS-NAME,firefox.exe,PP-FIXED'",
+                    "  - 'PROCESS-NAME,edge.exe,PP-FIXED,EXTRA'" },
+                    out parsed, out bad, out perr);
+                check("G2f-a payload 段少「-」/ 字段过多的行必须拦住",
+                    bad.Count == 2 && parsed.Count == 1 && perr.Length == 0,
+                    "bad=" + bad.Count + " items=" + parsed.Count);
+                Profile.ParseWhitelistLines(new[] { "payload:", "  - PROCESS-NAME,chrome.exe" },
+                    out parsed, out bad, out perr);
+                check("G2f-b 两字段老名单仍兼容", parsed.Count == 1 && bad.Count == 0 &&
+                    parsed[0].Policy == "PP-FIXED", "");
+
+                string g2fWhy;
+                bool okSame = Profile.BackupAllowed(@"C:\A.yaml", @"C:\A.yaml", true, "fp1", "fp1", out g2fWhy);
+                bool okChanged = Profile.BackupAllowed(@"C:\A.yaml", @"C:\A.yaml", true, "fp1", "fp2", out g2fWhy);
+                bool okNoFp = Profile.BackupAllowed(@"C:\A.yaml", @"C:\A.yaml", true, "", "", out g2fWhy);
+                check("G2f-c 同路径同指纹放行整份还原", okSame, "");
+                check("G2f-d 同路径但订阅已更新 → 拒绝整份还原（Verge 场景）", !okChanged, "");
+                check("G2f-e 旧版无指纹 → 拒绝整份还原", !okNoFp, "");
+
+                File.WriteAllText(g2fCfg, "mode: rule\n", new UTF8Encoding(false));
+                Profile.WriteBackupMeta(g2fMeta, g2fCfg);
+                string metaSrc, metaFp;
+                bool metaOk = Profile.ReadBackupMeta(g2fMeta, out metaSrc, out metaFp);
+                string fpNow = Profile.ConfigFingerprint(g2fCfg);
+                check("G2f-f 新版 .meta 记录路径与内容指纹",
+                    metaOk && metaSrc == g2fCfg && metaFp == fpNow && metaFp.Length == 64, "");
+                File.WriteAllText(g2fCfg, "mode: global\n", new UTF8Encoding(false));
+                check("G2f-g 配置内容变化后指纹随之变化",
+                    Profile.ConfigFingerprint(g2fCfg) != metaFp, "");
+
+                File.WriteAllText(g2fCfg,
+                    "secret: 'abc' # note\n  secret: NESTED\nexternal-controller: 127.0.0.1:9090 # c\n",
+                    new UTF8Encoding(false));
+                string sec, ctrl;
+                bool found;
+                ReadController(g2fCfg, out sec, out ctrl, out found);
+                check("G2f-h 只认顶层 secret 且剥掉行尾注释",
+                    found && sec == "abc" && ctrl == "127.0.0.1:9090", "sec=" + sec + " ctrl=" + ctrl);
+                File.WriteAllText(g2fCfg, "secret: \"\"\n", new UTF8Encoding(false));
+                ReadController(g2fCfg, out sec, out ctrl, out found);
+                check("G2f-i secret: \"\" 是合法空密钥，不是读取失败", found && sec.Length == 0, "");
+
+                var itPatch = new Guard.Intent
+                {
+                    Ok = true, Mode = "rule", FindProcess = "always",
+                    ProcessRules = 1, LastProcessIndex = 0,
+                    HeadShortCircuit = true, MatchCount = 1, MatchIndex = 0, MatchProxy = "DIRECT"
+                };
+                check("G2f-j 兼容模式不把订阅自带段首 MATCH 判成故障",
+                    Guard.Judge(itPatch, 1, true) == null, "");
+                var itNoMatch = new Guard.Intent
+                {
+                    Ok = true, Mode = "rule", FindProcess = "always",
+                    ProcessRules = 1, LastProcessIndex = 0, MatchCount = 0, MatchIndex = -1
+                };
+                check("G2f-k 白名单缺少兜底 MATCH 必须要求修复",
+                    Guard.Judge(itNoMatch, 1, false) != null, "");
+                var itProxyMatch = new Guard.Intent
+                {
+                    Ok = true, Mode = "rule", FindProcess = "always",
+                    ProcessRules = 1, LastProcessIndex = 0,
+                    MatchCount = 1, MatchIndex = 1, MatchProxy = "PROXY"
+                };
+                check("G2f-l MATCH,PROXY 必须要求修复",
+                    Guard.Judge(itProxyMatch, 1, false) != null, "");
+                var itGood = new Guard.Intent
+                {
+                    Ok = true, Mode = "rule", FindProcess = "always",
+                    ProcessRules = 1, LastProcessIndex = 0,
+                    MatchCount = 1, MatchIndex = 1, MatchProxy = "DIRECT"
+                };
+                check("G2f-m 正常白名单不误报", Guard.Judge(itGood, 1, false) == null, "");
+                check("G2f-n DIRECT 策略判定",
+                    Profile.IsDirectPolicy("DIRECT") && !Profile.IsDirectPolicy("PROXY") &&
+                    !Profile.IsDirectPolicy(""), "");
+            }
+            catch (Exception ex)
+            {
+                check("G2f 回归断言执行完成", false, ex.Message);
+            }
+            finally
+            {
+                try { if (File.Exists(g2fCfg)) File.Delete(g2fCfg); } catch { }
+                try { if (File.Exists(g2fMeta)) File.Delete(g2fMeta); } catch { }
+            }
+
             // G4：find-process-mode 原值以磁盘订阅为准，不能把工具写的 always 当成基线。
             check("G4-a 磁盘里的 strict 被正确读出",
                 Settings.ParseFindProcessFromYaml("mode: rule\nfind-process-mode: strict\nrules:\n") == "strict", "");
@@ -1471,12 +1608,20 @@ namespace ProxyPicker.Core
             check("N9 空名单不生成空标记块",
                 emptyOut.IndexOf("PP-BEGIN", StringComparison.Ordinal) < 0, "");
 
-            // N10：带引号 + 行尾注释的提前 MATCH 也要识别并移走（CodeArts F-06）。
+            // N10（独立审阅第二轮修正）：兼容模式要原样保留订阅自带的段首 MATCH，
+            // 且不能因为认不出带引号写法而在尾部又追加一条兜底。
+            // 旧断言只比 DOMAIN 与「最后一次 MATCH」的位置，尾部新加的那条会让它误通过。
             string quotedMatch = "mode: rule\nproxies: []\nrules:\n- 'MATCH,DIRECT' # early\n- DOMAIN-SUFFIX,google.com,PROXY\n";
             string qm = BuildPayload(quotedMatch, items, "PP-FIXED", true);
-            check("N10 引号+注释的提前 MATCH 不再短路",
-                qm.IndexOf("DOMAIN-SUFFIX,google.com", StringComparison.Ordinal) <
-                qm.LastIndexOf("MATCH,DIRECT", StringComparison.Ordinal), "");
+            int qmMatchCount = System.Text.RegularExpressions.Regex.Matches(
+                qm, @"(?m)^\s*-\s*'?MATCH,").Count;
+            check("N10-a 兼容模式保留订阅自带的带引号段首 MATCH",
+                qm.IndexOf("'MATCH,DIRECT' # early", StringComparison.Ordinal) >= 0, "");
+            check("N10-b 不额外新增 MATCH（安全网不误判）", qmMatchCount == 1,
+                  "MATCH=" + qmMatchCount);
+            check("N10-c 订阅原有规则顺序不变",
+                qm.IndexOf("MATCH,DIRECT", StringComparison.Ordinal) <
+                qm.IndexOf("DOMAIN-SUFFIX,google.com", StringComparison.Ordinal), "");
 
             // N11：IPv6 脱敏要覆盖中间压缩，同时不误伤时间戳和回环。
             check("N11 压缩 IPv6 脱敏",
@@ -1485,8 +1630,16 @@ namespace ProxyPicker.Core
                 Redactor.Apply("时间 12:34:56 回环 ::1") == "时间 12:34:56 回环 ::1", "");
 
             // N13/N14：Guard 不能漏掉「只有两条规则时的短路」和「策略被改」。
-            var shortGuard = new Guard.Intent { Ok = true, RuleCount = 2, ProcessRules = 1, HeadShortCircuit = true };
-            check("N13 两条规则也能判出提前 MATCH", Guard.Judge(shortGuard, 1, true) != null, "");
+            // 兼容模式会原样保留订阅自带的段首 MATCH，不能判成故障（独立审阅第二轮）；
+            // 「提前 MATCH 挡住勾选规则」这条硬约束只适用完全接管模式，改在这里测。
+            var shortGuard = new Guard.Intent
+            {
+                Ok = true, Mode = "rule", FindProcess = "always", RuleCount = 2,
+                ProcessRules = 1, LastProcessIndex = 1, HeadShortCircuit = true,
+                MatchCount = 1, MatchIndex = 0, MatchProxy = "DIRECT"
+            };
+            check("N13 完全接管模式两条规则也能判出提前 MATCH",
+                Guard.Judge(shortGuard, 1, false) != null, "");
             var wrongGuard = new Guard.Intent
             {
                 Ok = true, RuleCount = 3, ProcessRules = 1, WrongPolicy = 1

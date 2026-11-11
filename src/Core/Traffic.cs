@@ -60,6 +60,9 @@ namespace ProxyPicker.Core
             public int Mismatch;
             /// <summary>本次规则生效前就建立的旧连接数：仍计入网速，但不参与对账。</summary>
             public int StaleIgnored;
+            /// <summary>链路读不出来、按预期名单估算出口的连接数。界面据此标注「≈ 含估算」，
+            /// 不把所有速率都当成内核实测值（独立审阅第二轮）。</summary>
+            public int Estimated;
             /// <summary>不一致的明细：哪个 exe、预期什么、实际什么、下一步做什么。</summary>
             public readonly List<MismatchItem> Mismatches = new List<MismatchItem>();
             /// <summary>每个 exe 的实测链路汇总，供诊断信息逐条列出。</summary>
@@ -279,6 +282,8 @@ namespace ProxyPicker.Core
                 if (chain == Chain.Rejected) continue;
 
                 // 速率归类看实测链路；链路读不出来才用名单兜底，避免偶发缺字段打出假峰。
+                // 这部分是估算而非实测，单独计数供界面标注。
+                if (chain == Chain.Unknown && exe.Length > 0 && !stale) s.Estimated++;
                 bool isProxy = chain == Chain.Unknown ? expected : chain == Chain.Proxy;
 
                 if (isProxy)

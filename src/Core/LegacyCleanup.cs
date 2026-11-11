@@ -100,8 +100,12 @@ namespace ProxyPicker.Core
                 text.IndexOf("Rules 扩展", StringComparison.OrdinalIgnoreCase) >= 0) return "规则扩展";
             if (text.IndexOf("name: PP-FIXED", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 text.IndexOf("出口组", StringComparison.OrdinalIgnoreCase) >= 0) return "PP-FIXED 组";
-            if (text.IndexOf("rule-providers:", StringComparison.OrdinalIgnoreCase) >= 0) return "Merge/provider";
-            return "旧版扩展";
+            if (text.IndexOf("rule-providers:", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                text.IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0) return "Merge/provider";
+            // 独立审阅第二轮：只出现软件名不能作为删除依据（用户自己写的扩展里
+            // 一句提到 ProxyPicker 的注释也会命中）。没有可证明来源的历史结构就
+            // 返回空＝不列入清理，留给人工核查；宁可漏清，绝不误删用户文件。
+            return "";
         }
 
         /// <summary>备份后删除旧扩展，并从 profiles.yaml 的 option 链里摘掉引用。</summary>

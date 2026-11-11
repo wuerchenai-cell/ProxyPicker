@@ -70,6 +70,12 @@ namespace ProxyPicker.Core
             // 只打码 host/sniffHost，保留 IP、进程名、规则等排查必需的信息。
             s = Regex.Replace(s, @"(""(?:host|sniffHost)""\s*:\s*"")([^""\r\n]+)("")",
                 "$1<域名已隐藏>$3", RegexOptions.IgnoreCase);
+            // 独立审阅第二轮：--api / --raw 可能带出任意 JSON，固定字段规则覆盖不全。
+            // 常见敏感字段名的值一律打码；但诊断仍应默认按白名单生成，不能只靠正则
+            // 就承诺「可以直接公开贴出」。
+            s = Regex.Replace(s,
+                @"((?:""|')?(?:password|passwd|token|secret|authorization|api[_-]?key|access[_-]?key)(?:""|')?\s*[:=]\s*(?:""|'))([^""'\r\n]+)(""|')",
+                "$1<敏感值已隐藏>$3", RegexOptions.IgnoreCase);
             return s;
         }
 

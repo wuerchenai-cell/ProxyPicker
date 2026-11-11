@@ -29,6 +29,8 @@ namespace ProxyPicker.Core
             public bool ViaRuleSet;        // 名单是靠老的 RULE-SET provider 生效的
             public bool HeadShortCircuit;  // 规则段中间出现 MATCH，后面的规则永远走不到
             public int MatchIndex = -1;    // 第一条 MATCH 的位置（-1 = 没有）
+            public int MatchCount;         // MATCH 总条数（0 = 兜底缺失）
+            public string MatchProxy = ""; // 第一条 MATCH 的策略（必须是 DIRECT）
             public int LastProcessIndex = -1; // 最后一条 PROCESS-NAME 的位置
             public bool FirstRuleIsMatch;   // 第一条规则就是 MATCH（空名单白名单模式）
             public bool Ipv6On;            // 内核开着 IPv6 = 流量可以从物理网卡直出
@@ -92,12 +94,13 @@ namespace ProxyPicker.Core
                     it.ViaRuleSet = true;
                     if (!string.IsNullOrEmpty(r.Proxy)) it.Policy = r.Proxy;
                 }
-                // MATCH 是兜底，正常配置里一定在最后一条。它出现在中间（尤其第 1、2 条），
-                // 说明这份配置被写成了「白名单短路面」：后面几百条订阅规则永远不会被匹配到。
-                else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase) && i < rules.Count - 1)
+                // 记录所有 MATCH：条数、策略、第一条位置。兜底是否成立由 Judge 结合模式判定，
+                // 这里只做事实采集，不替调用方下结论。
+                else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase))
                 {
-                    it.HeadShortCircuit = true;
-                    if (it.MatchIndex < 0) it.MatchIndex = i;
+                    it.MatchCount++;
+                    if (it.MatchIndex < 0) { it.MatchIndex = i; it.MatchProxy = r.Proxy ?? ""; }
+                    if (i < rules.Count - 1) it.HeadShortCircuit = true;
                 }
             }
 
@@ -157,10 +160,11 @@ namespace ProxyPicker.Core
 
             if (patchOnly)
             {
-                // 「只改勾的」本该保留订阅的全部规则；段首那条 MATCH 会把它们全挡死。
-                // 不能加 RuleCount > 2 的阈值：只有 [MATCH, PROCESS] 两条时它照样短路（复审 F-07）。
-                if (it.HeadShortCircuit)
-                    return "配置里有一条提前的 MATCH，把订阅规则挡住了";
+                // 独立审阅第二轮 P1：兼容模式本来就要原样保留订阅的全部规则，
+                // 订阅自带的段首 MATCH 是订阅作者写的分流语义，不是本工具的故障。
+                // 以前在这里把 HeadShortCircuit 判成异常 → 每轮补回重新生成 → MATCH 仍在
+                // → 下一轮又判异常 → _repairFails 累到 3 后看守停摆。这里不再因它触发修复。
+                // 完全接管模式由下面的硬约束检查，那是本工具自己生成的整份规则。
                 if (wantedCount > 0 && !it.ViaRuleSet && it.ProcessRules == 0)
                     return "勾选的 " + wantedCount + " 条规则一条都不在内核里";
                 if (it.Missing.Count > 0)
@@ -180,8 +184,15 @@ namespace ProxyPicker.Core
             if (it.WrongPolicy > 0)
                 return "有 " + it.WrongPolicy + " 条规则的策略被改了：" + Sample(it.WrongPolicyNames);
             if (it.MissingPathRules > 0) return "有 " + it.MissingPathRules + " 条软件目录规则没生效";
-            // 空名单也要校验：白名单模式下第一条必须是直连兜底（评审 R3-5）。
-            if (wantedCount == 0 && !it.FirstRuleIsMatch) return "空名单下缺少直连兜底";
+            // 独立审阅第二轮 P1：白名单的兜底 MATCH 是硬约束——必须存在、策略必须 DIRECT、
+            // 位置必须在所有勾选规则之后。以前只在「恰好找到 MATCH」时查位置，
+            // MATCH 消失或被改成 MATCH,PROXY 都会漏检，界面仍显示「名单已生效」。
+            if (it.MatchCount == 0)
+                return "缺少直连兜底 MATCH，未勾选的软件可能被代理";
+            if (!string.IsNullOrEmpty(it.MatchProxy) && !Profile.IsDirectPolicy(it.MatchProxy))
+                return "兜底 MATCH 的策略是 " + it.MatchProxy + "，不是 DIRECT，白名单承诺不成立";
+            // 空名单：白名单模式下第一条必须是直连兜底（评审 R3-5）。
+            if (wantedCount == 0 && it.MatchIndex != 0) return "空名单下缺少段首直连兜底";
             // 短路 MATCH 必须在所有 PROCESS-NAME 之后，否则勾了也直连。
             if (it.MatchIndex >= 0 && it.MatchIndex <= it.LastProcessIndex)
                 return "直连兜底排在勾选规则前面";

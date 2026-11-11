@@ -215,7 +215,11 @@ namespace ProxyPicker.Core
             }
             catch { }
 
-            bool ok = count <= MaxExeInTree;
+            // 独立审阅第二轮：扫描被 400 目录上限或 60 exe 上限截断时，
+            // 「只数到少量 exe」不代表这个目录安全；必须按证据不足处理，
+            // 否则大型工具箱/游戏库会被误判成可整体代理的软件根目录。
+            bool truncated = dirs >= 400 || stack.Count > 0;
+            bool ok = count <= MaxExeInTree && !truncated;
             int stored = ok ? count : int.MaxValue;
             lock (CacheGate)
             {

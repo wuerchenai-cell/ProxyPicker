@@ -22,6 +22,7 @@ namespace ProxyPicker.UI
         readonly Icon _trayIcon;
         TrayWatch _trayWatch;
         bool _disposed;
+        bool _exiting;    // 退出还原因重入保护：DoEvents 期间再来一次退出不能起第二个还原任务
 
         /// <summary>
         /// explorer.exe 重启后（崩溃、更新、切用户）系统会把所有托盘图标清掉，
@@ -63,7 +64,7 @@ namespace ProxyPicker.UI
         /// 判断规则与 Profile.RollbackCore 的选择逻辑一致：
         /// 有 recent.yaml 用 recent.yaml，否则 original.yaml；选中的那份带 .meta 才算「新版备份」。
         /// </summary>
-        static bool HasBackupMeta()
+        static bool BackupWillFullRestore()
         {
             try
             {
@@ -72,11 +73,14 @@ namespace ProxyPicker.UI
                 string original = System.IO.Path.Combine(dir, "original.yaml");
                 string chosen = System.IO.File.Exists(recent) ? recent : original;
                 if (!System.IO.File.Exists(chosen) || !System.IO.File.Exists(chosen + ".meta")) return false;
-                // 收尾批 P3-4：RollbackCore 在 .meta 读失败或内容为空时按「旧版备份」处理，
-                // 只清工具规则。这里也做同样的可读性检查，避免确认框说「会整份推回」
-                // 而实际走的是清理分支，两套文案对不上。
-                string source = System.IO.File.ReadAllText(chosen + ".meta", System.Text.Encoding.UTF8);
-                return !string.IsNullOrEmpty(source.Trim());
+                // 独立审阅第二轮：确认框必须和 RollbackCore 用同一套判据。
+                // 以前只看 .meta 文件在不在，Verge 换订阅后路径不变却会走重建，
+                // 框里却说「会整份推回」，两句话互相矛盾。
+                string source, fingerprint, why;
+                if (!Core.Profile.ReadBackupMeta(chosen + ".meta", out source, out fingerprint)) return false;
+                string current = Core.Paths.ClashYaml;
+                return Core.Profile.BackupAllowed(source, current, true, fingerprint,
+                                                  Core.Profile.ConfigFingerprint(current), out why);
             }
             catch { return false; }
         }
@@ -120,15 +124,15 @@ namespace ProxyPicker.UI
                 // 评审 R3：确认框按备份带不带 .meta 说明还原语义——
                 // 带 .meta 的备份是 ProxyPicker 保存的原样快照，会整份推回；
                 // 不带 .meta 的是旧版备份，只会清除工具规则在当前订阅上的改动。
-                bool backupHasMeta = HasBackupMeta();
+                bool fullRestore = BackupWillFullRestore();
                 if (MessageBox.Show(
-                    backupHasMeta
-                        ? "把客户端配置还原到上次保存前（推回备份的整份配置），" +
+                    fullRestore
+                        ? "把客户端配置还原到上次保存前（推回这份备份的整份配置），" +
                           "并清除 ProxyPicker 的接管状态（勾选名单）。\n" +
-                          "还原后后台看守不会再自动接管。\n确定要还原吗？"
-                        : "备份里没有 .meta 备份标记（旧版备份）。\n" +
-                          "本次还原只清除 ProxyPicker 加到当前订阅上的工具规则，\n" +
-                          "不会把旧订阅整份推回，也不会影响你自己添加的规则。\n确定要还原吗？",
+                          "已确认备份来源与当前订阅一致。还原后后台看守不会再自动接管。\n确定要还原吗？"
+                        : "这份备份的来源对不上，或订阅在保存之后更新过（也可能是旧版备份）。\n" +
+                          "本次不会把旧备份整份推回；改为按当前订阅清除 ProxyPicker 加的工具规则，\n" +
+                          "当前订阅和你自己添加的规则都原样保留。\n确定要还原吗？",
                     "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 string msg;
                 bool ok = Core.Profile.Rollback(out msg);
@@ -280,6 +284,8 @@ namespace ProxyPicker.UI
         /// </summary>
         void ExitApp()
         {
+            if (_exiting) return;      // DoEvents 期间重复点退出不能起第二个还原任务
+            _exiting = true;
             bool restored = false;
             string why = "";
             try
@@ -316,9 +322,15 @@ namespace ProxyPicker.UI
             {
                 try
                 {
-                    MessageBox.Show("退出前没能把配置还原回去：" + why +
-                        "\n\n规则可能还留在内核里。重新打开本程序，用托盘菜单里的「还原上次保存前的配置」可以清掉。",
-                        "ProxyPicker", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    // 独立审阅第二轮：超时不等于后台任务已停，强制结束进程可能把还原打断。
+                    // 给用户「继续运行再试」与「带残留退出」两个明确选择，不默认强杀。
+                    var choice = MessageBox.Show(
+                        "退出前没能把配置还原回去：" + why +
+                        "\n\n规则可能还留在内核里。\n\n" +
+                        "点「是」＝继续运行，稍后用托盘「还原上次保存前的配置」再试一次；\n" +
+                        "点「否」＝接受残留并退出（后台还原任务可能尚未结束）。",
+                        "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (choice == DialogResult.Yes) { _exiting = false; return; }
                 }
                 catch { }
             }

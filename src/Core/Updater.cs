@@ -21,7 +21,7 @@ namespace ProxyPicker.Core
         /// 仓库地址，格式「用户名/仓库名」。留空表示检查更新未接上：
         /// 界面上不会出现版本链接，也不会发出任何网络请求。
         /// 现在已填我们自己的仓库：Enabled 只校验格式，不代表远端已经有比本机更新的
-        /// Release；只有远端版本号比本机大才提示（当前远端最新 v1.0.0 < 本机 v1.1.0）。
+        /// Release；只有远端版本号严格大于本机才提示（远端与本机同为最新版时不提醒）。
         /// </summary>
         const string DefaultSlug = "wuerchenai-cell/ProxyPicker";
 

@@ -45,11 +45,17 @@ namespace ProxyPicker.Core
         static string _pipeTrustDetail;
         static string _pipeAmbiguous;     // 多个内核实例、无法绑定同一客户端时失败关闭（评审 R6-2）
         static string _boundConfigPath;   // 通道缓存绑定的服务配置路径；与 Discovery 当前选中不一致时整份 Forget（评审 P1-①）
+        static bool _endpointGuessed;     // 控制地址是「猜端口」得来的，没和目标内核建立可验证关联
 
-        public static string LastPipeName { get { return _pipeName; } }
-        public static string LastEndpoint { get { return _endpoint; } }
-        public static string LastSecurityError { get { return _securityError; } }
-        public static string LastPipeTrustDetail { get { return _pipeTrustDetail; } }
+        /// <summary>通道缓存是共享可变状态：流量轮询、看守、保存并发时，
+        /// 以前没有任何同步，可能出现互相清掉绑定或拼出空密钥（独立审阅第二轮）。
+        /// 所有请求与绑定变更都走同一把锁；Monitor 可重入，嵌套调用不会自锁。</summary>
+        static readonly object ChannelGate = new object();
+
+        public static string LastPipeName { get { lock (ChannelGate) { return _pipeName; } } }
+        public static string LastEndpoint { get { lock (ChannelGate) { return _endpoint; } } }
+        public static string LastSecurityError { get { lock (ChannelGate) { return _securityError; } } }
+        public static string LastPipeTrustDetail { get { lock (ChannelGate) { return _pipeTrustDetail; } } }
 
         const uint TOKEN_QUERY = 0x0008;
         const int TokenUserInfoClass = 1;
@@ -224,24 +230,31 @@ namespace ProxyPicker.Core
 
         public static string ReadSecret(string knownConfigPath = null)
         {
+            string secret;
+            TryReadSecret(knownConfigPath, out secret);
+            return secret ?? "";
+        }
+
+        /// <summary>区分「没读到顶层 secret 行」与「合法的无认证配置 secret: ""」。
+        /// 还原时后者不该被当成密钥读取失败而中止（独立审阅第二轮）。</summary>
+        public static bool TryReadSecret(string knownConfigPath, out string secret)
+        {
+            secret = "";
             try
             {
                 // 评审 R4：传入本次保存已确认的配置路径时直接按它读 secret，
-                // 保证 secret 与 payload 生成 / 通道绑定判定出自同一份配置，
-                // 不与新 Detect 的怪异窗口交叉（避免把 A 的秘密送到 B 的管道/隧道）。
+                // 保证 secret 与 payload 生成 / 通道绑定判定出自同一份配置。
                 string p = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath
                                         : Discovery.Detect().ConfigPath;
-                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "";
-                // 收尾批 P2-2：secret 解析统一收敛到 Discovery.ReadController。
-                // 以前这里另有一套「不 trim / 不跳注释 / 取第一条」的实现，与
-                // Discovery 的「trim + 跳注释 + 取最后一条」在多行 secret 或缩进
-                // secret 时会读出不同密钥，导致认证失败或用错密钥。
-                string secret, controller;
-                Discovery.ReadController(p, out secret, out controller);
-                return secret ?? "";
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return false;
+                // 收尾批 P2-2：解析统一收敛到 Discovery.ReadController（只认顶层、
+                // 正确处理行尾注释与引号），不再有第二套实现。
+                string controller;
+                bool found;
+                Discovery.ReadController(p, out secret, out controller, out found);
+                return found;
             }
-            catch { }
-            return "";
+            catch { return false; }
         }
 
         /// <summary>
@@ -284,13 +297,16 @@ namespace ProxyPicker.Core
                 catch { return; }
             }
             if (!BindingStaleFor(current)) return;
-
-            Forget();
-            _boundConfigPath = current;
-            // 评审报告 §15（P3 可观测性）：真的改绑时留一行，路径由 AuditLog 统一脱敏。
-            // 切客户端后第一次保存若重新枚举失败，排障时能看出是缓存被清过。
-            if (!SuppressBindLog)
-                AuditLog.Record("BIND", "通道缓存改绑到配置 " + (current ?? ""));
+            lock (ChannelGate)
+            {
+                if (!BindingStaleFor(current)) return;   // 双检：并发下只让一个线程真正改绑
+                Forget();
+                _boundConfigPath = current;
+                // 评审报告 §15（P3 可观测性）：真的改绑时留一行，路径由 AuditLog 统一脱敏。
+                // 切客户端后第一次保存若重新枚举失败，排障时能看出是缓存被清过。
+                if (!SuppressBindLog)
+                    AuditLog.Record("BIND", "通道缓存改绑到配置 " + (current ?? ""));
+            }
         }
 
         /// <summary>没有同源路径、回退到 Detect 的次数；仅自检读取（收尾批 F-03）。</summary>
@@ -302,6 +318,14 @@ namespace ProxyPicker.Core
         /// <summary>发一次请求：先管道，失败再走本地 HTTP。</summary>
         public static ApiResult Request(string method, string path, string body, int timeoutMs,
                                         string knownConfigPath = null)
+        {
+            // 通道缓存（管道名 / 密钥 / 绑定路径 / 控制地址）是共享可变状态。
+            // 整个请求串行化，避免流量轮询、看守与保存并发时互相清掉绑定。
+            lock (ChannelGate) { return RequestCore(method, path, body, timeoutMs, knownConfigPath); }
+        }
+
+        static ApiResult RequestCore(string method, string path, string body, int timeoutMs,
+                                     string knownConfigPath)
         {
             EnsureBoundToCurrentConfig(knownConfigPath);
             var sw = Stopwatch.StartNew();
@@ -615,6 +639,14 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
+        /// <summary>猜端口通道的安全规则：只允许无 body 的读，且绝不发送所选配置的密钥。
+        /// 抽成纯函数供自检直接验证，不依赖真实内核（独立审阅第二轮 P1）。</summary>
+        internal static bool GuessedEndpointSafe(string method, string body, out bool sendSecret)
+        {
+            sendSecret = false;                 // 没验明身份，不发 Bearer Secret
+            return body == null;                // 只允许读，不执行任何写操作
+        }
+
         static ApiResult TryHttp(string method, string path, string body, int timeoutMs, Stopwatch sw,
                                  string knownConfigPath = null)
         {
@@ -628,7 +660,16 @@ namespace ProxyPicker.Core
                     return new ApiResult { Error = _securityError, Ms = sw.ElapsedMilliseconds };
                 return null;
             }
-            if (_secret == null) _secret = ReadSecret(knownConfigPath);
+            // 猜出来的端口没和目标内核建立可验证关联：不发这份配置的密钥，也不执行写操作。
+            bool guessed = _endpointGuessed;
+            bool sendSecret = false;
+            if (guessed && !GuessedEndpointSafe(method, body, out sendSecret))
+                return new ApiResult
+                {
+                    Error = "控制端口是探测猜测出来的，无法确认它属于本次选中的配置；已拒绝写操作",
+                    Ms = sw.ElapsedMilliseconds
+                };
+            if (!guessed) { sendSecret = true; if (_secret == null) _secret = ReadSecret(knownConfigPath); }
 
             var r = new ApiResult();
             try
@@ -640,7 +681,7 @@ namespace ProxyPicker.Core
                 req.Proxy = null;          // 别让系统代理把控制请求也带走
                 req.KeepAlive = false;
                 req.AllowAutoRedirect = false;
-                if (!string.IsNullOrEmpty(_secret))
+                if (sendSecret && !string.IsNullOrEmpty(_secret))
                     req.Headers["Authorization"] = "Bearer " + _secret;
 
                 if (body != null)
@@ -744,14 +785,19 @@ namespace ProxyPicker.Core
                 // 下面那些猜出来的候选端口一律不带密钥，避免把 A 的 Secret 送到 B（评审 R6-2）。
                 if (!ProbeMihomo(ep, true, knownConfigPath, sameFileSecret)) return null;
                 _endpoint = ep;
+                _endpointGuessed = false;   // 地址来自目标配置本身，可带该配置的密钥
                 return _endpoint;
             }
 
+            // 独立审阅第二轮 P1：这些端口是猜出来的，/version 只能证明「有个 mihomo 在听」，
+            // 不能证明它加载的就是这次选中的配置。标记为未关联，TryHttp 会据此
+            // 拒绝写操作、也不发送所选配置的 Bearer Secret。
             string[] candidates = { "127.0.0.1:9090", "127.0.0.1:9097", "127.0.0.1:6170", "127.0.0.1:9091" };
             foreach (var ep in candidates)
             {
-                if (!ProbeMihomo(ep, false)) continue;
+                if (!ProbeMihomo(ep, false)) continue;   // 探测阶段本来就不带密钥
                 _endpoint = ep;
+                _endpointGuessed = true;
                 return _endpoint;
             }
             return null;
@@ -920,9 +966,11 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>关闭指定的一条旧连接。只由「本次改动软件」的定向重连调用。</summary>
-        public static ApiResult DeleteConnection(string id, int timeoutMs = 5000)
+        public static ApiResult DeleteConnection(string id, int timeoutMs = 5000,
+                                                string knownConfigPath = null)
         {
-            return Request("DELETE", "/connections/" + Uri.EscapeDataString(id ?? ""), null, timeoutMs);
+            return Request("DELETE", "/connections/" + Uri.EscapeDataString(id ?? ""), null,
+                           timeoutMs, knownConfigPath);
         }
 
         /// <summary>纯字符串自检：不联网，确认非本机控制地址一定被挡住。</summary>
@@ -1048,15 +1096,21 @@ namespace ProxyPicker.Core
                 _pipeName = r4SavedPipe;
             }
 
-            // 收尾批 P2-1：回读校验 / 看守对账走 GetJson，以前它没有同源参数，
-            // Request 会自己 Detect 一次。这两条结构断言防止后续把参数删掉又退回旧行为。
-            bool getJsonKnown = false, pushKnown = false;
-            foreach (var p in typeof(Mihomo).GetMethod("GetJson").GetParameters())
-                if (p.Name == "knownConfigPath") getJsonKnown = true;
-            foreach (var p in typeof(Mihomo).GetMethod("PushConfig").GetParameters())
-                if (p.Name == "knownConfigPath") pushKnown = true;
-            check("R4-4 回读 GetJson 支持同源路径", getJsonKnown, "");
-            check("R4-5 推送 PushConfig 支持同源路径", pushKnown, "");
+            // 独立审阅第二轮：以前这两条只反射确认「方法有 knownConfigPath 参数」，
+            // 测不出调用点有没有真的把路径传进来。改为真实行为断言。
+            long fb0 = DetectFallbackCount;
+            EnsureBoundToCurrentConfig(@"C:\PP-TEST\same-config.yaml");
+            ReadSecret(@"C:\PP-TEST\same-config.yaml");
+            Profile.PolicyName(@"C:\PP-TEST\same-config.yaml");
+            check("R4-4 绑定/密钥/策略名传同源路径时不再二次识别客户端",
+                DetectFallbackCount == fb0, "fallback=" + (DetectFallbackCount - fb0));
+            bool sendSecret;
+            bool safeWrite = GuessedEndpointSafe("PUT", "{}", out sendSecret);
+            bool noSecretOnWrite = !sendSecret;
+            bool safeRead = GuessedEndpointSafe("GET", null, out sendSecret);
+            check("R4-5 猜出的端口拒绝写操作", !safeWrite && safeRead, "");
+            check("R4-6 猜出的端口读写都不发送所选配置的密钥",
+                noSecretOnWrite && !sendSecret, "");
 
             sb.AppendLine();
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
@@ -1122,17 +1176,21 @@ namespace ProxyPicker.Core
 
         public static void Forget()
         {
-            _pipeName = null;
-            _secret = null;
-            _endpoint = null;
-            _endpointTried = false;
-            _securityError = null;
-            _trustedPipePid = 0;
-            _trustedPipeName = null;
-            _trustedAtTick = 0;
-            _pipeTrustDetail = null;
-            _pipeAmbiguous = null;
-            _boundConfigPath = null;
+            lock (ChannelGate)
+            {
+                _pipeName = null;
+                _secret = null;
+                _endpoint = null;
+                _endpointTried = false;
+                _endpointGuessed = false;
+                _securityError = null;
+                _trustedPipePid = 0;
+                _trustedPipeName = null;
+                _trustedAtTick = 0;
+                _pipeTrustDetail = null;
+                _pipeAmbiguous = null;
+                _boundConfigPath = null;
+            }
         }
     }
 }
