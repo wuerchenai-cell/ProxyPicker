@@ -1772,7 +1772,11 @@ namespace ProxyPicker.UI
                 ? (Settings.PatchOnly ? "TUN · 订阅兼容" : "TUN · 白名单接管")
                 : "系统代理 · 部分失效";
             Color metaColor = _state.Tun ? Theme.Dim : Theme.Warn;
-            string outb = string.IsNullOrEmpty(_state.Outbound) ? _state.Node : _state.Outbound;
+            // 策略组没解析出来、或策略组不在 /proxies 里时，不要退回显示 GLOBAL 的节点：
+            // 那会让人以为「有出口」。直接写「未找到」，配合状态栏的错误提示。
+            string outb = _state.Outbound;
+            if (string.IsNullOrEmpty(_state.Policy) || string.IsNullOrEmpty(outb))
+                outb = "未找到";
             if (string.IsNullOrEmpty(outb))
             {
                 Draw.Text(g, meta, _fTiny, metaColor, new RectangleF(32, SummaryTop + 54, 200, 16));

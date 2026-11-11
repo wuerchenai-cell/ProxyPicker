@@ -528,6 +528,13 @@ namespace ProxyPicker.Core
             string text = File.ReadAllText(baselinePath, Encoding.UTF8).Replace("\r\n", "\n");
             bool reused;
             string policy = Discovery.FindPolicy(text, out reused);
+            // 失败关闭：有勾选规则却找不到可证明的代理组时，绝不能拿空/GLOBAL 去凑。
+            // 以前会生成 `PROCESS-NAME,x,GLOBAL`，GLOBAL 在规则模式下常是 DIRECT，
+            // 推送还成功、界面显示「已生效」——用户看到的就是「勾了也直连」。
+            if (policy.Length == 0 && items != null && items.Count > 0)
+                throw new InvalidOperationException(
+                    "找不到可用的代理策略组（订阅的 proxy-groups 为空或无法识别）；" +
+                    "为免规则指向 GLOBAL/DIRECT，已停止保存。请检查订阅配置里的策略组名称。");
             string payload = Discovery.BuildPayload(text, items ?? new List<Item>(), policy, Settings.PatchOnly);
 
             // IPv6 归客户端自己管，默认一个字都不碰。
@@ -550,11 +557,11 @@ namespace ProxyPicker.Core
             try
             {
                 string p = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
-                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "GLOBAL";
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "";
                 bool reused;
                 return Discovery.FindPolicy(File.ReadAllText(p, Encoding.UTF8), out reused);
             }
-            catch { return "GLOBAL"; }
+            catch { return ""; }
         }
 
         // ---------------------------------------------------------------- 应用
@@ -820,6 +827,19 @@ namespace ProxyPicker.Core
                     }
                 }
                 catch { }
+            }
+            // 语义校验：规则写进去了，但策略组本身指向 DIRECT / 不存在时，
+            // 勾选软件仍然不会走代理。以前只看「规则在不在」，会报「已生效」。
+            if (good && items.Count > 0 && !string.IsNullOrEmpty(result.Policy))
+            {
+                string exit;
+                if (PolicyGoesDirect(result.Policy, cfg, out exit))
+                {
+                    good = false;
+                    whyBad = string.IsNullOrEmpty(exit)
+                        ? "策略组 " + result.Policy + " 在内核里不存在，规则无法生效"
+                        : "策略组 " + result.Policy + " 当前出口是 " + exit + "，勾选软件不会走代理";
+                }
             }
             result.Ok = good;
             result.Message = good
@@ -1232,10 +1252,11 @@ namespace ProxyPicker.Core
             return ResolveOutbound(out global);
         }
 
-        public static string ResolveOutbound(out string global, string policy = null)
+        public static string ResolveOutbound(out string global, string policy = null,
+                                             string knownConfigPath = null)
         {
             global = "";
-            var obj = Mihomo.GetJson("/proxies");
+            var obj = Mihomo.GetJson("/proxies", 6000, knownConfigPath);
             if (obj == null) return "";
             var proxies = Json.Obj(obj, "proxies");
             if (proxies == null) return "";
@@ -1253,7 +1274,13 @@ namespace ProxyPicker.Core
 
             object raw;
             string name;
-            if (!string.IsNullOrEmpty(policy) && proxies.ContainsKey(policy)) name = policy;
+            if (!string.IsNullOrEmpty(policy))
+            {
+                // 指定的策略组不在 /proxies 里：不要退回 GLOBAL 假装有出口，
+                // 让调用方看到空值并提示「策略组不存在」。
+                if (!proxies.ContainsKey(policy)) return "";
+                name = policy;
+            }
             else if (proxies.TryGetValue("PP-FIXED", out raw)) name = "PP-FIXED";
             else name = "GLOBAL";
 
@@ -1267,6 +1294,15 @@ namespace ProxyPicker.Core
                 name = now;
             }
             return name ?? "";
+        }
+
+        /// <summary>策略组当前链路末端是不是 DIRECT / REJECT。空/不存在也按不可用处理。</summary>
+        public static bool PolicyGoesDirect(string policy, string knownConfigPath, out string exit)
+        {
+            string global;
+            exit = ResolveOutbound(out global, policy, knownConfigPath);
+            if (string.IsNullOrEmpty(exit)) return true;
+            return IsDirectPolicy(exit);
         }
 
         public sealed class KernelState
@@ -1304,12 +1340,13 @@ namespace ProxyPicker.Core
 
             string global;
             st.Policy = PolicyName();
-            // 没解析到任何代理组时 FindPolicy 会退回 GLOBAL；GLOBAL 在规则模式下
-            // 经常停在 DIRECT，勾选软件也不会走代理。把这句话直接摆到状态里，
+            // 没解析到任何代理组时 FindPolicy 返回空（不再退回 GLOBAL）；GLOBAL 在
+            // 规则模式下经常停在 DIRECT，勾选软件也不会走代理。把这句话直接摆到状态里，
             // 别让用户以为「保存成功」就等于分流生效。
-            if (!string.IsNullOrEmpty(st.Policy) &&
-                st.Policy.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase))
-                st.Error = "没找到代理策略组（只能指向 GLOBAL）；勾选软件可能仍然直连，请检查订阅";
+            if (string.IsNullOrEmpty(st.Policy))
+                st.Error = "找不到可用的代理策略组（订阅可能没有 proxy-groups）；勾选软件不会走代理";
+            else if (st.Policy.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase))
+                st.Error = "策略组只能指向 GLOBAL（规则模式下常为 DIRECT）；勾选软件可能仍然直连";
             st.Outbound = ResolveOutbound(out global, st.Policy);
             st.Node = global;
 
@@ -1324,6 +1361,12 @@ namespace ProxyPicker.Core
             // 不能拿订阅策略组的节点来显示（否则界面说日本、实际全直连）。
             if (!Settings.PatchOnly && diskItems.Count == 0 && !LastLoadFailed)
                 st.Outbound = "DIRECT";
+            // 勾了软件、但规则指向的策略组本身是 DIRECT/REJECT：这是「保存成功但没代理」，
+            // 必须在状态卡里说清楚，不能只显示一个「已生效」。
+            if (diskItems.Count > 0 && !string.IsNullOrEmpty(st.Outbound) &&
+                IsDirectPolicy(st.Outbound))
+                st.Error = "策略组 " + st.Policy + " 当前出口是 " + st.Outbound +
+                           "；勾选软件不会走代理";
             var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var it in diskItems) if (!string.IsNullOrEmpty(it.Exe)) mine.Add(it.Exe);
             bool hasOwnRule = false, hasDirectFallback = false;

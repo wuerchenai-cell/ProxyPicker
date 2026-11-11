@@ -657,11 +657,21 @@ namespace ProxyPicker.Core
         {
             reused = false;
             // 含逗号 / # / 引号的组名不能拼进 PROCESS-NAME 规则，自动挑组时直接跳过（评审 R4-5）。
+            // 同时排除 GLOBAL / DIRECT / REJECT：它们不是「代理组」，规则指向它们等于直连。
             var names = GroupNames(yaml).FindAll(n =>
                 !string.IsNullOrEmpty(n) &&
+                !n.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase) &&
+                !n.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) &&
+                !n.Equals("REJECT", StringComparison.OrdinalIgnoreCase) &&
                 n.IndexOfAny(new char[] { ',', '#', '\n', '\r', '\'', '"' }) < 0);
             foreach (var n in names)
                 if (n.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)) { reused = true; return n; }
+
+            // 最可靠的口径：订阅最后一条 MATCH 走哪个组，勾选软件就强制走哪个组。
+            // 这样「强制代理」和「订阅默认代理」是同一个出口，不会出现规则写 GLOBAL、
+            // 实际订阅走「节点选择」的错位（实机：规则模式却显示 DIRECT）。
+            string fromRules = PolicyFromRules(yaml, names);
+            if (fromRules != null) return fromRules;
 
             // 评审 R4-1：没有 PP-FIXED 时不能让「游戏代理」这类组抢在主节点组前面。
             // 先找「节点 + 选择」同时出现的组，再按明确的常见命名找，最后才用泛关键字。
@@ -677,8 +687,64 @@ namespace ProxyPicker.Core
                 foreach (var n in names)
                     if (n.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0) return n;
 
+            // 没有可证明是「代理组」的名字时返回空，交给调用方失败关闭。
+            // 以前返回 GLOBAL，规则会静默指向 GLOBAL（规则模式下常是 DIRECT），
+            // 界面还显示「已生效」——这是实机「勾了也直连」的根因之一。
             if (names.Count > 0) return names[0];
-            return "GLOBAL";
+            return "";
+        }
+
+        /// <summary>
+        /// 从 rules 段推断订阅默认走哪个策略组：优先最后一条 MATCH，其次出现次数最多的组。
+        /// 只返回 GroupNames 里确实存在的组，避免把 DIRECT / REJECT / 未知名字当成代理组。
+        /// </summary>
+        static string PolicyFromRules(string yaml, List<string> names)
+        {
+            if (string.IsNullOrEmpty(yaml) || names == null || names.Count == 0) return null;
+            bool inRules = false;
+            string matchPolicy = null;
+            var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            foreach (var raw in yaml.Replace("\r\n", "\n").Split('\n'))
+            {
+                if (raw.Length == 0) continue;
+                string t = raw.TrimEnd();
+                int indent = t.Length - t.TrimStart().Length;
+                string s = t.TrimStart();
+                if (!inRules)
+                {
+                    bool isHead = s.Equals("rules:", StringComparison.Ordinal) ||
+                                  (s.StartsWith("rules:", StringComparison.Ordinal) &&
+                                   s.Length > 6 && (s[6] == ' ' || s[6] == '\t' || s[6] == '#'));
+                    if (isHead && indent == 0) inRules = true;
+                    continue;
+                }
+                if (indent == 0 && !s.StartsWith("-", StringComparison.Ordinal) &&
+                    !s.StartsWith("#", StringComparison.Ordinal)) break;
+                string body = RuleText(raw);
+                if (body.Length == 0) continue;
+                string[] parts = body.Split(',');
+                if (parts.Length < 2) continue;
+                int pi = parts.Length - 1;
+                if (parts[pi].Trim().Equals("no-resolve", StringComparison.OrdinalIgnoreCase)) pi--;
+                if (pi < 1) continue;
+                string pol = parts[pi].Trim().Trim('\'', '"');
+                bool known = false;
+                foreach (var n in names)
+                    if (n.Equals(pol, StringComparison.OrdinalIgnoreCase)) { known = true; break; }
+                if (!known) continue;
+                if (parts[0].Trim().Equals("MATCH", StringComparison.OrdinalIgnoreCase))
+                    matchPolicy = pol;   // 后面的 MATCH 覆盖前面的，取最后一条
+                int c;
+                counts.TryGetValue(pol, out c);
+                counts[pol] = c + 1;
+            }
+            if (!string.IsNullOrEmpty(matchPolicy)) return matchPolicy;
+            string best = null;
+            int bestCount = 0;
+            foreach (var kv in counts)
+                if (kv.Value > bestCount) { best = kv.Key; bestCount = kv.Value; }
+            // 只出现一次的多半是某条专用规则，不作为默认组。
+            return bestCount >= 2 ? best : null;
         }
 
         public static List<string> GroupNames(string yaml)
@@ -1184,12 +1250,14 @@ namespace ProxyPicker.Core
                 pb.IndexOf("# PP-END", StringComparison.Ordinal), "");
             check("B 没有分组时也能补 find-process-mode", pb.IndexOf("\nmode: rule\nfind-process-mode: always\n", StringComparison.Ordinal) >= 0, "");
 
-            // C. 裸 mihomo：没有 proxy-groups，退回 GLOBAL
+            // C. 裸 mihomo：没有 proxy-groups，必须失败关闭，不能再退回 GLOBAL
             string c = "mixed-port: 7890\nproxies:\n  - name: n1\n    type: ss\nrules:\n- MATCH,DIRECT\n";
             string policyC = FindPolicy(c, out reused);
-            check("C 没有分组时退回 GLOBAL", policyC == "GLOBAL", policyC);
-            string pc = BuildPayload(c, items, policyC, false);
-            check("C 仍能生成合法规则", pc.IndexOf("- PROCESS-NAME,msedge.exe,GLOBAL", StringComparison.Ordinal) >= 0, "");
+            check("C 没有分组时返回空而不是 GLOBAL", policyC == "", policyC);
+            bool cRejected = false;
+            try { BuildPayload(c, items, policyC, false); }
+            catch (InvalidOperationException) { cRejected = true; }
+            check("C 没有分组时拒绝写规则（不指向 GLOBAL）", cRejected, "");
 
             // D. 幂等：同一份配置重复生成，结果必须一致，否则规则会越滚越长
             string pb2 = BuildPayload(pb, items, policyB, false);
@@ -1675,6 +1743,22 @@ namespace ProxyPicker.Core
             string pgInline = "proxy-groups:\n- {name: 节点选择, type: select, proxies: [DIRECT]}\n";
             check("PG2 行内映射写法的组名也能识别",
                 FindPolicy(pgInline, out pgReused) == "节点选择", FindPolicy(pgInline, out pgReused));
+
+            // PG3-PG6：挑组必须跟订阅默认路由一致，且找不到时失败关闭，绝不静默退回 GLOBAL。
+            string pgRules = "proxy-groups:\n- name: 广告拦截\n- name: 节点选择\n" +
+                             "rules:\n- DOMAIN-SUFFIX,ads.example,广告拦截\n- MATCH,节点选择\n";
+            check("PG3 优先跟订阅最后一条 MATCH 的策略组",
+                FindPolicy(pgRules, out pgReused) == "节点选择", FindPolicy(pgRules, out pgReused));
+            string pgNone = "rules:\n- MATCH,DIRECT\n";
+            check("PG4 没有代理组时返回空而不是 GLOBAL",
+                FindPolicy(pgNone, out pgReused) == "", FindPolicy(pgNone, out pgReused));
+            string pgBuiltin = "proxy-groups:\n- name: GLOBAL\n- name: DIRECT\n- name: REJECT\n";
+            check("PG5 GLOBAL/DIRECT/REJECT 不算代理组",
+                FindPolicy(pgBuiltin, out pgReused) == "", FindPolicy(pgBuiltin, out pgReused));
+            string pgQuoted = "proxy-groups:\n- name: '节点选择'\n" +
+                              "rules:\n- MATCH,'节点选择'\n";
+            check("PG6 带引号的组名与 MATCH 也能对上",
+                FindPolicy(pgQuoted, out pgReused) == "节点选择", FindPolicy(pgQuoted, out pgReused));
 
             // N15：白名单模式空名单仍要保留 MATCH,DIRECT，但不能留空标记块。
             string emptyWl = BuildPayload("mode: rule\nrules:\n- MATCH,DIRECT\n",
