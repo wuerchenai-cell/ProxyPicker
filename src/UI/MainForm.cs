@@ -71,6 +71,7 @@ namespace ProxyPicker.UI
         bool _realExit;
         bool _help;
         bool _modeChanged;   // 在帮助面板里切过分流模式，关闭时提醒去保存
+        bool _compatHintShown; // 「订阅兼容下取消勾选≠直连」只提示一次，不反复弹
         bool _ipv6Changed;   // 在帮助面板里切过 IPv6 防泄漏，关闭时提醒去保存
         Updater.Info _update;      // null = 还没查过；查过之后失败也留着，用来解释为什么没提示
         string _lastEnvWarn;       // 上次弹过的多客户端提醒文字；同一条不重复弹
@@ -942,6 +943,17 @@ namespace ProxyPicker.UI
                 bool saved = _savedProxy.Contains(r.Exe);
                 if (r.Proxy != saved) changed.Add(r.Name);
             }
+            // 订阅兼容模式下「取消勾选」只是不再强制走代理，流量仍按订阅规则走。
+            // 用户很容易理解成「关掉就直连」，然后在 IP 检测页反复开关都没变化。
+            // 第一次出现这种取消动作时明确说一次，别让人以为软件坏了。
+            if (!_compatHintShown && Settings.PatchOnly &&
+                _all.Any(r => _savedProxy.Contains(r.Exe) && !r.Proxy))
+            {
+                _compatHintShown = true;
+                Toast("取消勾选 ≠ 直连",
+                      "订阅兼容模式仍按订阅规则走；想「关掉就直连」，请在帮助面板切到「代理白名单」。",
+                      Theme.Warn, 2);
+            }
             if (changed.Count == 0)
             {
                 SetStatus("没有待保存改动", Theme.Dim);
@@ -1728,12 +1740,15 @@ namespace ProxyPicker.UI
             Theme.Stroke(g, Theme.Line, card, 10f);
 
             int selected = _all.Count(r => r.Proxy);
-            Draw.Text(g, selected + " 个软件走代理", _fSummary, selected > 0 ? Theme.Accent : Theme.Fg,
-                new RectangleF(32, SummaryTop + 7, 200, 24));
+            // 订阅兼容模式下，取消勾选≠直连：只是不再强制走代理，流量仍按订阅规则走。
+            // 以前两种情况都写「N 个软件走代理」，用户会以为关掉开关就该直连（实机反馈）。
+            string countText = selected + (Settings.PatchOnly ? " 个软件强制走代理" : " 个软件走代理");
+            Draw.Text(g, countText, _fSummary, selected > 0 ? Theme.Accent : Theme.Fg,
+                new RectangleF(32, SummaryTop + 7, 240, 24));
             // 第二行顺便报出「内核这一轮看得到几个进程」。
             // 这个数字是本工具存在感的唯一实证：TUN 下它≈全部在跑的软件，
             // 系统代理下会明显变小 —— 变小就意味着有软件我们管不到。
-            string rest = Settings.PatchOnly ? "其余按订阅规则" : "其余软件全部直连";
+            string rest = Settings.PatchOnly ? "取消勾选≠直连 · 按订阅规则" : "其余软件全部直连";
             // 预期出口与实测链路不一致时，优先把这句话摆出来：
             // 「勾了却没生效」比「现在有几个进程可见」重要得多。
             if (_mismatch > 0)
@@ -1751,9 +1766,11 @@ namespace ProxyPicker.UI
             // 为什么单独立一格：PP-FIXED 指向主选择组后，真正生效的是这条链路末端，
             // 而 GLOBAL 的选择可能完全不是同一个节点。以前只显示 GLOBAL，
             // 用户会以为「我明明换了节点」，界面却纹丝不动 —— 看起来就像贴图。
-            // 底座只有两种：TUN 全部接管，或系统代理只能覆盖一部分。
-            // 这里直接写结论而不是"TUN 开/关"，因为开关本身没人关心，覆盖范围才关心。
-            string meta = _state.Tun ? "TUN · 全部接管" : "系统代理 · 部分失效";
+            // 底座直接写「TUN + 当前模式」：以前无论哪种模式都写「全部接管」，
+            // 订阅兼容下会让人误以为所有流量都由本工具控制（实机反馈）。
+            string meta = _state.Tun
+                ? (Settings.PatchOnly ? "TUN · 订阅兼容" : "TUN · 白名单接管")
+                : "系统代理 · 部分失效";
             Color metaColor = _state.Tun ? Theme.Dim : Theme.Warn;
             string outb = string.IsNullOrEmpty(_state.Outbound) ? _state.Node : _state.Outbound;
             if (string.IsNullOrEmpty(outb))
@@ -1762,11 +1779,12 @@ namespace ProxyPicker.UI
             }
             else
             {
-                Draw.Text(g, meta, _fTiny, metaColor, new RectangleF(32, SummaryTop + 54, 96, 16));
+                Draw.Text(g, meta, _fTiny, metaColor, new RectangleF(32, SummaryTop + 54, 110, 16));
 
-                // 这个值来自默认代理策略组（没有 PP-FIXED 时是 GLOBAL），
-                // 不代表每个勾选软件各自的真实链路，所以不再叫「真实出口」。
-                string label = "默认出口 " + CleanEmoji(outb);
+                // 这个值跟随本次规则实际写入的策略组（见 Profile.ResolveOutbound），
+                // 不再固定跟 GLOBAL —— GLOBAL 在规则模式下经常停在 DIRECT，
+                // 会让用户以为规则没生效（实机截图：订阅组是日本，界面却写 DIRECT）。
+                string label = "出口 " + CleanEmoji(outb);
                 var fp = _fPill ?? (_fPill = Theme.Ui(9.5f));
                 float bw = Math.Min(g.MeasureString(label, fp).Width + 18f, 134f);
                 var pill = new RectangleF(242 - bw, SummaryTop + 52, bw, 20);

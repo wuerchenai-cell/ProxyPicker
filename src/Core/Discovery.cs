@@ -697,7 +697,13 @@ namespace ProxyPicker.Core
 
                 if (!inGroups)
                 {
-                    if (s == "proxy-groups:") { inGroups = true; groupIndent = indent; }
+                    // 允许 `proxy-groups:` 后面跟行尾注释（订阅模板常见），
+                    // 以前只认完全相等的 13 个字符，认不出就整份组名列表为空，
+                    // FindPolicy 静默退回 GLOBAL —— 规则全指向 GLOBAL，勾了也直连。
+                    bool isHead = s.Equals("proxy-groups:", StringComparison.Ordinal) ||
+                                  (s.StartsWith("proxy-groups:", StringComparison.Ordinal) &&
+                                   s.Length > 13 && (s[13] == ' ' || s[13] == '\t' || s[13] == '#'));
+                    if (isHead) { inGroups = true; groupIndent = indent; }
                     continue;
                 }
                 if (s.StartsWith("#", StringComparison.Ordinal)) continue;
@@ -708,9 +714,22 @@ namespace ProxyPicker.Core
 
                 string body = s;
                 if (body.StartsWith("- ", StringComparison.Ordinal)) body = body.Substring(2).Trim();
-                if (body.StartsWith("name:", StringComparison.Ordinal))
+                if (body.StartsWith("{", StringComparison.Ordinal))
                 {
-                    string v = body.Substring(5).Trim().Trim('\'', '"');
+                    // 行内映射写法：- {name: 节点选择, type: select, ...}
+                    int k = body.IndexOf("name:", StringComparison.Ordinal);
+                    if (k >= 0)
+                    {
+                        string v = body.Substring(k + 5).Trim();
+                        int cut = v.IndexOfAny(new[] { ',', '}' });
+                        if (cut >= 0) v = v.Substring(0, cut);
+                        v = StripYamlComment(v).Trim().Trim('\'', '"');
+                        if (v.Length > 0) list.Add(v);
+                    }
+                }
+                else if (body.StartsWith("name:", StringComparison.Ordinal))
+                {
+                    string v = StripYamlComment(body.Substring(5)).Trim().Trim('\'', '"');
                     if (v.Length > 0) list.Add(v);
                 }
             }
@@ -1647,6 +1666,16 @@ namespace ProxyPicker.Core
             wrongGuard.WrongPolicyNames.Add("chrome.exe");
             check("N14 策略被改要判不一致", Guard.Judge(wrongGuard, 1, true) != null, "");
 
+            // N15/N16：代理组解析不能因为写法差异整份落空，否则 FindPolicy 会静默退回
+            // GLOBAL（规则全指向 GLOBAL，勾了也直连）。订阅模板常见行尾注释和行内映射。
+            bool pgReused;
+            string pgComment = "proxy-groups: # 代理组\n- name: 节点选择\n  type: select\n";
+            check("PG1 proxy-groups 带行尾注释仍能识别组名",
+                FindPolicy(pgComment, out pgReused) == "节点选择", FindPolicy(pgComment, out pgReused));
+            string pgInline = "proxy-groups:\n- {name: 节点选择, type: select, proxies: [DIRECT]}\n";
+            check("PG2 行内映射写法的组名也能识别",
+                FindPolicy(pgInline, out pgReused) == "节点选择", FindPolicy(pgInline, out pgReused));
+
             // N15：白名单模式空名单仍要保留 MATCH,DIRECT，但不能留空标记块。
             string emptyWl = BuildPayload("mode: rule\nrules:\n- MATCH,DIRECT\n",
                 new List<Profile.Item>(), "PP-FIXED", false);
@@ -1879,6 +1908,12 @@ namespace ProxyPicker.Core
             sb.AppendLine("管道：" + (Mihomo.LastPipeName ?? "未发现"));
             var st = Profile.ReadKernelState();
             sb.AppendLine("模式：" + st.Mode + " · TUN " + (st.Tun ? "开" : "关") + " · 规则 " + st.RuleCount + " 条 · " + (st.Applied ? "名单生效" : "名单未生效"));
+            // 这三行是排查「规则模式却显示 DIRECT / 勾了不生效」的关键：
+            // 规则到底写到哪个策略组、这个组当前是什么节点、GLOBAL 又是什么。
+            sb.AppendLine("策略组：" + (st.Policy.Length > 0 ? st.Policy : "未找到") +
+                          " · 出口：" + (st.Outbound.Length > 0 ? st.Outbound : "未读取") +
+                          " · GLOBAL：" + (st.Node.Length > 0 ? st.Node : "未读取"));
+            if (!string.IsNullOrEmpty(st.Error)) sb.AppendLine("状态提示：" + st.Error);
             sb.AppendLine("节点：" + (st.Node.Length > 0 ? st.Node : "未读取"));
             var cands = Inspect(false);
             if (cands.Count > 0)

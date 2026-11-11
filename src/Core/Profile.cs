@@ -1232,7 +1232,7 @@ namespace ProxyPicker.Core
             return ResolveOutbound(out global);
         }
 
-        public static string ResolveOutbound(out string global)
+        public static string ResolveOutbound(out string global, string policy = null)
         {
             global = "";
             var obj = Mihomo.GetJson("/proxies");
@@ -1243,8 +1243,19 @@ namespace ProxyPicker.Core
             var g = Json.Obj(proxies, "GLOBAL");
             global = Json.Str(g, "now") ?? "";
 
+            // 跟随「本次规则实际写入的策略组」，而不是一律跟 GLOBAL。
+            // GLOBAL 在规则模式下经常停在 DIRECT；以前界面因此显示 DIRECT，
+            // 用户以为规则没生效（实机截图：明明订阅组是日本，顶部却写 DIRECT）。
+            if (!string.IsNullOrEmpty(policy) &&
+                (policy.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                 policy.Equals("REJECT", StringComparison.OrdinalIgnoreCase)))
+                return policy.ToUpperInvariant();
+
             object raw;
-            string name = proxies.TryGetValue("PP-FIXED", out raw) ? "PP-FIXED" : "GLOBAL";
+            string name;
+            if (!string.IsNullOrEmpty(policy) && proxies.ContainsKey(policy)) name = policy;
+            else if (proxies.TryGetValue("PP-FIXED", out raw)) name = "PP-FIXED";
+            else name = "GLOBAL";
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             while (!string.IsNullOrEmpty(name) && seen.Add(name))
@@ -1292,9 +1303,15 @@ namespace ProxyPicker.Core
             st.Tun = Json.Bool(tun, "enable", false);
 
             string global;
-            st.Outbound = ResolveOutbound(out global);
-            st.Node = global;
             st.Policy = PolicyName();
+            // 没解析到任何代理组时 FindPolicy 会退回 GLOBAL；GLOBAL 在规则模式下
+            // 经常停在 DIRECT，勾选软件也不会走代理。把这句话直接摆到状态里，
+            // 别让用户以为「保存成功」就等于分流生效。
+            if (!string.IsNullOrEmpty(st.Policy) &&
+                st.Policy.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase))
+                st.Error = "没找到代理策略组（只能指向 GLOBAL）；勾选软件可能仍然直连，请检查订阅";
+            st.Outbound = ResolveOutbound(out global, st.Policy);
+            st.Node = global;
 
             var rules = ReadRules();
             st.RuleCount = rules.Count;
@@ -1303,6 +1320,10 @@ namespace ProxyPicker.Core
             // 以前只看首条规则类型，订阅自己写在段首的 PROCESS-NAME 也会被误判为已生效，
             // 导致刷新后本该立刻补回却跳过。
             var diskItems = Load();
+            // 白名单 + 空名单＝用户明确要全部直连，出口就是 DIRECT，
+            // 不能拿订阅策略组的节点来显示（否则界面说日本、实际全直连）。
+            if (!Settings.PatchOnly && diskItems.Count == 0 && !LastLoadFailed)
+                st.Outbound = "DIRECT";
             var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var it in diskItems) if (!string.IsNullOrEmpty(it.Exe)) mine.Add(it.Exe);
             bool hasOwnRule = false, hasDirectFallback = false;

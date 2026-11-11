@@ -57,6 +57,10 @@ namespace ProxyPicker.UI
     internal sealed class AppList : Control
     {
         public const float RowH = 54f;
+        // 拖动排序的起始距离。以前是 5px，远程桌面/触控板轻微抖动就会把
+        // 「点开关」误判成「拖动排序」，结果开关怎么点都不亮（实机反馈）。
+        // 提高到 12px，并且拖动结束后如果位置没变，仍按点击处理。
+        const float DragStartPx = 12f;
 
         readonly List<AppRow> _rows = new List<AppRow>();
         readonly Timer _anim;
@@ -383,6 +387,19 @@ namespace ProxyPicker.UI
             return idx < 0 || idx >= _rows.Count ? -1 : idx;
         }
 
+        /// <summary>开关本体的命中区（逻辑坐标）。比视觉范围四周各大 4px，远程鼠标更容易点中。</summary>
+        bool InsideToggle(int idx, Point p)
+        {
+            if (idx < 0 || idx >= _rows.Count) return false;
+            float lx = p.X / Theme.S, ly = p.Y / Theme.S;
+            var outer = Outer;
+            float y = RowsTop + idx * RowH;
+            var row = new RectangleF(outer.X + 6, y, Math.Max(0f, outer.Width - 12), RowH);
+            var sw = new RectangleF(row.X + 12, row.Y + (RowH - 23) / 2f, 42, 23);
+            sw.Inflate(4f, 4f);
+            return lx >= sw.X && lx <= sw.Right && ly >= sw.Y && ly <= sw.Bottom;
+        }
+
         int DropIndex(Point p)
         {
             float y = p.Y / Theme.S;
@@ -405,7 +422,7 @@ namespace ProxyPicker.UI
                 // 少了 (e.Button & Left) 这个判断，SetCapture 触发的无按键 MOUSEMOVE
                 // 会被当成拖动，单击就变成了「把这一行往上挪一格」（这个 bug 很隐蔽）。
                 int dx = Math.Abs(e.X - _pressPt.X), dy = Math.Abs(e.Y - _pressPt.Y);
-                if ((e.Button & MouseButtons.Left) != 0 && dy > 5 && dy > dx)
+                if ((e.Button & MouseButtons.Left) != 0 && dy > DragStartPx && dy > dx * 1.2f)
                 {
                     _drag = true;
                     _dragIdx = _pressIdx;
@@ -461,6 +478,20 @@ namespace ProxyPicker.UI
             }
             if (e.Button != MouseButtons.Left) return;
 
+            // 点在开关上就立刻切换，不再等 MouseUp 的「同索引」判定。
+            // 远程桌面 / 触控板常见「按下后指针抖几像素」，旧逻辑会把它当成拖动，
+            // 开关永远不亮；先把开关做成独立、立即生效的命中区。
+            if (InsideToggle(idx, e.Location))
+            {
+                var tr = _rows[idx];
+                tr.Proxy = !tr.Proxy;
+                _sel = idx;
+                Wake();
+                Invalidate();
+                if (Toggled != null) Toggled(this, EventArgs.Empty);
+                return;
+            }
+
             _sel = idx;
             _pressIdx = idx;
             _pressPt = e.Location;
@@ -491,19 +522,23 @@ namespace ProxyPicker.UI
 
             if (wasDrag && from >= 0 && from < _rows.Count && to >= 0)
             {
-                var row = _rows[from];
-                _rows.RemoveAt(from);
                 int insert = to > from ? to - 1 : to;
                 if (insert < 0) insert = 0;
                 if (insert > _rows.Count) insert = _rows.Count;
-                _rows.Insert(insert, row);
+                // 抖了一下但没真正换位置：按普通点击处理，不能把这次切换吞掉。
+                if (insert != from)
+                {
+                    var row = _rows[from];
+                    _rows.RemoveAt(from);
+                    _rows.Insert(insert, row);
 
-                string before = insert + 1 < _rows.Count ? _rows[insert + 1].Exe : null;
-                _sel = insert;
-                Invalidate();
-                if (Reordered != null)
-                    Reordered(this, new ReorderEventArgs { Exe = exe, BeforeExe = before });
-                return;
+                    string before = insert + 1 < _rows.Count ? _rows[insert + 1].Exe : null;
+                    _sel = insert;
+                    Invalidate();
+                    if (Reordered != null)
+                        Reordered(this, new ReorderEventArgs { Exe = exe, BeforeExe = before });
+                    return;
+                }
             }
 
             int idx = HitTest(e.Location);
