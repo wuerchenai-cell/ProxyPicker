@@ -8,10 +8,10 @@
 [直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
 [更新记录](CHANGELOG.md)
 
-> **最新版 v1.3.2**（2026-11-10，已签名打包，待实机复测后发布）：上面两个下载链接
-> 指向远端最新 Release，在 v1.3.2 发布前仍会下载到 v1.3.1。
-> **当前远端最新 Release 是 v1.3.1**：https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v1.3.1
-> （v1.2.5 / v1.3.0 未单独发布，其修复并入 v1.3.1）。
+> **最新版 v1.3.2**（2026-11-11 已发布 Release）：上面两个下载链接指向远端最新 Release，
+> 即 v1.3.2，下载到的就是本版 exe。
+> Release 页面：https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v1.3.2
+> （v1.2.5 / v1.3.0 未单独发布，其修复并入 v1.3.1；v1.3.1 之后的所有修复并入 v1.3.2）。
 > v1.3.2 修了第三方评审提出的三个问题：中途切换客户端时的通道缓存绑定（P1-①）、
 > 托盘还原与自动补回的接管竞态（P1-②）、旧版备份来源校验与干净重建（P1-③），
 > 以及第二轮评审的 R1–R5：接管意图核对与模式无关（订阅兼容模式下撤销即停手）、

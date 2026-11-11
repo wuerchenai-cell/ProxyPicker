@@ -43,8 +43,9 @@ ProxyPicker 怎么发给朋友
 https://github.com/wuerchenai-cell/ProxyPicker/releases/latest
 
 程序里的「检查更新」就是查这个地址。
-注意：GitHub 上目前最新的 Release 还是 v1.0.0，这个分享包是更新的 v1.2.2，
-还没发布到 GitHub。所以现在点「检查更新」不会提示更新，也不会把人引到旧版。
+注意：GitHub 上最新 Release 是 v1.3.2，和这个分享包是同一版。
+程序里的「检查更新」只在 GitHub 上的版本号比本机大时才提醒，不会把人引去下载旧包；
+它只提示 + 打开下载页，绝不自动下载或替换自己。
 国内有时打不开或很慢，所以它只当备份，不当主入口。
 
 
