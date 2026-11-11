@@ -1306,14 +1306,15 @@ namespace ProxyPicker.Core
             var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var it in diskItems) if (!string.IsNullOrEmpty(it.Exe)) mine.Add(it.Exe);
             bool hasOwnRule = false, hasDirectFallback = false;
-            int firstDirectMatch = -1;
+            int firstDirectMatch = -1, lastOwnProcess = -1;
             for (int i = 0; i < rules.Count; i++)
             {
                 var r = rules[i];
                 string type = r.Type ?? "";
                 if (type.StartsWith("Process", StringComparison.OrdinalIgnoreCase) &&
                     (mine.Contains(r.Payload ?? "") ||
-                     (r.Proxy ?? "").Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase))) hasOwnRule = true;
+                     (r.Proxy ?? "").Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)))
+                { hasOwnRule = true; lastOwnProcess = i; }
                 else if (type.Equals("RuleSet", StringComparison.OrdinalIgnoreCase) &&
                          (r.Payload ?? "").IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0) hasOwnRule = true;
                 else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase) && IsDirectPolicy(r.Proxy))
@@ -1321,8 +1322,16 @@ namespace ProxyPicker.Core
             }
             // 空名单＝用户明确要「全部直连」，段首的 DIRECT 兜底本身就是生效证据。
             bool emptyAllDirect = diskItems.Count == 0 && HasSavedIntent && firstDirectMatch == 0;
-            if (rules.Count > 0 && (hasOwnRule || emptyAllDirect) && hasDirectFallback)
+            // 白名单模式还要查位置：兜底 MATCH 必须排在所有自家进程规则之后。
+            // 只看「有 MATCH」不够——客户端、扩展或用户把 MATCH 挪到前面时，
+            // 勾选的软件会落到直连，状态卡却仍显示「名单已生效」（独立审阅第二轮 P2）。
+            // 兼容模式不受这条约束：订阅自带的提前 MATCH 是订阅作者的分流语义。
+            bool positionOk = Settings.PatchOnly || !hasOwnRule || firstDirectMatch < 0 ||
+                              firstDirectMatch > lastOwnProcess;
+            if (rules.Count > 0 && (hasOwnRule || emptyAllDirect) && hasDirectFallback && positionOk)
                 st.Applied = true;
+            else if (!Settings.PatchOnly && hasOwnRule && hasDirectFallback && !positionOk)
+                st.Error = "直连兜底排在勾选规则前面，勾选的软件会走直连";
             // 兼容模式下名单是空的＝本来就没有要生效的东西，不该提示「请保存一次」。
             if (!st.Applied && Settings.PatchOnly && diskItems.Count == 0) st.Applied = true;
 

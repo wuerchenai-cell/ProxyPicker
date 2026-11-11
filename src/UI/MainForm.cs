@@ -1017,6 +1017,14 @@ namespace ProxyPicker.UI
                     _state.Applied = true; _state.RuleCount = pack.Apply.RuleCount;
                     _state.Policy = pack.Apply.Policy;
                     UpdateLogContext();
+                    // 404 单独记账：连接自然结束是正常的，但若整批都 404，
+                    // 往往说明请求打到了另一个内核（连接 ID 不属于它）。写进审计日志，
+                    // 「复制诊断信息」里能看到，不至于只显示一个「清理 0 条」。
+                    if (pack.Reconnect != null &&
+                        (pack.Reconnect.Failed > 0 || pack.Reconnect.NotFound > 0))
+                        AuditLog.Record("RECONNECT", "旧连接清理：关闭 " + pack.Reconnect.Closed +
+                            " / 已自然结束(404) " + pack.Reconnect.NotFound +
+                            " / 失败 " + pack.Reconnect.Failed);
                     AuditLog.Record("SAVE", "手动保存 " + now.Count + " 个软件，内核现有 "
                         + pack.Apply.RuleCount + " 条规则，" + pack.Apply.Ms + "ms"
                         + (pack.Apply.Ipv6Off ? "，IPv6 已关" : "") + "；重连 " + changed.Count + " 个");
