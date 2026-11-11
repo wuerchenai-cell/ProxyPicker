@@ -60,8 +60,13 @@ namespace ProxyPicker.Core
         static List<Candidate> _lastCandidates;
         static readonly object Gate = new object();
 
+        /// <summary>Detect 调用次数（含缓存命中）。仅供自检核对「同源链路不再二次 Detect」，
+        /// 生产逻辑不读它；用 long 避免长时间运行溢出（收尾批 F-03）。</summary>
+        internal static long DetectCalls;
+
         public static Env Detect(bool refresh = false)
         {
+            DetectCalls++;
             lock (Gate)
             {
                 if (!refresh && _env != null && (DateTime.UtcNow - _at).TotalSeconds < 5) return _env;
@@ -571,7 +576,11 @@ namespace ProxyPicker.Core
             return "mihomo";
         }
 
-        static void ReadController(string cfg, Env env)
+        /// <summary>
+        /// 入口：把路径拿到的 secret / controller 填进候选环境。算法自 EndRecovery 一致，
+        /// 重复调用只是重新覆盖同一份 env，安全。
+        /// </summary>
+        internal static void ReadController(string cfg, Env env)
         {
             string secret, controller;
             ReadController(cfg, out secret, out controller);
@@ -579,7 +588,10 @@ namespace ProxyPicker.Core
             env.Controller = controller;
         }
 
-        static void ReadController(string cfg, out string secret, out string controller)
+        /// <summary>读取指定配置里的 secret: 与 external-controller: 两行。
+        /// 评审 R4：把这个解析放在 Discovery 而非 Mihomo 里，保证配置读取只此一种实现，
+        /// 绑定链（Mihomo.Endpoint）复用它按 knownConfigPath 取值，避免第二套解析逻辑。</summary>
+        internal static void ReadController(string cfg, out string secret, out string controller)
         {
             secret = "";
             controller = "";
@@ -1334,15 +1346,15 @@ namespace ProxyPicker.Core
                 CountOccurrences(wlKeep, "- MATCH,DIRECT") == 1 &&
                 wlKeep.IndexOf("rules:\n- MATCH,DIRECT", StringComparison.Ordinal) >= 0, "");
 
-            // G2：备份来源核对（不匹配拒绝 / 旧备份放行但警告 / 匹配放行）。
+            // G2：备份来源核对（不匹配拒绝 / 旧备份拒绝并走重建 / 匹配放行）。
             string why;
             check("G2-a 备份来源与当前配置一致时放行",
                 Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\a\config.yaml", true, out why) && why.Length == 0, "");
             check("G2-b 备份来自另一份配置时拒绝还原",
                 !Profile.BackupAllowed(@"D:\a\config.yaml", @"D:\b\config.yaml", true, out why) &&
                 why.IndexOf("另一份", StringComparison.Ordinal) >= 0, "");
-            check("G2-c 旧版无来源标记放行但必须警告",
-                Profile.BackupAllowed("", @"D:\b\config.yaml", false, out why) &&
+            check("G2-c 旧版备份无来源标记：拒绝整份推回（改为当前订阅重建）",
+                !Profile.BackupAllowed("", @"D:\b\config.yaml", false, out why) &&
                 why.IndexOf("旧版", StringComparison.Ordinal) >= 0, "");
 
             // G3：手动还原＝删除名单文件。用临时文件覆盖，绝不碰真机名单。
@@ -1356,6 +1368,88 @@ namespace ProxyPicker.Core
                 check("G3 删除名单文件后意图消失，重复删除也安全", gone && absentOk, "");
             }
             finally { try { if (File.Exists(tmpIntent)) File.Delete(tmpIntent); } catch { } }
+
+            // G2d：评审 R1 纯函数断——补回停手只依赖名单文件存在性，与模式无关。
+            // PatchOnly（订阅兼容）与 WHITELIST 两种模式下 AutoRecoverStopped(true) 必须一致；
+            // manual 保存（autoRecover=false）永远是放行的。只改内存字段、不写盘，用相对断言。
+            string modeBackup = Settings.Current.Mode;
+            try
+            {
+                bool hasIntent = Profile.HasSavedIntent;
+                bool expectStop = !hasIntent;
+                Settings.Current.Mode = Settings.ModePatch;
+                check("G2d-a 订阅兼容模式：补回停手判定等于 !HasSavedIntent",
+                    Profile.AutoRecoverStopped(true) == expectStop, "expectStop=" + expectStop);
+                check("G2d-b 订阅兼容模式：手动保存永远放行", !Profile.AutoRecoverStopped(false), "");
+                Settings.Current.Mode = Settings.ModeWhitelist;
+                check("G2d-c 完全接管模式：补回停手判定与订阅兼容一致",
+                    Profile.AutoRecoverStopped(true) == expectStop, "expectStop=" + expectStop);
+                check("G2d-d 完全接管模式：手动保存永远放行", !Profile.AutoRecoverStopped(false), "");
+            }
+            finally { Settings.Current.Mode = modeBackup; }
+
+            // G2e：收尾批 F-03，补评审 §10 点名的测试缺口。
+            // 名单路径注入到一个「故意不创建」的临时文件后，Apply 的撤销分支位于保存锁内
+            // 最前面，不碰内核、不写盘，因此可以离线端到端真跑一次（不再是纯函数替身）。
+            // 第三条「单次 ApplyCore 只 Detect 一次」无法在不推内核的前提下完整跑完，
+            // 由 Mihomo 的 R4-3 断言锁住关键前提：传了同源路径就不再回退 Detect。
+            string g2eList = Path.Combine(Path.GetTempPath(),
+                "pp-selftest-intent-" + Guid.NewGuid().ToString("N") + ".yaml");
+            string g2eCfg = Path.Combine(Path.GetTempPath(),
+                "pp-selftest-cfg-" + Guid.NewGuid().ToString("N") + ".yaml");
+            string g2eOverride = Paths.ListPathOverride;
+            string g2eMode = Settings.Current.Mode;
+            try
+            {
+                Paths.ListPathOverride = g2eList;   // 不存在 = 名单文件已删除 = 接管意图已撤销
+                long savesBefore = Profile.SaveCallCount;
+                long detectsBefore = DetectCalls;
+
+                Settings.Current.Mode = Settings.ModePatch;   // 评审点名的订阅兼容模式
+                var revoked = Profile.Apply(new List<Profile.Item>(), true);
+                check("G2e-a 订阅兼容 + 名单已删除：Apply 失败且不得 Save / Detect",
+                    !revoked.Ok && Profile.IsRevokedIntent(revoked.Message) &&
+                    Profile.SaveCallCount == savesBefore && DetectCalls == detectsBefore,
+                    "msg=" + (revoked.Message ?? "<空>"));
+
+                check("G2e-b 撤销文案判 SKIP，普通失败与占用文案不判 SKIP",
+                    Profile.IsRevokedIntent(Profile.RevokedIntentMessage) &&
+                    !Profile.IsRevokedIntent("内核没有确认") &&
+                    !Profile.IsRevokedIntent(Profile.ApplyBusyMessage), "");
+
+                Settings.Current.Mode = Settings.ModeWhitelist;
+                var revoked2 = Profile.Apply(new List<Profile.Item>(), true);
+                check("G2e-c 完全接管模式同样停手（判定与模式无关）",
+                    !revoked2.Ok && Profile.IsRevokedIntent(revoked2.Message), "");
+
+                // 收尾批 P2-2：secret 曾经有三套解析，这里锁住「统一解析 + 无第三套实现」。
+                File.WriteAllText(g2eCfg,
+                    "# secret: COMMENTED\nsecret: 'OLD'\n  secret: INDENTED\n" +
+                    "secret: \"FINAL\"\nexternal-controller: '127.0.0.1:9090'\n",
+                    new UTF8Encoding(false));
+                string g2eSecret, g2eController;
+                ReadController(g2eCfg, out g2eSecret, out g2eController);
+                check("G2e-d 多行 / 缩进 / 注释 secret 由统一解析器处理",
+                    g2eSecret == "FINAL" && g2eController == "127.0.0.1:9090", "secret=" + g2eSecret);
+                check("G2e-e Mihomo.ReadSecret 与统一解析结果一致",
+                    Mihomo.ReadSecret(g2eCfg) == g2eSecret, "");
+                var legacySecret = typeof(Profile).GetMethod("CurrentSecret",
+                    System.Reflection.BindingFlags.Static |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic);
+                check("G2e-f Profile 不再保留第三套 secret 解析", legacySecret == null, "");
+            }
+            catch (Exception ex)
+            {
+                check("G2e 端到端断言执行完成", false, ex.Message);
+            }
+            finally
+            {
+                Paths.ListPathOverride = g2eOverride;
+                Settings.Current.Mode = g2eMode;
+                try { if (File.Exists(g2eList)) File.Delete(g2eList); } catch { }
+                try { if (File.Exists(g2eCfg)) File.Delete(g2eCfg); } catch { }
+            }
 
             // G4：find-process-mode 原值以磁盘订阅为准，不能把工具写的 always 当成基线。
             check("G4-a 磁盘里的 strict 被正确读出",

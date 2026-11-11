@@ -79,21 +79,26 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
-        /// 备份能不能推给当前客户端。旧版备份没有 .meta，一律放行但要求调用方明确警告；
-        /// 新版备份记录了来源配置路径，与当前路径不一致时拒绝，避免把 A 客户端的订阅推给 B。
+        /// 备份能不能推给当前客户端（fail-closed，三种情况一律拒绝并给原因）：
+        /// 1) 无 .meta（旧版备份）：不推整份原件，调用方改走 BuildCleanRollbackPayload 基于当前订阅重建；
+        /// 2) 当前探测不到配置：核对不了来源，停止；
+        /// 3) 来源与当前路径不一致：避免把 A 客户端的订阅推给 B。
+        ///
+        /// 只有「有 .meta 且来源与当前路径一致」才放行整份推回。
+        /// 调用方必须先确认 currentPath 是否可信——探测不到就宁可停止还原。
         /// </summary>
         internal static bool BackupAllowed(string metaSource, string currentPath, bool metaExists, out string why)
         {
             why = "";
             if (!metaExists || string.IsNullOrEmpty(metaSource))
             {
-                why = "这份备份没有记录来源（旧版备份）";
-                return true;
+                why = "这份备份没有记录来源（旧版备份）；已改用当前订阅重建配置，不整份推回";
+                return false;
             }
             if (string.IsNullOrEmpty(currentPath))
             {
-                why = "当前探测不到客户端配置，无法核对备份来源";
-                return true;
+                why = "当前探测不到客户端配置，无法核对备份来源，已停止还原";
+                return false;
             }
             if (!metaSource.Trim().Equals(currentPath.Trim(), StringComparison.OrdinalIgnoreCase))
             {
@@ -103,11 +108,47 @@ namespace ProxyPicker.Core
             return true;
         }
 
+        /// <summary>
+        /// 旧版备份（没有 .meta）还原兜底：不推整份备份原文——那只是「上次接管前的旧订阅」，
+        /// 用户可能已经换过订阅，原样推回去等于把订阅整个换掉（外部评审 P1-③）。
+        ///
+        /// 改为：读当前订阅原文，用 Discovery.BuildPayload 以空名单+兼容模式重建一份
+        /// 「订阅原文去掉本工具规则块」的干净 payload（订阅/规则逐字保留，只拿走
+        /// 自己的 # PP-BEGIN / # PP-END 标记块；兼容模式（patchOnly: true）下订阅自带的
+        /// 段首 MATCH 属于订阅自己的规则，不会被 StripHeadMatch 拿走）。
+        /// 等价于退出还原。
+        /// find-process-mode / IPv6 按记下的原值恢复，与 LeaveNoTraceCore 同一套口径。
+        /// 返回 null 表示当前订阅不可读。
+        /// </summary>
+        static string BuildCleanRollbackPayload(string currentCfg)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(currentCfg) || !File.Exists(currentCfg)) return null;
+                string text = File.ReadAllText(currentCfg, System.Text.Encoding.UTF8);
+                string policy = "PP-FIXED";
+                try { bool reused; policy = Discovery.FindPolicy(text, out reused); } catch { }
+                // 未记过原值时保持现状（null = 仍写 always，与上次接管时的状态一致）。
+                string fpm = Settings.Current.FindProcessOriginal;
+                if (fpm.Length == 0) fpm = null;
+                string clean = Discovery.BuildPayload(text, new List<Item>(), policy, true, fpm);
+                bool ipv6Restore = Settings.Ipv6GuardOn && !string.IsNullOrEmpty(Settings.Current.Ipv6Original);
+                if (ipv6Restore)
+                    clean = Guard.RestoreIpv6(clean, Settings.Current.Ipv6Original);
+                return clean;
+            }
+            catch { return null; }
+        }
+
         public sealed class ApplyOutcome
         {
             public bool Ok;
-            /// <summary>配置已成功推给内核（即使随后回读校验或名单写入失败）。界面据此同步内存名单。</summary>
+            /// <summary>配置已成功推给内核（即使随后回读校验失败）。界面据此同步内存名单。</summary>
             public bool Pushed;
+            /// <summary>收尾批 P3-2：内核推成功、但勾选名单没写进磁盘。此时界面不能把内存名单
+            /// 对齐到「本次新名单」，否则看守会拿一份磁盘上并不存在的名单去对账；保持旧内存名单
+            /// 反而能让下一轮看守把内核自愈回磁盘那份，状态重新一致。</summary>
+            public bool PersistFailed;
             public string Message;
             public int RuleCount;
             public long Ms;
@@ -248,9 +289,13 @@ namespace ProxyPicker.Core
 
         public static string LastSaveError = "";
 
+        /// <summary>名单实际写盘次数；仅自检读取，用来断言「意图撤销时不得调用 Save」（收尾批 F-03）。</summary>
+        internal static long SaveCallCount;
+
         /// <summary>临时文件 + 原子替换；写失败返回 false，调用方必须停止推送。</summary>
         public static bool Save(List<Item> items)
         {
+            SaveCallCount++;
             string temp = null;
             try
             {
@@ -442,8 +487,10 @@ namespace ProxyPicker.Core
 
         // ---------------------------------------------------------------- 应用
 
-        /// <summary>跨进程互斥：命令行 --apply 与界面保存不能交叉写名单 / 推配置（评审 R6-4）。</summary>
-        public static ApplyOutcome Apply(List<Item> items)
+        /// <summary>跨进程互斥：命令行 --apply 与界面保存不能交叉写名单 / 推配置（评审 R6-4）。
+        /// autoRecover=true 时在锁内推送前再核一次接管意图，消除修复与托盘还原的竞态（评审 P1-②）；
+        /// 订阅兼容模式同样核对名单文件——它是接管意图的唯一载体（评审 R1）。</summary>
+        public static ApplyOutcome Apply(List<Item> items, bool autoRecover = false)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using (var gate = new System.Threading.Mutex(false, @"Local\ProxyPicker.Apply"))
@@ -453,19 +500,62 @@ namespace ProxyPicker.Core
                 catch (System.Threading.AbandonedMutexException) { owned = true; }
                 if (!owned)
                 {
-                    var busy = new ApplyOutcome { Ok = false, Message = "另一个 ProxyPicker 正在保存，请稍后再试" };
+                    var busy = new ApplyOutcome { Ok = false, Message = ApplyBusyMessage };
                     busy.Ms = sw.ElapsedMilliseconds;
                     return busy;
                 }
-                try { return ApplyCore(items, sw); }
+                try { return ApplyCore(items, sw, autoRecover); }
                 finally { try { gate.ReleaseMutex(); } catch { } }
             }
         }
 
-        /// <summary>生成 payload -> 推给内核 -> 回读规则校验 -> 成功后才写名单。</summary>
-        static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw)
+        internal static readonly string RevokedIntentMessage =
+            "接管意图已撤销，已停止自动补回；如需恢复请重新勾选后保存";
+
+        /// <summary>另一个实例正在保存（跨进程互斥没抢到锁）。收尾批 P3-5：
+        /// 这不是「补回坏了」，修复侧应按占用跳过，不能计入连败数。</summary>
+        internal static readonly string ApplyBusyMessage =
+            "另一个 ProxyPicker 正在保存，请稍后再试";
+
+        /// <summary>评审 R2 判别收敛成纯函数：ApplyCore 返回的是不是「用户主动撤销接管」。
+        /// RepairAsync 与自检都引用它，避免两处 StartsWith 文案各写一份而漂移。</summary>
+        internal static bool IsRevokedIntent(string message)
+        {
+            return message != null &&
+                   message.StartsWith(RevokedIntentMessage, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// 自动补回是否应停手：名单文件（接管意图的唯一载体）不存在时一律停手。
+        /// 纯函数，PatchOnly 不参与判定（评审 R1：订阅兼容模式下托盘还原同样删名单文件，
+        /// 豁免核对会让还原失效）。MainForm.RepairAsync 也引用 RevokedIntentMessage
+        /// 识别此语义（不计入反馈失败）。
+        /// </summary>
+        internal static bool AutoRecoverStopped(bool autoRecover) => autoRecover && !HasSavedIntent;
+
+        /// <summary>
+        /// 生成 payload -> 推给内核 -> 回读规则校验 -> 成功后才写名单。
+        ///
+        /// 评审 R1：`AutoRecoverStopped`（判定）与 `RevokedIntentMessage`（文案）在临界区内
+        /// 引用，同时由 MainForm.RepairAsync 按同一常量识别「撤销」语义；
+        /// Discovery.SelfTest G2d 也锁同一口径，三处不会漂移。</summary>
+        static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw, bool autoRecover)
         {
             var result = new ApplyOutcome();
+
+            // 竞态消除：自动化补回的推送前必达条件留在临界区内（同一把 Apply 互斥锁）。
+            // 否则「修复任务发出前检查意图」与「托盘还原删除名单文件」之间的窗口里：
+            // 还原完成，修复任务照旧把接管状态重新推回去，还原等于没做（评审 P1-②）。
+            // 评审 R1：曾经这里额外排除了订阅兼容模式（!Settings.PatchOnly），但名单文件
+            // 是接管意图的唯一载体，与模式无关——订阅兼容模式下还原同样删名单文件，
+            // 若豁免核对，托盘还原后看守照旧补回，还原等于没做。两种模式一律核对。
+            if (AutoRecoverStopped(autoRecover))
+            {
+                result.Ok = false;
+                result.Message = RevokedIntentMessage;
+                result.Ms = sw.ElapsedMilliseconds;
+                return result;
+            }
 
             string cfg = Paths.ClashYaml;
             if (string.IsNullOrEmpty(cfg) || !File.Exists(cfg))
@@ -498,7 +588,14 @@ namespace ProxyPicker.Core
                 return result;
             }
 
-            BackupOnce(cfg);
+            string backupErr;
+            if (!BackupOnce(cfg, out backupErr))
+            {
+                result.Ok = false;
+                result.Message = "创建备份失败，已停止本次推送以免覆盖脏状态：" + backupErr;
+                result.Ms = sw.ElapsedMilliseconds;
+                return result;
+            }
             // 主动开了防泄漏但还没记原值（例如命令行直接保存）时，先补记一次。
             if (Settings.Ipv6GuardOn) Settings.CaptureIpv6Original();
             // 第一次保存前记下客户端原本的 find-process-mode，退出时才能恢复原值。
@@ -519,7 +616,10 @@ namespace ProxyPicker.Core
 
             result.Policy = PolicyName();
             // 先推送；推送失败时磁盘名单保持原样，界面与内核不分叉（评审 R1-6 / R3-6）。
-            var push = Mihomo.PushConfig(payload);
+            // 评审 R4：本次保存已确认的订阅路径 cfg（由 Paths.ClashYaml 的 Detect 结果而来）
+            // 作为 knownConfigPath 传下去，让整条推送链绑定/secret/controller 全部使用
+            // 生成 payload 用的同一份配置——不允许通道绑定再猜一次导致错配。
+            var push = Mihomo.PushConfig(payload, 15000, cfg);
 
             // 只有内核「明确不认识 PROCESS-PATH-REGEX」时才降级。
             // 复审 F-07：以前超时/401/网络中断也会走这里，重试一旦成功就把目录规则
@@ -533,7 +633,8 @@ namespace ProxyPicker.Core
                 catch { fallback = null; }
                 if (fallback != null)
                 {
-                    var retry = Mihomo.PushConfig(fallback);
+                    // 评审 R4：重试同样锁定 cfg，与主推共用同一份配置
+                    var retry = Mihomo.PushConfig(fallback, 15000, cfg);
                     if (retry.Ok)
                     {
                         PathRulesRejected = true;   // 本次会话不再尝试，避免每次保存都白推一遍
@@ -565,13 +666,16 @@ namespace ProxyPicker.Core
             if (!Save(persist))
             {
                 result.Ok = false;
-                result.Message = "规则已推送，但勾选名单写入失败：" + LastSaveError + "；请检查文件权限后重新保存";
+                result.PersistFailed = true;   // 收尾批 P3-2：界面不要据此对齐内存名单
+                result.Message = "规则已推送，但勾选名单写入失败：" + LastSaveError +
+                    "；本次改动没有落盘，后台看守会按原名单恢复，请检查文件权限后重新保存";
                 result.Ms = sw.ElapsedMilliseconds;
                 return result;
             }
 
             // 回读校验：条数、exe、策略、空名单兜底、内核模式与进程识别开关（评审 R3-5 / R1-7）。
-            var rules = ReadRules();
+            // 收尾批 P2-1：回读也锁定 cfg，避免 5 秒缓存窗口内读到另一份客户端配置。
+            var rules = ReadRules(cfg);
             result.RuleCount = rules.Count;
             bool good = true;
             string whyBad = "";
@@ -617,7 +721,7 @@ namespace ProxyPicker.Core
             {
                 try
                 {
-                    var conf = Mihomo.GetJson("/configs", 4000);
+                    var conf = Mihomo.GetJson("/configs", 4000, cfg);
                     if (conf != null)
                     {
                         string mode = Json.Str(conf, "mode");
@@ -644,7 +748,7 @@ namespace ProxyPicker.Core
             {
                 try
                 {
-                    var after = Mihomo.GetJson("/configs", 4000);
+                    var after = Mihomo.GetJson("/configs", 4000, cfg);
                     if (after != null && Json.Bool(after, "ipv6", false))
                         result.Message += "（IPv6 仍开着，客户端可能已覆盖；要彻底关闭请在 Clash Verge 设置里改）";
                     else if (after != null)
@@ -668,22 +772,19 @@ namespace ProxyPicker.Core
             return System.Text.RegularExpressions.Regex.Replace(yaml, @"(?m)^secret:\s*.*$", SecretPlaceholder);
         }
 
-        static string CurrentSecret()
-        {
-            try
-            {
-                string p = Paths.ClashYaml;
-                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "";
-                foreach (var line in File.ReadLines(p))
-                    if (line.StartsWith("secret:", StringComparison.Ordinal))
-                        return line.Substring(7).Trim().Trim('\'', '"');
-            }
-            catch { }
-            return "";
-        }
+        // 收尾批 P2-2：删掉这里的第三套 secret 解析。还原补回密钥统一走
+        // Mihomo.ReadSecret(currentCfg) -> Discovery.ReadController，全仓只剩一种解析口径。
 
-        public static void BackupOnce(string configPath)
+        /// <summary>
+        /// 第一次接管留一份原件；每次保存前再滚动保留最近 3 份（评审 R1-12）。
+        ///
+        /// 返回 true 表示至少写出了一份；false 表示备份目录不可写 / 磁盘问题。
+        /// 调用方（ApplyCore）在备份失败时会中止本次推送，避免「推完无法回滚」
+        /// 还谎报成功（外部评审 P1-③）。备份持续失败也会在每日日志里积攒警告。
+        /// </summary>
+        public static bool BackupOnce(string configPath, out string error)
         {
+            error = "";
             try
             {
                 string dir = Paths.BackupDir;
@@ -706,8 +807,14 @@ namespace ProxyPicker.Core
                 if (File.Exists(recent)) { File.Copy(recent, prev2, true); CopyBackupMeta(recent, prev2); }
                 File.WriteAllText(recent, scrubbed, utf8);
                 File.WriteAllText(recent + ".meta", source, utf8);
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                CrashLog.Write(ex, "创建配置备份失败");
+                return false;
+            }
         }
 
         /// <summary>备份轮转时来源标记一起走；旧备份没有标记就把目标的标记删掉，避免张冠李戴。</summary>
@@ -795,7 +902,7 @@ namespace ProxyPicker.Core
                 }
                 catch { }
                 bool readOk;
-                var live = ReadRules(out readOk);
+                var live = ReadRules(out readOk, cfg);   // 收尾批 P2-1：退出还原回读同源
                 // 复审 F-02：任一位置存在自家规则都算，不能只看首条；读失败必须按「有」处理。
                 bool fpmRestore = !string.IsNullOrEmpty(fpm) && !fpm.Equals("always", StringComparison.OrdinalIgnoreCase);
                 // 完全接管 + 明确保存过空名单时，段首 MATCH,DIRECT 也是本工具留下的，必须一并撤掉。
@@ -805,7 +912,7 @@ namespace ProxyPicker.Core
                     Settings.ClearRestoreBaseline();   // 没接管过，也不该留着上一轮的过期基线
                     return true;                       // 内核里本来就没有我们的东西，不必重载配置
                 }
-                var push = Mihomo.PushConfig(clean);
+                var push = Mihomo.PushConfig(clean, 15000, cfg);   // 收尾批 P2-1
                 if (!push.Ok) { message = push.Error ?? ("HTTP " + push.Status); return false; }
                 Settings.ClearRestoreBaseline();       // 还原成功：这次接管收尾，下次重新捕获真实基线
                 return true;
@@ -881,19 +988,40 @@ namespace ProxyPicker.Core
                     try { metaSource = File.ReadAllText(chosen + ".meta", Encoding.UTF8).Trim(); }
                     catch { metaExists = false; }
                 }
-                string currentCfg = Paths.ClashYaml;
-                string sourceWhy;
-                if (!BackupAllowed(metaSource, currentCfg, metaExists, out sourceWhy))
+            string currentCfg = Paths.ClashYaml;
+            string sourceWhy;
+            if (!BackupAllowed(metaSource, currentCfg, metaExists, out sourceWhy))
+            {
+                // 旧版备份（无 .meta）：不推整份原件 —— 那是「换客户端前的旧订阅」，
+                // 推回去等于把用户已经更新过的订阅整个换掉（外部评审 P1-③）。
+                // 改为基于当前订阅重建一份干净 payload：剔除本工具的规则块，
+                // 保留订阅原规则与用户设置。
+                string back = BuildCleanRollbackPayload(currentCfg);
+                if (back == null)
                 {
-                    message = sourceWhy + "（备份来源：" + metaSource + "；当前配置：" + currentCfg +
-                              "）。请先在界面里保存一次，再点还原。";
+                    message = sourceWhy + "；且当前订阅不可读（" + currentCfg + "），无法重建配置。" +
+                              "请先启动客户端并保存一次，再点还原。";
                     return false;
                 }
+                var rebuild = Mihomo.PushConfig(back, 15000, currentCfg);   // 收尾批 P2-1
+                if (!rebuild.Ok)
+                {
+                    message = "推送清理后的配置失败：" + (rebuild.Error ?? ("HTTP " + rebuild.Status));
+                    return false;
+                }
+                message = sourceWhy + "；已按当前订阅重建干净配置，接管状态已清除";
+                string clearError2;
+                bool cleared2 = ClearSavedIntent(out clearError2);
+                if (cleared2) Settings.ClearRestoreBaseline();
+                return true;
+            }
 
                 string text = File.ReadAllText(chosen, Encoding.UTF8);
                 if (text.IndexOf("<备份时已移除", StringComparison.Ordinal) >= 0)
                 {
-                    string secret = CurrentSecret();
+                    // 收尾批 P2-2：改用统一的 Discovery.ReadController 解析（经 Mihomo.ReadSecret），
+                    // 且传入本次已确认的 currentCfg，不再另走一次 Paths.ClashYaml 的 Detect。
+                    string secret = Mihomo.ReadSecret(currentCfg);
                     if (secret.Length == 0)
                     {
                         message = "备份里的控制密钥已被移除，且读不到当前密钥；为安全起见已停止还原";
@@ -902,7 +1030,7 @@ namespace ProxyPicker.Core
                     text = System.Text.RegularExpressions.Regex.Replace(
                         text, @"(?m)^secret:\s*.*$", "secret: " + Json.Quote(secret));
                 }
-                var push = Mihomo.PushConfig(text);
+                var push = Mihomo.PushConfig(text, 15000, currentCfg);   // 收尾批 P2-1
                 if (!push.Ok)
                 {
                     message = "推送备份失败：" + (push.Error ?? ("HTTP " + push.Status));
@@ -945,12 +1073,24 @@ namespace ProxyPicker.Core
             return ReadRules(out ok);
         }
 
+        /// <summary>收尾批 P2-1：调用方已确认配置路径时，回读也走同一份，不再二次 Detect。</summary>
+        public static List<RuleInfo> ReadRules(string knownConfigPath)
+        {
+            bool ok;
+            return ReadRules(out ok, knownConfigPath);
+        }
+
         /// <summary>读内核规则表。ok=false 表示「没读到/格式异常」，与「真的 0 条」必须区分开。</summary>
         public static List<RuleInfo> ReadRules(out bool ok)
         {
+            return ReadRules(out ok, null);
+        }
+
+        public static List<RuleInfo> ReadRules(out bool ok, string knownConfigPath)
+        {
             ok = false;
             var list = new List<RuleInfo>();
-            var obj = Mihomo.GetJson("/rules");
+            var obj = Mihomo.GetJson("/rules", 10000, knownConfigPath);
             if (obj == null) return list;
             object raw;
             if (!obj.TryGetValue("rules", out raw)) return list;

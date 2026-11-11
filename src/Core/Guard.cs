@@ -49,17 +49,20 @@ namespace ProxyPicker.Core
         /// policies：名单里每条的名字 → 期望策略。只有显式写了 DIRECT / 组名时才核对；
         /// PP-FIXED 的目标要运行时才知道，交给 Apply 的回读，不在这里猜。
         /// </summary>
-        public static Intent Audit(IEnumerable<string> wanted, Dictionary<string, string> policies)
+        public static Intent Audit(IEnumerable<string> wanted, Dictionary<string, string> policies,
+                                   string knownConfigPath = null)
         {
             var it = new Intent();
-            var cfg = Mihomo.GetJson("/configs", 6000);
+            // 收尾批 P2-1：看守对账的两次读（/configs 与 /rules）锁到同一份配置，
+            // 不与 5 秒缓存窗口里的另一次 Detect 交叉。不传时保持原行为。
+            var cfg = Mihomo.GetJson("/configs", 6000, knownConfigPath);
             if (cfg == null) { it.Error = "读不到内核配置"; return it; }
 
             it.Ipv6On = Json.Bool(cfg, "ipv6", false);
             it.FindProcess = Json.Str(cfg, "find-process-mode") ?? "";
             it.Mode = Json.Str(cfg, "mode") ?? "";
 
-            var rules = Profile.ReadRules();
+            var rules = Profile.ReadRules(knownConfigPath);
             it.RuleCount = rules.Count;
             if (rules.Count == 0) { it.Error = "内核没有返回规则表"; return it; }
             it.Ok = true;

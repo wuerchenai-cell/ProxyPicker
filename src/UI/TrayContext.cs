@@ -58,6 +58,29 @@ namespace ProxyPicker.UI
         [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
         static extern int RegisterWindowMessage(string message);
 
+        /// <summary>
+        /// 还原确认框按备份带不带 .meta 分两句文案（评审 R3）。
+        /// 判断规则与 Profile.RollbackCore 的选择逻辑一致：
+        /// 有 recent.yaml 用 recent.yaml，否则 original.yaml；选中的那份带 .meta 才算「新版备份」。
+        /// </summary>
+        static bool HasBackupMeta()
+        {
+            try
+            {
+                string dir = Core.Paths.BackupDir;
+                string recent = System.IO.Path.Combine(dir, "recent.yaml");
+                string original = System.IO.Path.Combine(dir, "original.yaml");
+                string chosen = System.IO.File.Exists(recent) ? recent : original;
+                if (!System.IO.File.Exists(chosen) || !System.IO.File.Exists(chosen + ".meta")) return false;
+                // 收尾批 P3-4：RollbackCore 在 .meta 读失败或内容为空时按「旧版备份」处理，
+                // 只清工具规则。这里也做同样的可读性检查，避免确认框说「会整份推回」
+                // 而实际走的是清理分支，两套文案对不上。
+                string source = System.IO.File.ReadAllText(chosen + ".meta", System.Text.Encoding.UTF8);
+                return !string.IsNullOrEmpty(source.Trim());
+            }
+            catch { return false; }
+        }
+
         public TrayContext(bool showOnStart)
         {
             _form = new MainForm();
@@ -94,9 +117,18 @@ namespace ProxyPicker.UI
             menu.Items.Add("复制诊断信息", null, (s, e) => _form.CopyDiagnosticsPublic());
             menu.Items.Add("还原上次保存前的配置", null, (s, e) =>
             {
+                // 评审 R3：确认框按备份带不带 .meta 说明还原语义——
+                // 带 .meta 的备份是 ProxyPicker 保存的原样快照，会整份推回；
+                // 不带 .meta 的是旧版备份，只会清除工具规则在当前订阅上的改动。
+                bool backupHasMeta = HasBackupMeta();
                 if (MessageBox.Show(
-                    "把客户端配置还原到上次保存前，并清除 ProxyPicker 的接管状态（勾选名单）。\n" +
-                    "还原后后台看守不会再自动接管。\n确定要还原吗？",
+                    backupHasMeta
+                        ? "把客户端配置还原到上次保存前（推回备份的整份配置），" +
+                          "并清除 ProxyPicker 的接管状态（勾选名单）。\n" +
+                          "还原后后台看守不会再自动接管。\n确定要还原吗？"
+                        : "备份里没有 .meta 备份标记（旧版备份）。\n" +
+                          "本次还原只清除 ProxyPicker 加到当前订阅上的工具规则，\n" +
+                          "不会把旧订阅整份推回，也不会影响你自己添加的规则。\n确定要还原吗？",
                     "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 string msg;
                 bool ok = Core.Profile.Rollback(out msg);

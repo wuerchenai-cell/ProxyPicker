@@ -564,6 +564,9 @@ namespace ProxyPicker.UI
                 _watching = true;
                 int revision = _revision;
                 bool patch = Settings.PatchOnly;
+                // 收尾批 P2-1：本轮对账只认这一份配置，/configs 与 /rules 都按它绑定，
+                // 不让 5 秒缓存窗口里的另一次 Detect 把两次读拆到不同客户端。
+                string watchCfg = Paths.ClashYaml;
                 // 对账要拿「实际应该存在的规则」比，而不是只比主 exe：
                 // Antigravity 的语言服务进程在 resources\bin 下，属于必须一起写进规则的 helper，
                 // 只比主 exe 会得出「已生效」，实际登录请求仍然直连（实测就是登录失败）。
@@ -574,7 +577,7 @@ namespace ProxyPicker.UI
                 var auditPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var r in _all)
                     if (r.Proxy && !string.IsNullOrEmpty(r.Policy)) auditPolicies[r.Exe] = r.Policy;
-                var audit = await Task.Run(() => Guard.Audit(wantedAll, auditPolicies));
+                var audit = await Task.Run(() => Guard.Audit(wantedAll, auditPolicies, watchCfg));
                 if (!UiAlive || revision != _revision) return;
 
                 // 用户刚在帮助面板切了模式但还没点保存，看守不能替他把新模式推下去（评审 R4-2）。
@@ -638,9 +641,31 @@ namespace ProxyPicker.UI
 
                 var visible = VisibleExes();
                 var paths = PathMap();
-                var res = await Task.Run(() => Profile.Apply(ComposeWithHelpers(exes, visible, paths)));
+                var res = await Task.Run(() => Profile.Apply(ComposeWithHelpers(exes, visible, paths), true));
                 if (!UiAlive) return;
-                if (!res.Ok) throw new InvalidOperationException(res.Message ?? "内核没有确认");
+                if (!res.Ok)
+                {
+                    // 评审 R2：Apply 返回「接管意图已撤销…」= 用户在托盘放过还原，
+                    // 看守按用户意图安静退出，不是补回失败。撤销刚才预增的失败计数，
+                    // 记一条 SKIP 日志直接返回——不进 catch 触发 FAIL 记录，
+                    // 也不会连败 3 次后弹「请点保存」（用户本来就是要撤，弹这个反而警告无效）。
+                    // 判别用 Profile.RevokedIntentMessage 常量，与 ApplyCore 同一来源。
+                    if (Profile.IsRevokedIntent(res.Message))
+                    {
+                        _repairFails--;
+                        AuditLog.Record("SKIP", "自动补回按用户意图退出：" + why + " / " + res.Message);
+                        return;
+                    }
+                    // 收尾批 P3-5：双开时没抢到跨进程保存锁属于「占用」，不是补回故障。
+                    // 以前它走 catch 记 FAIL，连碰三次会让看守直接放弃，实际什么都没坏。
+                    if (Profile.ApplyBusyMessage.Equals(res.Message, StringComparison.Ordinal))
+                    {
+                        _repairFails--;
+                        AuditLog.Record("SKIP", "另一个 ProxyPicker 正在保存，本轮补回跳过：" + why);
+                        return;
+                    }
+                    throw new InvalidOperationException(res.Message ?? "内核没有确认");
+                }
 
                 _state.Applied = true;
                 _state.RuleCount = res.RuleCount;
@@ -951,7 +976,10 @@ namespace ProxyPicker.UI
 
                 // 推送成功就把内存名单对齐（外部评审 F4）：回读校验失败时内核其实已经改了，
                 // 若仍拿旧名单去对账，看守会把用户刚取消勾选的软件又补回来。
-                if (pack.Apply.Pushed)
+                // 收尾批 P3-2：但「名单没写进磁盘」是例外——此时对齐内存会让看守拿一份
+                // 磁盘上并不存在的名单去对账。保持旧内存名单，下一轮看守自然把内核补回
+                // 磁盘那份，状态重新一致；界面也会明确提示本次改动没有落盘。
+                if (pack.Apply.Pushed && !pack.Apply.PersistFailed)
                 {
                     _savedProxy = now;
                     _list.SavedProxy = now;

@@ -44,6 +44,7 @@ namespace ProxyPicker.Core
         static long _trustedAtTick;
         static string _pipeTrustDetail;
         static string _pipeAmbiguous;     // 多个内核实例、无法绑定同一客户端时失败关闭（评审 R6-2）
+        static string _boundConfigPath;   // 通道缓存绑定的服务配置路径；与 Discovery 当前选中不一致时整份 Forget（评审 P1-①）
 
         public static string LastPipeName { get { return _pipeName; } }
         public static string LastEndpoint { get { return _endpoint; } }
@@ -221,30 +222,93 @@ namespace ProxyPicker.Core
             return hits[0];
         }
 
-        public static string ReadSecret()
+        public static string ReadSecret(string knownConfigPath = null)
         {
             try
             {
-                string p = Discovery.Detect().ConfigPath;
+                // 评审 R4：传入本次保存已确认的配置路径时直接按它读 secret，
+                // 保证 secret 与 payload 生成 / 通道绑定判定出自同一份配置，
+                // 不与新 Detect 的怪异窗口交叉（避免把 A 的秘密送到 B 的管道/隧道）。
+                string p = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath
+                                        : Discovery.Detect().ConfigPath;
                 if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "";
-                foreach (var line in File.ReadLines(p))
-                {
-                    if (line.StartsWith("secret:", StringComparison.Ordinal))
-                        return line.Substring(7).Trim().Trim('\'', '"');
-                }
+                // 收尾批 P2-2：secret 解析统一收敛到 Discovery.ReadController。
+                // 以前这里另有一套「不 trim / 不跳注释 / 取第一条」的实现，与
+                // Discovery 的「trim + 跳注释 + 取最后一条」在多行 secret 或缩进
+                // secret 时会读出不同密钥，导致认证失败或用错密钥。
+                string secret, controller;
+                Discovery.ReadController(p, out secret, out controller);
+                return secret ?? "";
             }
             catch { }
             return "";
         }
 
-        /// <summary>发一次请求：先管道，失败再走本地 HTTP。</summary>
-        public static ApiResult Request(string method, string path, string body, int timeoutMs)
+        /// <summary>
+        /// 绑定判定：当前选中配置路径非空、且与缓存绑定的那一份不一致时返回 true（应整份 Forget）。
+        /// 抽成独立方法以便自检直接驱动判定逻辑，不依赖 Discovery 的真实返回值。
+        /// </summary>
+        static bool BindingStaleFor(string current)
         {
+            if (string.IsNullOrEmpty(current)) return false;   // 没有选中任何配置：不动缓存
+            return !string.Equals(_boundConfigPath, current, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// P1-① 通道缓存绑定：多客户端 / 多订阅机器上，Discovery 按评分自动选当前最可能在跑的那个；
+        /// 用户中途切换客户端（VS Code 订阅换成 Clash Verge 订阅等）时，旧的 _pipeName / _endpoint /
+        /// _secret 不会自动失效——它们都缓存着上一次命中的容器管道名 / HTTP 端口 / Secret。管道名里带的
+        /// 又不是跨客户端唯一，于是会出现「连的是 A 的管道、推的是 B 的配置」那类错配，而用户看得见
+        /// 界面只是「保存成功」。
+        /// 修法：每次复用缓存前，比对 Discovery 当前选中的配置路径与缓存绑定的那一份；不一致就整份
+        /// Forget（动作原子且幂等，并发下无损），让后续枚举重新命中目标客户端。
+        /// 评审 R4：一次保存里 payload 生成（Profile.ApplyCore 用 Paths.ClashYaml，触发 Detect #1）
+        /// 与通道绑定判定（这里再 Detect #2）必须使用同一份配置路径——否则 5 秒缓存窗口内两次
+        /// 猜测可能拿到不同订阅，导致「按 A 生成、按 B 绑定」的错配。knownConfigPath 由调用方
+        /// （ApplyCore）传入本次保存已确认的配置路径：传入时不再 Detect，直接用它做绑定判定；
+        /// 不传（外部命令 --raw / --diag 等旧调用点）维持原行为。
+        /// </summary>
+        internal static void EnsureBoundToCurrentConfig(string knownConfigPath = null)
+        {
+            string current;
+            if (!string.IsNullOrEmpty(knownConfigPath))
+            {
+                current = knownConfigPath;   // R4：调用方已持有本次保存的配置路径，不再二次猜测
+            }
+            else
+            {
+                // 收尾批 F-03：只有「没拿到同源路径」才允许回退到 Detect；
+                // 这个计数供自检断言「传了 knownConfigPath 就不再二次猜测」。
+                DetectFallbackCount++;
+                try { current = Discovery.Detect().ConfigPath; }
+                catch { return; }
+            }
+            if (!BindingStaleFor(current)) return;
+
+            Forget();
+            _boundConfigPath = current;
+            // 评审报告 §15（P3 可观测性）：真的改绑时留一行，路径由 AuditLog 统一脱敏。
+            // 切客户端后第一次保存若重新枚举失败，排障时能看出是缓存被清过。
+            if (!SuppressBindLog)
+                AuditLog.Record("BIND", "通道缓存改绑到配置 " + (current ?? ""));
+        }
+
+        /// <summary>没有同源路径、回退到 Detect 的次数；仅自检读取（收尾批 F-03）。</summary>
+        internal static long DetectFallbackCount;
+
+        /// <summary>自检驱动绑定逻辑时不写审计账本，避免一次 --selftest 污染用户日志。</summary>
+        internal static bool SuppressBindLog;
+
+        /// <summary>发一次请求：先管道，失败再走本地 HTTP。</summary>
+        public static ApiResult Request(string method, string path, string body, int timeoutMs,
+                                        string knownConfigPath = null)
+        {
+            EnsureBoundToCurrentConfig(knownConfigPath);
             var sw = Stopwatch.StartNew();
-            var viaPipe = TryPipe(method, path, body, timeoutMs, sw);
+            var viaPipe = TryPipe(method, path, body, timeoutMs, sw, knownConfigPath);
             if (viaPipe != null) { HandleAuthFailure(viaPipe); return viaPipe; }
 
-            var viaHttp = TryHttp(method, path, body, timeoutMs, sw);
+            var viaHttp = TryHttp(method, path, body, timeoutMs, sw, knownConfigPath);
             if (viaHttp != null) { HandleAuthFailure(viaHttp); return viaHttp; }
 
             return new ApiResult
@@ -262,13 +326,14 @@ namespace ProxyPicker.Core
             if (r != null && (r.Status == 401 || r.Status == 403)) Forget();
         }
 
-        static ApiResult TryPipe(string method, string path, string body, int timeoutMs, Stopwatch sw)
+        static ApiResult TryPipe(string method, string path, string body, int timeoutMs, Stopwatch sw,
+                                 string knownConfigPath = null)
         {
             if (_pipeName == null) _pipeName = FindPipe();
             if (_pipeName == null && !string.IsNullOrEmpty(_pipeAmbiguous))
                 return new ApiResult { Error = _pipeAmbiguous, Ms = sw.ElapsedMilliseconds };
             if (_pipeName == null) return null;
-            if (_secret == null) _secret = ReadSecret();
+            if (_secret == null) _secret = ReadSecret(knownConfigPath);
 
             var r = new ApiResult();
             bool sent = false;
@@ -550,19 +615,20 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
-        static ApiResult TryHttp(string method, string path, string body, int timeoutMs, Stopwatch sw)
+        static ApiResult TryHttp(string method, string path, string body, int timeoutMs, Stopwatch sw,
+                                 string knownConfigPath = null)
         {
             // 多实例时连 HTTP 回退也不能发密钥，避免把 A 的 Secret 送到 B（评审 R6-2）。
             if (!string.IsNullOrEmpty(_pipeAmbiguous))
                 return new ApiResult { Error = _pipeAmbiguous, Ms = sw.ElapsedMilliseconds };
-            string ep = Endpoint();
+            string ep = Endpoint(knownConfigPath);
             if (ep == null)
             {
                 if (!string.IsNullOrEmpty(_securityError))
                     return new ApiResult { Error = _securityError, Ms = sw.ElapsedMilliseconds };
                 return null;
             }
-            if (_secret == null) _secret = ReadSecret();
+            if (_secret == null) _secret = ReadSecret(knownConfigPath);
 
             var r = new ApiResult();
             try
@@ -639,15 +705,30 @@ namespace ProxyPicker.Core
         /// 挑控制地址。两条硬规则：
         /// ① external-controller 必须是纯本机地址，非本机一律拒绝且不回退，防止 Bearer Secret 走明文 HTTP 出本机；
         /// ② 端口能连上还不够，先用不带密钥的 /version 确认监听者确实是 mihomo。
+        /// 评审 R4：knownConfigPath 传入时（一次保存链路里由 ApplyCore 传入本次已确认的配置路径），
+        /// external-controller 直接从该配置读取（复用 Discovery.ReadController 兜底解析，不二次 Detect）；
+        /// 不传时保持原行为：走 Discovery.Detect() 的缓存路径。
         /// </summary>
-        static string Endpoint()
+        static string Endpoint(string knownConfigPath = null)
         {
             if (_endpointTried && _endpoint != null) return _endpoint;
             _endpointTried = true;
             _endpoint = null;
             _securityError = null;
 
-            string configured = Discovery.Detect().Controller;
+            string configured;
+            string sameFileSecret = null;
+            if (!string.IsNullOrEmpty(knownConfigPath))
+            {
+                // R4：与绑定/secret 同一份配置，控制器地址不能另走一次 Detect() 猜测。
+                // 收尾批 P3-1：同一次读出的 secret 一并往下传，不再让 ProbeMihomo
+                // 重开文件读第二遍（少一次 IO，也少一次两套解析发散的机会）。
+                Discovery.ReadController(knownConfigPath, out sameFileSecret, out configured);
+            }
+            else
+            {
+                configured = Discovery.Detect().Controller;
+            }
             if (!string.IsNullOrEmpty(configured))
             {
                 string ep, reason;
@@ -661,7 +742,7 @@ namespace ProxyPicker.Core
                 // 只有非本机地址（上面 TryLoopbackEndpoint 拒绝）才需要硬阻止并给出安全提示。
                 // 只有「来自同一份客户端配置」的地址才允许带该配置的 Secret 重试；
                 // 下面那些猜出来的候选端口一律不带密钥，避免把 A 的 Secret 送到 B（评审 R6-2）。
-                if (!ProbeMihomo(ep, true)) return null;
+                if (!ProbeMihomo(ep, true, knownConfigPath, sameFileSecret)) return null;
                 _endpoint = ep;
                 return _endpoint;
             }
@@ -708,13 +789,16 @@ namespace ProxyPicker.Core
         /// 配了 Secret 的实例对无密钥请求一律返 401 —— 以前这一步直接吞掉异常判「通道不可用」，
         /// 导致只开 HTTP 控制口且设了 Secret 的客户端完全连不上（外部评审 F6）。
         /// allowSecret=true 时（地址来自同一份客户端配置）才允许带密钥重试。
+        /// 评审 R4：knownConfigPath 传入时，重试密钥按该配置读取（与 push 的绑定/推送Secret 同源）。
         /// </summary>
-        static bool ProbeMihomo(string ep, bool allowSecret)
+        static bool ProbeMihomo(string ep, bool allowSecret, string knownConfigPath = null,
+                                string sameFileSecret = null)
         {
             // 第一次绝不带 Authorization 头：没设 Secret 的实例不需要多余的信息披露。
             if (ProbeVersion(ep, null)) return true;
             if (!allowSecret) return false;
-            string secret = ReadSecret();
+            // 收尾批 P3-1：Endpoint 已读过同一份配置时直接复用，不再二次读文件。
+            string secret = sameFileSecret ?? ReadSecret(knownConfigPath);
             if (string.IsNullOrEmpty(secret)) return false;
             // 401 只说明「需要认证」，不能据此认定服务可信：地址已被 TryLoopbackEndpoint
             // 限定为本机回环，且带密钥重试后仍必须通过 LooksLikeMihomoVersion 校验响应体。
@@ -759,9 +843,15 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
-        public static Dictionary<string, object> GetJson(string path, int timeoutMs = 10000)
+        /// <summary>
+        /// 收尾批 P2-1：knownConfigPath 把「回读 /configs、/rules」也锁到调用方已确认的
+        /// 那一份配置。以前 GetJson 没有这个参数，Request 会回退到 Detect()；Detect 有
+        /// 5 秒缓存，过期窗口内可能与本次推送绑定的不是同一份配置。不传时保持原行为。
+        /// </summary>
+        public static Dictionary<string, object> GetJson(string path, int timeoutMs = 10000,
+                                                          string knownConfigPath = null)
         {
-            var r = Request("GET", path, null, timeoutMs);
+            var r = Request("GET", path, null, timeoutMs, knownConfigPath);
             if (!r.Ok) return null;
             try { return Json.AsObject(Json.Parse(r.Body)); }
             catch { return null; }
@@ -818,10 +908,15 @@ namespace ProxyPicker.Core
             catch { }
         }
 
-        /// <summary>把完整配置文本推给内核（不落盘、不触发 SAFE_PATHS 限制）。</summary>
-        public static ApiResult PushConfig(string yamlText, int timeoutMs = 15000)
+        /// <summary>把完整配置文本推给内核（不落盘、不触发 SAFE_PATHS 限制）。
+        /// 评审 R4：knownConfigPath 传入时（一次保存链路里由 ApplyCore 传入本次已确认的配置路径），
+        /// 整条推送链——通道绑定判定、secret 读取、external-controller 读取——都使用这一份配置，
+        /// 不再各自 Detect()；从而消除「payload 按 A 生成、通道按 B 绑定」的错配窗口。不传保持原行为。</summary>
+        public static ApiResult PushConfig(string yamlText, int timeoutMs = 15000,
+                                           string knownConfigPath = null)
         {
-            return Request("PUT", "/configs", "{\"payload\":" + Json.Quote(yamlText) + "}", timeoutMs);
+            return Request("PUT", "/configs", "{\"payload\":" + Json.Quote(yamlText) + "}", timeoutMs,
+                           knownConfigPath);
         }
 
         /// <summary>关闭指定的一条旧连接。只由「本次改动软件」的定向重连调用。</summary>
@@ -881,6 +976,88 @@ namespace ProxyPicker.Core
                 _pipeTrustDetail = savedDetail;
             }
 
+            // P1-① 通道缓存绑定：判定逻辑是纯函数，直接驱动，不碰真管道 / 不联网。
+            string savedBound = _boundConfigPath;
+            try
+            {
+                // 空选择：不动缓存（不能把没有选中配置当成切换）。
+                _boundConfigPath = "C:/X.yaml";
+                check("绑定判定：当前无选中配置时不动缓存", !BindingStaleFor(""), "");
+
+                // 绑定一致：复用缓存。
+                _boundConfigPath = "C:\\Client A\\config.yaml";
+                check("绑定判定：与缓存绑定同一份时复用", !BindingStaleFor("C:\\Client A\\config.yaml"), _boundConfigPath);
+                check("绑定判定：路径比较大小写不敏感", !BindingStaleFor("c:\\client a\\CONFIG.yaml"), _boundConfigPath);
+
+                // 绑定不一致：应判定为需要失效。
+                _boundConfigPath = "C:\\Client A\\config.yaml";
+                check("绑定判定：切到另一份配置时判失效", BindingStaleFor("C:\\Client B\\config.yaml"), "");
+
+                // 首次绑定（缓存为空）应判失效，让后续重新枚举。
+                _boundConfigPath = null;
+                check("绑定判定：首次未绑定时判失效", BindingStaleFor("C:\\Client A\\config.yaml"), "");
+            }
+            finally
+            {
+                _boundConfigPath = savedBound;
+            }
+
+            // Forget 必须连绑定一起清空，否则下次无法重新绑定。
+            string savedBoundForForget = _boundConfigPath;
+            string savedPipeForForget = _pipeName;
+            try
+            {
+                _boundConfigPath = "C:\\Client A\\config.yaml";
+                _pipeName = "pipe-X";
+                Forget();
+                check("Forget 连通道缓存绑定一起清空", _boundConfigPath == null && _pipeName == null, "");
+            }
+            finally
+            {
+                _boundConfigPath = savedBoundForForget;
+                _pipeName = savedPipeForForget;
+            }
+
+            // 评审 R4 断：knownConfigPath 传入时，通道绑定只按该路径判定，不再走 Discovery.Detect()。
+            // 用两个假路径驱动：切换运行时必须整份失效（Forget），绑定目标必须是传入的那份路径。
+            // 不传路径（null）时走原 Detect 分支，该分支依赖真实机器环境，不在纯自检里下断言。
+            string r4SavedBound = _boundConfigPath;
+            string r4SavedPipe = _pipeName;
+            bool r4SavedSuppress = SuppressBindLog;
+            try
+            {
+                SuppressBindLog = true;   // 自检驱动绑定不写审计账本
+                _boundConfigPath = null;
+                _pipeName = null;
+                long fallbackBefore = DetectFallbackCount;
+                EnsureBoundToCurrentConfig(@"C:\PP-TEST\known-config.yaml");
+                check("R4-1 绑定只用传入的 knownConfigPath",
+                    _boundConfigPath == @"C:\PP-TEST\known-config.yaml", _boundConfigPath ?? "<空>");
+                // 收尾批 F-03（评审 §10 第 3 条的等价自动化）：一次保存链路里，
+                // 传了同源路径就绝不能再回退到 Detect() 二次猜测。
+                check("R4-3 传同源路径时不再 Detect 二次猜测",
+                    DetectFallbackCount == fallbackBefore, "fallback=" + (DetectFallbackCount - fallbackBefore));
+                EnsureBoundToCurrentConfig(@"C:\PP-TEST\another-config.yaml");
+                check("R4-2 传另一份配置路径时整份失效重新绑定",
+                    _boundConfigPath == @"C:\PP-TEST\another-config.yaml", _boundConfigPath ?? "<空>");
+            }
+            finally
+            {
+                SuppressBindLog = r4SavedSuppress;
+                _boundConfigPath = r4SavedBound;
+                _pipeName = r4SavedPipe;
+            }
+
+            // 收尾批 P2-1：回读校验 / 看守对账走 GetJson，以前它没有同源参数，
+            // Request 会自己 Detect 一次。这两条结构断言防止后续把参数删掉又退回旧行为。
+            bool getJsonKnown = false, pushKnown = false;
+            foreach (var p in typeof(Mihomo).GetMethod("GetJson").GetParameters())
+                if (p.Name == "knownConfigPath") getJsonKnown = true;
+            foreach (var p in typeof(Mihomo).GetMethod("PushConfig").GetParameters())
+                if (p.Name == "knownConfigPath") pushKnown = true;
+            check("R4-4 回读 GetJson 支持同源路径", getJsonKnown, "");
+            check("R4-5 推送 PushConfig 支持同源路径", pushKnown, "");
+
             sb.AppendLine();
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();
@@ -895,6 +1072,7 @@ namespace ProxyPicker.Core
         public static string RequestRaw(string method, string path, string body, int timeoutMs)
         {
             var sb = new StringBuilder();
+            EnsureBoundToCurrentConfig();   // P1-①：--raw 也复用 Endpoint() 缓存，同样要先按当前选中配置失效
             string pipe = FindPipe();
             string sec = ReadSecret();
             sb.AppendLine("pipe     : " + (pipe ?? "<未找到>"));
@@ -954,6 +1132,7 @@ namespace ProxyPicker.Core
             _trustedAtTick = 0;
             _pipeTrustDetail = null;
             _pipeAmbiguous = null;
+            _boundConfigPath = null;
         }
     }
 }

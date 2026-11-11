@@ -8,9 +8,16 @@
 [直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
 [更新记录](CHANGELOG.md)
 
-> **v1.3.1 已发布**（2026-11-10）：上面两个下载链接指向的就是 v1.3.1，
-> Release 页面：https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v1.3.1
-> （v1.2.5 / v1.3.0 未单独发布，其修复并入本版）。
+> **最新版 v1.3.2**（2026-11-10，已签名打包，待实机复测后发布）：上面两个下载链接
+> 指向远端最新 Release，在 v1.3.2 发布前仍会下载到 v1.3.1。
+> **当前远端最新 Release 是 v1.3.1**：https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v1.3.1
+> （v1.2.5 / v1.3.0 未单独发布，其修复并入 v1.3.1）。
+> v1.3.2 修了第三方评审提出的三个问题：中途切换客户端时的通道缓存绑定（P1-①）、
+> 托盘还原与自动补回的接管竞态（P1-②）、旧版备份来源校验与干净重建（P1-③），
+> 以及第二轮评审的 R1–R5：接管意图核对与模式无关（订阅兼容模式下撤销即停手）、
+> 意图撤销不计补回失败、还原确认框按备份来源分文案、一次保存只 Detect 一遍配置、
+> 过期注释同步与自检补足。随后按独立复审收尾批补齐 R4 同源约束的剩余调用点、
+> secret 解析统一与评审 §10 的测试断言（自检 154 项）。
 > 程序里的「检查更新」只在远端版本号比本机大时才提示，不会把人引去下载旧包。
 
 ![主界面](docs/img/main.png)
@@ -117,7 +124,7 @@ dotnet build src\ProxyPicker.csproj -c Release
 只读自检出口（不改任何配置）：
 
 ```bat
-ProxyPicker.exe --selftest 自检.txt     :: 通用性 104 项 + 控制接口安全 20 项 + 流量对账 9 项（共 133 项）
+ProxyPicker.exe --selftest 自检.txt     :: 通用性 114 项 + 控制接口安全 31 项 + 流量对账 9 项（共 154 项）
 ProxyPicker.exe --dryrun 配置.yaml 输出.yaml whitelist
 ProxyPicker.exe --scan 进程识别.txt     :: 只读列出路径、同名冲突、辅助进程（已脱敏）
 ProxyPicker.exe --version 版本.txt

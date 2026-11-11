@@ -22,6 +22,13 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
+        /// 仅自检使用的名单路径注入点：把 HasSavedIntent 指向一个临时文件，
+        /// 让「名单已删除」的端到端断言能在不碰真机名单的前提下真跑一次 Apply。
+        /// 生产路径下恒为 null；自检在 try/finally 里临时设置并恢复（收尾批 F-03）。
+        /// </summary>
+        internal static string ListPathOverride;
+
+        /// <summary>
         /// 勾选名单固定放本程序自己的目录：换客户端 / 重装不会丢（评审 R5-3）。
         /// 只读命令不再在客户端数据目录里创建 pp_rules\（评审 R5-6）。
         /// 老版本把名单写在客户端目录下，这里做一次性迁移，绝不覆盖已有的新名单。
@@ -29,7 +36,12 @@ namespace ProxyPicker.Core
         /// </summary>
         public static string ListPath
         {
-            get { return Path.Combine(OwnDir, "pp-whitelist.yaml"); }
+            get
+            {
+                return !string.IsNullOrEmpty(ListPathOverride)
+                    ? ListPathOverride
+                    : Path.Combine(OwnDir, "pp-whitelist.yaml");
+            }
         }
 
         /// <summary>
