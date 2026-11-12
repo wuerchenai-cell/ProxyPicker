@@ -58,6 +58,13 @@ namespace ProxyPicker.Core
 
             // 节点名和管道实例 ID 会暴露订阅来源 / 这台机器的标识。
             s = Regex.Replace(s, @"(?m)^节点：.*$", "节点：<节点名已隐藏>");
+            // v1.3.7：--diag 里「策略组：X · 出口：Y · GLOBAL：Z」是组合行，
+            // 以前只盖住独立的「节点：」行，组合行里的组名和节点名照旧带出去。
+            // 只隐藏名字，保留 DIRECT / REJECT / 未找到 这类排查必需的状态词。
+            s = Regex.Replace(s, @"(?m)^策略组：(.+?) · 出口：(.+?) · GLOBAL：(.+)$", m =>
+                "策略组：" + MaskName(m.Groups[1].Value) +
+                " · 出口：" + MaskExit(m.Groups[2].Value) +
+                " · GLOBAL：" + MaskName(m.Groups[3].Value));
             s = Regex.Replace(s, @"(实际 代理)（[^）\r\n]*）", "$1（节点名已隐藏）");
             // ID 放宽到 ≥8 位 hex 或 GUID 形态；\\.\pipe\ 全名一律整段隐藏（复审 P2）。
             s = Regex.Replace(s, @"(?m)^(管道：.+)-([0-9A-Fa-f][0-9A-Fa-f-]{7,})\s*$",
@@ -77,6 +84,25 @@ namespace ProxyPicker.Core
                 @"((?:""|')?(?:password|passwd|token|secret|authorization|api[_-]?key|access[_-]?key)(?:""|')?\s*[:=]\s*(?:""|'))([^""'\r\n]+)(""|')",
                 "$1<敏感值已隐藏>$3", RegexOptions.IgnoreCase);
             return s;
+        }
+
+        /// <summary>诊断行里的策略组 / GLOBAL 名字：状态词保留，真名字隐藏。</summary>
+        static string MaskName(string v)
+        {
+            string t = (v ?? "").Trim();
+            if (t.Length == 0 || t == "未找到" || t == "未读取" || t == "-") return t;
+            return "<组名已隐藏>";
+        }
+
+        /// <summary>出口名：DIRECT / REJECT 这类状态词要留着，节点名隐藏。</summary>
+        static string MaskExit(string v)
+        {
+            string t = (v ?? "").Trim();
+            if (t.Length == 0 || t == "未找到" || t == "未读取" || t == "-") return t;
+            if (t.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                t.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                t.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase)) return t.ToUpperInvariant();
+            return "<节点名已隐藏>";
         }
 
         /// <summary>

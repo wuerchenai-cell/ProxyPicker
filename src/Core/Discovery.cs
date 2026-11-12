@@ -56,7 +56,9 @@ namespace ProxyPicker.Core
         }
 
         static Env _env;
-        static DateTime _at = DateTime.MinValue;
+        /// <summary>缓存时刻用单调计时（Environment.TickCount），不用系统墙上时钟：
+        /// 用户改时间 / NTP 回拨时 DateTime.UtcNow 会算出负数年龄，5 秒缓存变成无限期。</summary>
+        static int _atTick;
         static List<Candidate> _lastCandidates;
         static readonly object Gate = new object();
 
@@ -69,9 +71,10 @@ namespace ProxyPicker.Core
             DetectCalls++;
             lock (Gate)
             {
-                if (!refresh && _env != null && (DateTime.UtcNow - _at).TotalSeconds < 5) return _env;
+                if (!refresh && _env != null &&
+                    unchecked((uint)(Environment.TickCount - _atTick)) < 5000) return _env;
                 _env = DetectCore();
-                _at = DateTime.UtcNow;
+                _atTick = Environment.TickCount;
                 return _env;
             }
         }
@@ -564,6 +567,23 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
+        /// <summary>
+        /// 按配置文件路径反查它属于哪个客户端（只读缓存，不触发 Detect）。
+        /// 管道筛选需要这个提示，但一次保存里不能再多一次识别（自检 R4-3 锁着这条）。
+        /// </summary>
+        public static string ClientForConfig(string configPath)
+        {
+            if (string.IsNullOrEmpty(configPath)) return "";
+            lock (Gate)
+            {
+                if (_lastCandidates == null) return "";
+                foreach (var c in _lastCandidates)
+                    if (string.Equals(c.ConfigPath, configPath, StringComparison.OrdinalIgnoreCase))
+                        return c.Client ?? "";
+            }
+            return "";
+        }
+
         static string GuessClient(string dir)
         {
             string d = (dir ?? "").ToLowerInvariant();
@@ -597,7 +617,11 @@ namespace ProxyPicker.Core
             ReadController(cfg, out secret, out controller, out found);
         }
 
-        /// <summary>剥掉 YAML 值的行尾注释与成对引号，不管缩进（调用方负责限定顶层）。</summary>
+        /// <summary>剥掉 YAML 值的行尾注释与成对引号，不管缩进（调用方负责限定顶层）。
+        ///
+        /// v1.3.7：以前用 IndexOf(q, 1) 找结束引号，不认 YAML 转义——
+        /// `secret: "ab\"cd"` 会在被转义的引号处提前截断，读出来的密钥是错的；
+        /// 单引号的 `''` 双写同样处理错。现在按 YAML 规则解码引号内容。</summary>
         internal static string StripYamlComment(string value)
         {
             string s = (value ?? "").Trim();
@@ -605,12 +629,37 @@ namespace ProxyPicker.Core
             if (s[0] == '\'' || s[0] == '"')
             {
                 char q = s[0];
-                int end = s.IndexOf(q, 1);
-                return end > 0 ? s.Substring(1, end - 1) : s.Trim(q);
+                var sb = new StringBuilder();
+                for (int i = 1; i < s.Length; i++)
+                {
+                    char c = s[i];
+                    if (q == '"' && c == '\\' && i + 1 < s.Length)
+                    {
+                        char n = s[i + 1];
+                        switch (n)
+                        {
+                            case '"': sb.Append('"'); i++; continue;
+                            case '\\': sb.Append('\\'); i++; continue;
+                            case 'n': sb.Append('\n'); i++; continue;
+                            case 't': sb.Append('\t'); i++; continue;
+                            case 'r': sb.Append('\r'); i++; continue;
+                            default: sb.Append(n); i++; continue;   // \uXXXX 之类退化成原字符
+                        }
+                    }
+                    if (c == q)
+                    {
+                        if (q == '\'' && i + 1 < s.Length && s[i + 1] == '\'')
+                        { sb.Append('\''); i++; continue; }      // YAML 单引号里的 '' 是一个 '
+                        return sb.ToString();                     // 字符串正常结束
+                    }
+                    sb.Append(c);
+                }
+                return sb.ToString();   // 没有结束引号：整段当值用，不吞内容
             }
             if (s[0] == '#') return "";
-            int hash = s.IndexOf(" #", StringComparison.Ordinal);
-            if (hash >= 0) s = s.Substring(0, hash);
+            // 注释标记必须是「空白 + #」；`a#b` 里的 # 是值的一部分（YAML 规范）。
+            for (int i = 1; i < s.Length; i++)
+                if (s[i] == '#' && (s[i - 1] == ' ' || s[i - 1] == '\t')) { s = s.Substring(0, i); break; }
             return s.Trim();
         }
 
@@ -690,7 +739,10 @@ namespace ProxyPicker.Core
             // 没有可证明是「代理组」的名字时返回空，交给调用方失败关闭。
             // 以前返回 GLOBAL，规则会静默指向 GLOBAL（规则模式下常是 DIRECT），
             // 界面还显示「已生效」——这是实机「勾了也直连」的根因之一。
-            if (names.Count > 0) return names[0];
+            // v1.3.7：只剩一个候选组时才敢用它；多个组都没有任何特征、订阅里也没有
+            // MATCH 可循时返回空（停止保存），不再「随便挑第一个」——挑到广告拦截 /
+            // 拒绝连接的组，比存不了盘更难查。
+            if (names.Count == 1) return names[0];
             return "";
         }
 
@@ -769,7 +821,20 @@ namespace ProxyPicker.Core
                     bool isHead = s.Equals("proxy-groups:", StringComparison.Ordinal) ||
                                   (s.StartsWith("proxy-groups:", StringComparison.Ordinal) &&
                                    s.Length > 13 && (s[13] == ' ' || s[13] == '\t' || s[13] == '#'));
-                    if (isHead) { inGroups = true; groupIndent = indent; }
+                    if (isHead)
+                    {
+                        // v1.3.7：流式写法 `proxy-groups: [{name: A, ...}, {...}]` 以前完全认不出，
+                        // 整份组名为空 → 停止保存（失败关闭，但合法配置用不了）。
+                        // 这里把同一行里的流式列表也解析出来。
+                        string rest = s.Substring("proxy-groups:".Length).Trim();
+                        if (rest.StartsWith("[", StringComparison.Ordinal) && rest != "[]")
+                        {
+                            ParseFlowGroupNames(rest, list);
+                            continue;
+                        }
+                        inGroups = true;
+                        groupIndent = indent;
+                    }
                     continue;
                 }
                 if (s.StartsWith("#", StringComparison.Ordinal)) continue;
@@ -799,6 +864,66 @@ namespace ProxyPicker.Core
                     if (v.Length > 0) list.Add(v);
                 }
             }
+            return list;
+        }
+
+        /// <summary>
+        /// 解析流式列表 `[{name: "A", ...}, {name: B}]` 里的组名。
+        /// 只取 name 字段，其余字段（type / proxies / url）一律不关心。
+        /// </summary>
+        static void ParseFlowGroupNames(string value, List<string> into)
+        {
+            string s = (value ?? "").Trim();
+            if (s.StartsWith("[", StringComparison.Ordinal)) s = s.Substring(1);
+            int close = s.LastIndexOf(']');
+            if (close >= 0) s = s.Substring(0, close);
+            foreach (var item in SplitTopLevel(s, ','))
+            {
+                string body = item.Trim().Trim('{', '}', ' ').Trim();
+                if (body.Length == 0) continue;
+                int k = body.IndexOf("name:", StringComparison.Ordinal);
+                if (k < 0) continue;
+                string v = body.Substring(k + 5).Trim();
+                int cut = v.IndexOfAny(new[] { ',', '}' });
+                if (cut >= 0) v = v.Substring(0, cut);
+                v = StripYamlComment(v).Trim().Trim('\'', '"');
+                if (v.Length > 0 && !into.Contains(v)) into.Add(v);
+            }
+        }
+
+        /// <summary>按分隔符切分，但不切引号 / 方括号 / 花括号内部的内容。</summary>
+        internal static List<string> SplitTopLevel(string s, char sep)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(s)) return list;
+            var sb = new StringBuilder();
+            int depth = 0;
+            bool inS = false, inD = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (inD)
+                {
+                    sb.Append(c);
+                    if (c == '\\' && i + 1 < s.Length) { sb.Append(s[++i]); continue; }
+                    if (c == '"') inD = false;
+                    continue;
+                }
+                if (inS)
+                {
+                    sb.Append(c);
+                    if (c == '\'' && i + 1 < s.Length && s[i + 1] == '\'') { sb.Append(s[++i]); continue; }
+                    if (c == '\'') inS = false;
+                    continue;
+                }
+                if (c == '"') { inD = true; sb.Append(c); continue; }
+                if (c == '\'') { inS = true; sb.Append(c); continue; }
+                if (c == '[' || c == '{') { depth++; sb.Append(c); continue; }
+                if (c == ']' || c == '}') { depth--; sb.Append(c); continue; }
+                if (c == sep && depth <= 0) { list.Add(sb.ToString()); sb.Length = 0; continue; }
+                sb.Append(c);
+            }
+            list.Add(sb.ToString());
             return list;
         }
 
@@ -844,23 +969,44 @@ namespace ProxyPicker.Core
                 throw new InvalidOperationException("没找到规则段，请把 rules: 恢复成列表形式（rules: 或 rules: []）");
 
             // rules: [] 后面不能接 - 列表项，改写成 rules:；行内注释保留。
+            // v1.3.7：`rules: ["MATCH,DIRECT"]` 这类流式写法以前完全不处理——
+            // 原样保留 flow 头再往下追加 `-` 项，生成的 YAML 结构是坏的。
+            // 现在把流式项展开成块式列表，再走同一套插入逻辑。
             string head = lines[rulesIdx].Trim();
             string rest = head.Length > 6 ? head.Substring(6).Trim() : "";
-            if (rest.StartsWith("[]", StringComparison.Ordinal))
+            var flowRules = new List<string>();
+            bool flowRulesStyle = false;
+            if (rest.StartsWith("[", StringComparison.Ordinal))
             {
-                string comment = rest.Substring(2).Trim();
-                lines[rulesIdx] = "rules:" + (comment.Length > 0 ? " " + comment : "");
+                int close = rest.LastIndexOf(']');
+                string tail = close >= 0 ? rest.Substring(close + 1).Trim() : "";
+                string inner = close >= 0 ? rest.Substring(1, close - 1) : rest.Substring(1);
+                if (inner.Trim().Length > 0)
+                    foreach (var part in SplitTopLevel(inner, ','))
+                    {
+                        string v = part.Trim();
+                        if (v.Length > 0) flowRules.Add(v);
+                    }
+                flowRulesStyle = true;
+                lines[rulesIdx] = "rules:" + (tail.StartsWith("#", StringComparison.Ordinal) ? " " + tail : "");
             }
 
             // 2. 收集整个 rules 段：列表项、注释、空行。
             int p = rulesIdx + 1;
             var block = new List<string>();
-            while (p < lines.Length)
+            if (flowRulesStyle)
             {
-                string t = lines[p].Trim();
-                if (t.Length == 0 || t.StartsWith("#", StringComparison.Ordinal) || t.StartsWith("-", StringComparison.Ordinal))
-                { block.Add(lines[p]); p++; continue; }
-                break;
+                foreach (var v in flowRules) block.Add("- " + v);
+            }
+            else
+            {
+                while (p < lines.Length)
+                {
+                    string t = lines[p].Trim();
+                    if (t.Length == 0 || t.StartsWith("#", StringComparison.Ordinal) || t.StartsWith("-", StringComparison.Ordinal))
+                    { block.Add(lines[p]); p++; continue; }
+                    break;
+                }
             }
 
             // 3. 只删「能确认是本工具生成的」旧块（评审 R1-1 / R3-1 / R3-2 / R6-1 / R4-4）。
@@ -896,7 +1042,8 @@ namespace ProxyPicker.Core
                     string pol = ItemPolicy(items[i], policy);
                     AssertRuleToken(target, pathRule ? "目录正则" : "软件名");
                     AssertRuleToken(pol, "策略名");
-                    fresh.Add(indent + (pathRule ? "- PROCESS-PATH-REGEX," : "- PROCESS-NAME,") + target + "," + pol);
+                    string rule = (pathRule ? "PROCESS-PATH-REGEX," : "PROCESS-NAME,") + target + "," + pol;
+                    fresh.Add(indent + "- " + YamlScalar(rule));
                 }
                 if (!patchOnly) fresh.Add(indent + "- MATCH,DIRECT");
                 fresh.Add(indent + "# PP-END");
@@ -914,7 +1061,7 @@ namespace ProxyPicker.Core
                     // 独立审阅第二轮：用能剥引号 / 行尾注释的 RuleText 判定，
                     // 以前 Compact(...).StartsWith("-MATCH,") 认不出 `- 'MATCH,DIRECT' # note`，
                     // 会误判「没有兜底」而在尾部再追加一条，造成重复 MATCH。
-                    if (IsMatchDirect(line)) { hasMatch = true; break; }
+                    if (IsAnyMatch(line)) { hasMatch = true; break; }
                 if (!hasMatch) rebuilt.Add(indent + "- MATCH,DIRECT");
             }
             else if (items.Count == 0)
@@ -945,24 +1092,56 @@ namespace ProxyPicker.Core
 
         static string Compact(string line) { return (line ?? "").Replace(" ", "").Replace("\t", "").Trim(); }
 
-        /// <summary>去掉列表符号、整行引号和行尾注释，拿到规则正文；带引号的旧规则也能识别。</summary>
+        /// <summary>去掉列表符号、整行引号和行尾注释，拿到规则正文；带引号的旧规则也能识别。
+        ///
+        /// v1.3.7：以前无条件找第一个 '#'，规则值里本来就带 # 会被截断。
+        /// 现在只在「引号外、且 # 前面是空白」时才算注释；引号内容统一交给
+        /// StripYamlComment 按 YAML 规则解码。</summary>
         static string RuleText(string line)
         {
             string s = (line ?? "").Trim();
-            // 顺序很重要：先剥行尾注释，再去列表符号和引号。
-            // 以前先 Trim 引号，`'MATCH,DIRECT' # 注释` 剥完还剩一个尾引号，
-            // 导致提前 MATCH 识别不到（复审 F-06）。
-            int hash = s.IndexOf('#');
-            if (hash >= 0) s = s.Substring(0, hash);
-            s = s.Trim();
             if (s.StartsWith("-", StringComparison.Ordinal)) s = s.Substring(1).Trim();
-            s = s.Trim('\'', '"').Trim();
-            return s;
+            bool inS = false, inD = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (inD)
+                {
+                    if (c == '\\') { i++; continue; }
+                    if (c == '"') inD = false;
+                    continue;
+                }
+                if (inS)
+                {
+                    if (c == '\'' && i + 1 < s.Length && s[i + 1] == '\'') { i++; continue; }
+                    if (c == '\'') inS = false;
+                    continue;
+                }
+                if (c == '"') { inD = true; continue; }
+                if (c == '\'') { inS = true; continue; }
+                if (c == '#' && i > 0 && (s[i - 1] == ' ' || s[i - 1] == '\t'))
+                { s = s.Substring(0, i); break; }
+            }
+            s = s.Trim();
+            if (s.Length >= 2 &&
+                ((s[0] == '\'' && s[s.Length - 1] == '\'') || (s[0] == '"' && s[s.Length - 1] == '"')))
+                s = StripYamlComment(s);
+            return s.Trim();
         }
 
         static bool IsMatchDirect(string line)
         {
             return RuleText(line).Equals("MATCH,DIRECT", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>任意 MATCH 兜底（不管策略是什么）。
+        /// v1.3.7：兼容模式的安全网以前只认 MATCH,DIRECT，订阅里本来就是 `MATCH,PROXY` 时
+        /// 会在末尾再补一条永远走不到的 MATCH,DIRECT，与「只在没有 MATCH 时补」的说明不符。</summary>
+        static bool IsAnyMatch(string line)
+        {
+            string t = RuleText(line);
+            return t.StartsWith("MATCH,", StringComparison.OrdinalIgnoreCase) ||
+                   t.Equals("MATCH", StringComparison.OrdinalIgnoreCase);
         }
 
         static bool IsBlankOrComment(string line)
@@ -1131,6 +1310,26 @@ namespace ProxyPicker.Core
             if (string.IsNullOrEmpty(token) ||
                 token.IndexOfAny(new char[] { ',', '#', '\n', '\r', '\'', '"' }) >= 0)
                 throw new InvalidOperationException(what + "含逗号、#、引号或换行，无法安全写入规则：" + token);
+        }
+
+        /// <summary>
+        /// 必要时把规则整体写成 YAML 双引号标量。
+        /// v1.3.7：合法组名里可能有「冒号 + 空格」（如 "Proxy: Japan"），
+        /// 直接写成 `- PROCESS-NAME,x,Proxy: Japan` 会被 YAML 解析成映射而不是字符串，
+        /// 整份配置结构就坏了。普通名字保持原样，避免无谓地改动输出。
+        /// </summary>
+        internal static string YamlScalar(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "\"\"";
+            bool need = s.IndexOf(": ", StringComparison.Ordinal) >= 0 ||
+                        s.EndsWith(":", StringComparison.Ordinal) ||
+                        s.StartsWith(":", StringComparison.Ordinal) ||
+                        s.IndexOf('\t') >= 0 ||
+                        s[0] == ' ' || s[s.Length - 1] == ' ' ||
+                        s[0] == '[' || s[0] == '{' || s[0] == '&' || s[0] == '*' ||
+                        s[0] == '!' || s[0] == '|' || s[0] == '>' || s[0] == '@' || s[0] == '`';
+            if (!need) return s;
+            return "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         }
 
         /// <summary>是不是我们自己早期注册的那条 pp-whitelist 规则集。</summary>
@@ -1930,6 +2129,128 @@ namespace ProxyPicker.Core
                 BuildPayload(b, mixed, "🚀 节点选择", true).IndexOf("- PROCESS-PATH-REGEX," + pattern + ",🚀 节点选择", StringComparison.Ordinal) >= 0, "");
 
             sb.AppendLine();
+            // ---------------- v1.3.7 对抗审查回归 ----------------
+            // 1) 出口链路必须能证明终点；组名 / 不存在的节点 / 负载均衡组都不能当「有效代理」。
+            var pxRoot = Json.AsObject(Json.Parse(
+                "{\"proxies\":{" +
+                "\"GLOBAL\":{\"type\":\"Selector\",\"now\":\"组A\"}," +
+                "\"组A\":{\"type\":\"Selector\",\"now\":\"节点1\"}," +
+                "\"节点1\":{\"type\":\"Shadowsocks\"}," +
+                "\"断链\":{\"type\":\"Selector\",\"now\":\"不存在的节点\"}," +
+                "\"均衡\":{\"type\":\"LoadBalance\",\"proxies\":[\"节点1\"]}," +
+                "\"环A\":{\"type\":\"Selector\",\"now\":\"环B\"}," +
+                "\"环B\":{\"type\":\"Selector\",\"now\":\"环A\"}}}"));
+            var px = Json.Obj(pxRoot, "proxies");
+            string g1;
+            check("v1.3.7 出口链路追到真节点", Profile.ResolveIn(px, "组A", out g1) == "节点1", "");
+            check("v1.3.7 链路指向不存在的节点时返回空（不拿组名冒充）",
+                Profile.ResolveIn(px, "断链", out g1) == "", "");
+            check("v1.3.7 负载均衡组没有 now 时不算终点",
+                Profile.ResolveIn(px, "均衡", out g1) == "", "");
+            check("v1.3.7 循环引用返回空而不是停在环上",
+                Profile.ResolveIn(px, "环A", out g1) == "", "");
+            check("v1.3.7 策略组不存在时返回空",
+                Profile.ResolveIn(px, "没这个组", out g1) == "", "");
+            check("v1.3.7 REJECT / REJECT-DROP 与 DIRECT 一样判为不可用",
+                Profile.IsBlockedPolicy("REJECT") && Profile.IsBlockedPolicy("reject-drop") &&
+                Profile.IsBlockedPolicy("DIRECT") && !Profile.IsBlockedPolicy("节点1"), "");
+
+            // 2) 合法组名带「冒号 + 空格」时必须写成 YAML 引号标量，普通名字保持原样。
+            check("v1.3.7 冒号空格的规则整体加引号",
+                YamlScalar("PROCESS-NAME,a.exe,Proxy: Japan").StartsWith("\"", StringComparison.Ordinal), "");
+            check("v1.3.7 普通规则不加多余引号",
+                YamlScalar("PROCESS-NAME,a.exe,节点选择") == "PROCESS-NAME,a.exe,节点选择", "");
+
+            // 3) YAML 流式写法与转义引号。
+            var flowGroups = GroupNames("proxy-groups: [{name: \"组A\", type: select}, {name: 组B, type: select}]\n");
+            check("v1.3.7 流式 proxy-groups 能解析出组名",
+                flowGroups.Count == 2 && flowGroups[0] == "组A" && flowGroups[1] == "组B", "");
+            check("v1.3.7 双引号里的转义引号能正确解码",
+                StripYamlComment("\"ab\\\"cd\"") == "ab\"cd", "");
+            check("v1.3.7 单引号双写能正确解码",
+                StripYamlComment("'it''s'") == "it's", "");
+            check("v1.3.7 值里的 # 不被当成注释",
+                StripYamlComment("a#b") == "a#b", "");
+
+            string flowRulesYaml = "mode: rule\nproxies:\n- {name: n1, type: ss}\nproxy-groups:\n- {name: 组A, type: select, proxies: [n1]}\nrules: [\"MATCH,组A\"]\n";
+            var flowItems = new List<Profile.Item> { new Profile.Item("msedge.exe", "PP-FIXED") };
+            string flowOut = BuildPayload(flowRulesYaml, flowItems, "组A", false);
+            check("v1.3.7 流式 rules 会被展开成块式列表",
+                flowOut.IndexOf("rules: [", StringComparison.Ordinal) < 0 &&
+                flowOut.IndexOf("\nrules:\n", StringComparison.Ordinal) >= 0, "");
+            check("v1.3.7 展开后原 MATCH 仍在且不重复",
+                CountOccurrences(flowOut, "MATCH,组A") == 1, "");
+
+            string colonYaml = "mode: rule\nproxies:\n- {name: n1, type: ss}\nproxy-groups:\n- {name: \"Proxy: Japan\", type: select, proxies: [n1]}\nrules:\n- MATCH,Proxy: Japan\n";
+            var colonItems = new List<Profile.Item> { new Profile.Item("msedge.exe", "PP-FIXED") };
+            string colonOut = BuildPayload(colonYaml, colonItems, "Proxy: Japan", false);
+            check("v1.3.7 冒号组名生成的规则是带引号的字符串",
+                colonOut.IndexOf("- \"PROCESS-NAME,msedge.exe,Proxy: Japan\"", StringComparison.Ordinal) >= 0, "");
+
+            // 4) 策略组不能「随便挑第一个」。
+            string manyGroups = "mode: rule\nproxy-groups:\n- name: 广告拦截\n  type: select\n- name: 漏网之鱼\n  type: select\nrules:\n- MATCH,DIRECT\n";
+            bool reusedMany;
+            check("v1.3.7 多个无特征组且无 MATCH 可循时停止保存",
+                FindPolicy(manyGroups, out reusedMany) == "", "");
+            string oneGroup = "mode: rule\nproxy-groups:\n- name: 唯一组\n  type: select\nrules:\n- MATCH,DIRECT\n";
+            check("v1.3.7 只有一个候选组时可以直接用",
+                FindPolicy(oneGroup, out reusedMany) == "唯一组", "");
+
+            // 5) 看守不能把订阅自带的进程规则当成「自家兜底位置错误」。
+            var it1 = new Guard.Intent
+            {
+                Ok = true,
+                Mode = "rule",
+                FindProcess = "strict",
+                MatchCount = 1,
+                MatchIndex = 2,
+                MatchProxy = "DIRECT",
+                ProcessRules = 2,
+                LastWantedIndex = 1,
+                LastProcessIndex = 9
+            };
+            check("v1.3.7 订阅进程规则排在 MATCH 之后不误判",
+                Guard.Judge(it1, 2, false) == null, Guard.Judge(it1, 2, false) ?? "");
+            var it2 = new Guard.Intent
+            {
+                Ok = true,
+                Mode = "rule",
+                FindProcess = "strict",
+                MatchCount = 1,
+                MatchIndex = 1,
+                MatchProxy = "DIRECT",
+                ProcessRules = 2,
+                LastWantedIndex = 2,
+                LastProcessIndex = 9
+            };
+            check("v1.3.7 自家规则确实排在 MATCH 之后仍报错",
+                Guard.Judge(it2, 2, false) != null, "");
+
+            // 6) 切模式只改内存，保存成功才落盘。
+            bool before = Settings.PatchOnly;
+            Settings.SetMode(before ? Settings.ModeWhitelist : Settings.ModePatch);
+            bool flipped = Settings.PatchOnly != before;
+            Settings.CancelPendingMode();
+            check("v1.3.7 模式切换未保存时可撤销（不提前落盘）",
+                flipped && Settings.PatchOnly == before, "");
+
+            // 7) 兼容模式：订阅自己是 MATCH,某个组 时，不再补一条走不到的 MATCH,DIRECT。
+            string matchProxyYaml = "mode: rule\nproxy-groups:\n- name: 组A\n  type: select\nrules:\n- DOMAIN-SUFFIX,a.com,组A\n- MATCH,组A\n";
+            string matchProxyOut = BuildPayload(matchProxyYaml,
+                new List<Profile.Item> { new Profile.Item("msedge.exe", "PP-FIXED") }, "组A", true);
+            check("v1.3.7 兼容模式已有 MATCH,组名 时不再追加 MATCH,DIRECT",
+                CountOccurrences(matchProxyOut, "MATCH,DIRECT") == 0, "");
+
+            // 8) 辅助进程跟随主软件策略（主软件手改 DIRECT 时不能一半直连一半代理）。
+            var peers = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            peers["main.exe"] = new List<string> { "helper.exe" };
+            var pols = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            pols["main.exe"] = "DIRECT";
+            var composed = Profile.Compose(new[] { "main.exe" }, new string[0], peers, null, pols);
+            var helper = composed.Find(x => x.Exe == "helper.exe");
+            check("v1.3.7 辅助进程继承主软件的手改策略",
+                helper != null && helper.Policy == "DIRECT", helper == null ? "缺 helper" : helper.Policy);
+
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();
         }

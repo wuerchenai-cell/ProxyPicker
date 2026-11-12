@@ -62,6 +62,10 @@ namespace ProxyPicker.Core
             // 原值快照（find-process-mode / ipv6）是在哪一份客户端配置下捕获的。
             // 换客户端或换配置后旧快照就过期了，必须重新捕获，不能拿来覆盖用户的新设置。
             public string RestoreSource = "";
+            // 还原时「内核规则已清掉、但勾选名单删不掉」：说明接管意图还在，
+            // 后台看守下一轮会把它补回来。置位后看守暂停自动补回，等用户下次
+            // 主动保存（或手动删掉名单文件）再恢复。v1.3.7。
+            public bool RepairSuspended;
         }
 
         static Data _data;
@@ -82,20 +86,74 @@ namespace ProxyPicker.Core
         /// <summary>true = 只改勾选的，其余按订阅原规则走；false = 完全接管，不勾的一律直连。</summary>
         public static bool PatchOnly
         {
-            get { return !string.Equals(Current.Mode, ModeWhitelist, StringComparison.OrdinalIgnoreCase); }
+            get
+            {
+                lock (Gate)
+                {
+                    string mode = _pendingMode ?? Current.Mode;
+                    return !string.Equals(mode, ModeWhitelist, StringComparison.OrdinalIgnoreCase);
+                }
+            }
         }
+
+        /// <summary>
+        /// 界面上刚切、还没保存的模式。
+        ///
+        /// v1.3.7 之前 SetMode() 立刻写 settings.json：用户切了模式却没点保存就退出，
+        /// 下次启动已经是新模式，但内核里还是旧规则，界面和实际行为对不上。
+        /// 现在只放在内存里；保存成功后才 CommitMode() 落盘，失败/退出则丢弃。
+        /// 单独存放也保证其它地方随手 Save()（改排序、点过软件）不会把它捎带写进去。
+        /// </summary>
+        static string _pendingMode;
+
+        public static string PendingMode { get { lock (Gate) return _pendingMode; } }
 
         public static void SetMode(string mode)
         {
             lock (Gate)
             {
-                Current.Mode = string.Equals(mode, ModeWhitelist, StringComparison.OrdinalIgnoreCase)
+                _pendingMode = string.Equals(mode, ModeWhitelist, StringComparison.OrdinalIgnoreCase)
                     ? ModeWhitelist : ModePatch;
             }
-            Save();
+        }
+
+        /// <summary>保存成功后把待定模式落盘；失败返回 false，调用方要提示用户。</summary>
+        public static bool CommitMode()
+        {
+            lock (Gate)
+            {
+                if (_pendingMode == null) return true;
+                Current.Mode = _pendingMode;
+                _pendingMode = null;
+            }
+            bool ok = Save();
+            if (!ok) AuditLog.Record("MODE", "分流模式写入 settings.json 失败：" + LastSaveError);
+            return ok;
+        }
+
+        public static void CancelPendingMode()
+        {
+            lock (Gate) { _pendingMode = null; }
         }
 
         public static bool Ipv6GuardOn { get { lock (Gate) return Current.Ipv6Guard; } }
+
+        /// <summary>还原时名单删不掉 → 暂停自动补回，避免「刚还原又被接管」。</summary>
+        public static bool RepairSuspended { get { lock (Gate) return Current.RepairSuspended; } }
+
+        public static void SuspendRepair()
+        {
+            lock (Gate) { Current.RepairSuspended = true; }
+            Save();
+            AuditLog.Record("RESTORE", "勾选名单删除失败，已暂停后台自动补回，直到下次手动保存");
+        }
+
+        public static void ResumeRepair()
+        {
+            bool changed;
+            lock (Gate) { changed = Current.RepairSuspended; Current.RepairSuspended = false; }
+            if (changed) Save();
+        }
 
         /// <summary>完全接管时是否放行登录窗口（WebView2 共享运行时）。默认开，可在 settings.json 关闭。</summary>
         public static bool LoginWindowProxyOn
@@ -324,7 +382,8 @@ namespace ProxyPicker.Core
                     long checkedAt = d.UpdateCheckedAt;
                     bool firstRun = d.FirstRun, trayHint = d.TrayHintShown,
                          updateCheck = d.UpdateCheck, ipv6Guard = d.Ipv6Guard,
-                         loginWindowProxy = d.LoginWindowProxy;
+                         loginWindowProxy = d.LoginWindowProxy,
+                         repairSuspended = d.RepairSuspended;
                     var order = new List<string>(d.Order);
                     var usage = new Dictionary<string, int>(d.Usage, StringComparer.OrdinalIgnoreCase);
                     var lastUsed = new Dictionary<string, long>(d.LastUsed, StringComparer.OrdinalIgnoreCase);
@@ -348,6 +407,7 @@ namespace ProxyPicker.Core
                     sb.Append("  \"findProcessOriginal\": ").Append(Json.Quote(findProcessOriginal)).Append(",\n");
                     sb.Append("  \"restoreSource\": ").Append(Json.Quote(restoreSource)).Append(",\n");
                     sb.Append("  \"loginWindowProxy\": ").Append(loginWindowProxy ? "true" : "false").Append(",\n");
+                    sb.Append("  \"repairSuspended\": ").Append(repairSuspended ? "true" : "false").Append(",\n");
 
                     sb.Append("  \"order\": [");
                     for (int i = 0; i < order.Count; i++)
@@ -468,6 +528,7 @@ namespace ProxyPicker.Core
                 // v1.2.5 漏了这一项：字段有默认值却没写进 JSON，用户在 settings.json 里
                 // 把 loginWindowProxy 改成 false 根本不会被读到，登录窗口例外无法关闭。
                 if (root.TryGetValue("loginWindowProxy", out v) && v is bool) d.LoginWindowProxy = (bool)v;
+                if (root.TryGetValue("repairSuspended", out v) && v is bool) d.RepairSuspended = (bool)v;
 
                 Dictionary<string, object> obj;
                 if (root.TryGetValue("order", out v))

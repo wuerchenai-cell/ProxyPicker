@@ -31,7 +31,11 @@ namespace ProxyPicker.Core
             public int MatchIndex = -1;    // 第一条 MATCH 的位置（-1 = 没有）
             public int MatchCount;         // MATCH 总条数（0 = 兜底缺失）
             public string MatchProxy = ""; // 第一条 MATCH 的策略（必须是 DIRECT）
-            public int LastProcessIndex = -1; // 最后一条 PROCESS-NAME 的位置
+            public int LastProcessIndex = -1; // 最后一条 PROCESS-NAME 的位置（含订阅自带）
+            /// <summary>名单里某个软件在规则表中的最后位置。判断「兜底 MATCH 是否排在
+            /// 勾选规则前面」只能看自家的这些规则；v1.3.7 以前用 LastProcessIndex，
+            /// 订阅自带、排在 MATCH 之后的 PROCESS-NAME 会让正常配置被误判成故障。</summary>
+            public int LastWantedIndex = -1;
             public bool FirstRuleIsMatch;   // 第一条规则就是 MATCH（空名单白名单模式）
             public bool Ipv6On;            // 内核开着 IPv6 = 流量可以从物理网卡直出
             public string FindProcess = "";
@@ -73,6 +77,7 @@ namespace ProxyPicker.Core
 
             var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var presentPolicy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var presentIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < rules.Count; i++)
             {
                 var r = rules[i];
@@ -83,7 +88,7 @@ namespace ProxyPicker.Core
                 {
                     it.ProcessRules++;
                     it.LastProcessIndex = i;
-                    if (!string.IsNullOrEmpty(r.Payload)) present.Add(r.Payload);
+                    if (!string.IsNullOrEmpty(r.Payload)) { present.Add(r.Payload); presentIndex[r.Payload] = i; }
                     if (!string.IsNullOrEmpty(r.Payload) && !string.IsNullOrEmpty(r.Proxy))
                         presentPolicy[r.Payload] = r.Proxy;
                     if (!string.IsNullOrEmpty(r.Proxy)) it.Policy = r.Proxy;
@@ -114,11 +119,19 @@ namespace ProxyPicker.Core
                     if (raw.StartsWith("(?", StringComparison.Ordinal) || raw.IndexOf('\\') >= 0)
                     {
                         if (!present.Contains(raw)) it.MissingPathRules++;
+                        else
+                        {
+                            int atPath;
+                            if (presentIndex.TryGetValue(raw, out atPath) && atPath > it.LastWantedIndex)
+                                it.LastWantedIndex = atPath;
+                        }
                         continue;
                     }
                     string name = Profile.Normalize(raw);
                     if (name.Length == 0) continue;
                     if (!present.Contains(name)) { it.Missing.Add(name); continue; }
+                    int at;
+                    if (presentIndex.TryGetValue(name, out at) && at > it.LastWantedIndex) it.LastWantedIndex = at;
                     // 规则在，但策略被改成了别的（例如期望 DIRECT，实际走了代理组）。
                     string expect;
                     if (policies != null && policies.TryGetValue(name, out expect) &&
@@ -193,8 +206,12 @@ namespace ProxyPicker.Core
                 return "兜底 MATCH 的策略是 " + it.MatchProxy + "，不是 DIRECT，白名单承诺不成立";
             // 空名单：白名单模式下第一条必须是直连兜底（评审 R3-5）。
             if (wantedCount == 0 && it.MatchIndex != 0) return "空名单下缺少段首直连兜底";
-            // 短路 MATCH 必须在所有 PROCESS-NAME 之后，否则勾了也直连。
-            if (it.MatchIndex >= 0 && it.MatchIndex <= it.LastProcessIndex)
+            // 短路 MATCH 必须在所有「勾选规则」之后，否则勾了也直连。
+            // v1.3.7：只看名单里的软件，不再看「全表最后一条进程规则」——
+            // 订阅自带的 PROCESS-NAME 本来就排在 MATCH 后面，以前会把正常配置
+            // 判成「兜底排在勾选规则前面」，看守每轮重推一次直到放弃。
+            int lastMine = it.LastWantedIndex >= 0 ? it.LastWantedIndex : it.LastProcessIndex;
+            if (wantedCount > 0 && it.MatchIndex >= 0 && it.MatchIndex <= lastMine)
                 return "直连兜底排在勾选规则前面";
             return null;
         }

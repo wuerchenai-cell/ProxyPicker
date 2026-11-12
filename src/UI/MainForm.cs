@@ -71,6 +71,7 @@ namespace ProxyPicker.UI
         bool _realExit;
         bool _help;
         bool _modeChanged;   // 在帮助面板里切过分流模式，关闭时提醒去保存
+        volatile bool _shuttingDown;   // 退出还原进行中：禁止再起保存任务（v1.3.7）
         bool _compatHintShown; // 「订阅兼容下取消勾选≠直连」只提示一次，不反复弹
         bool _ipv6Changed;   // 在帮助面板里切过 IPv6 防泄漏，关闭时提醒去保存
         Updater.Info _update;      // null = 还没查过；查过之后失败也留着，用来解释为什么没提示
@@ -427,6 +428,24 @@ namespace ProxyPicker.UI
 
         public void RealExit() { _realExit = true; Close(); }
 
+        /// <summary>
+        /// 退出还原开始前调用：禁掉主窗口交互并标记全局关闭状态。
+        /// 以前退出用 DoEvents 抽消息泵，用户还能点「保存」；保存任务会等锁，
+        /// 等还原放锁后又抢在 Environment.Exit 之前推一次配置（v1.3.7 修）。
+        /// 若用户选择「继续运行」则调用 EndShutdown 恢复。
+        /// </summary>
+        public void BeginShutdown()
+        {
+            _shuttingDown = true;
+            try { Enabled = false; } catch { }
+        }
+
+        public void EndShutdown()
+        {
+            _shuttingDown = false;
+            try { Enabled = true; } catch { }
+        }
+
         /// <summary>点「×」时抛给 TrayContext：走「还原 + 退出」，不再静默收进托盘。</summary>
         public event Action CloseRequested;
 
@@ -588,6 +607,8 @@ namespace ProxyPicker.UI
 
                 // 用户刚在帮助面板切了模式但还没点保存，看守不能替他把新模式推下去（评审 R4-2）。
                 if (_modeChanged) return;
+                // 还原时名单文件删除失败：看守已经暂停，不能再按旧名单补回（v1.3.7）。
+                if (Settings.RepairSuspended) return;
 
                 // 全局模式 / 关掉进程识别时规则根本不参与匹配，自动重推没有意义，只提示。
                 if (audit.Ok && !string.IsNullOrEmpty(audit.Mode) &&
@@ -639,6 +660,7 @@ namespace ProxyPicker.UI
             {
                 if (!UiAlive || _busy) return;
                 if (_modeChanged) return;   // 模式切换还没保存，任何自动补回都不能推新模式
+                if (Settings.RepairSuspended) return;   // 上次还原时名单没删掉，别自动接管回去
                 // 推送前最后确认一次意图：托盘还原会删掉名单文件，
                 // 已启动的旧任务不能因为它重新创建接管状态。
                 if (!Profile.HasSavedIntent) return;
@@ -976,37 +998,46 @@ namespace ProxyPicker.UI
             bool ownsBusy = false;
             try
             {
-                if (!UiAlive || _busy || _help) return;
+                if (!UiAlive || _busy || _help || _shuttingDown) return;
                 if (_all.Count == 0)
                 {
                     Toast("还没有可保存的名单", "等列表读出来再试一次", Theme.Warn, 1);
                     return;
                 }
                 ownsBusy = true;
+                int saveRevision = _revision;
+                long saveEpoch = Profile.IntentEpoch;   // 等锁期间若发生还原，代次会变
+                bool modeChanged = _modeChanged;
                 BeginBusy();
                 SetStatus("正在保存并更新分流…", Theme.Dim);
                 var proxy = _all.Where(r => r.Proxy).Select(r => r.Exe).ToList();
                 var now = new HashSet<string>(proxy, StringComparer.OrdinalIgnoreCase);
                 var changed = now.Where(x => !_savedProxy.Contains(x))
                     .Concat(_savedProxy.Where(x => !now.Contains(x))).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                // 只切换了分流模式、名单没动时，受影响的软件同样要重连：
+                // 白名单→订阅兼容（或反向）会改变未勾选软件的路由语义，旧连接不会自己重匹配。
+                if (modeChanged)
+                    foreach (var exe in now) if (!changed.Contains(exe)) changed.Add(exe);
                 var visible = VisibleExes();
                 var paths = PathMap();
                 var policies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var r in _all)
                     if (r.Proxy && !string.IsNullOrEmpty(r.Policy)) policies[r.Exe] = r.Policy;
-                var pack = await Task.Run(() =>
+                var pack = await Task.Run(() => Profile.WithApplyLock(() =>
                 {
                     var p = new SavePack();
                     // 保存事务同源（独立审阅第二轮）：整条链只识别一次客户端，
                     // 旧连接快照 / payload 生成 / 推送 / 回读 / 删除旧连接共享同一份配置。
+                    // v1.3.7：整段都在跨进程锁内，托盘还原无法插到「推送完成、删除连接之前」。
                     string cfg = Paths.ClashYaml;
                     p.Snapshot = Profile.CaptureConnections(changed, cfg); // 先快照旧连接，再推新规则
-                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies), false, cfg);
+                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies), false, cfg, saveEpoch);
                     if (p.Apply.Ok && changed.Count > 0 && p.Snapshot.Error == null)
                         p.Reconnect = Profile.CloseCapturedConnections(p.Snapshot, cfg);
                     return p;
-                });
-                if (!UiAlive) return;
+                }));
+                // 等待期间发生了还原 / 退出：内核状态已经被别人改过，不能再拿这次结果覆盖界面。
+                if (!UiAlive || saveRevision != _revision) return;
 
                 // 推送成功就把内存名单对齐（外部评审 F4）：回读校验失败时内核其实已经改了，
                 // 若仍拿旧名单去对账，看守会把用户刚取消勾选的软件又补回来。
@@ -1020,7 +1051,13 @@ namespace ProxyPicker.UI
                 }
                 if (pack.Apply.Ok)
                 {
-                    _modeChanged = false;   // 模式切换直到这次保存成功才算落地
+                    // 模式切换直到这次保存成功才落盘（v1.3.7：以前一切换就写 settings.json，
+                    // 没点保存就退出，下次启动模式和内核规则对不上）。
+                    if (modeChanged && !Settings.CommitMode())
+                        Toast("模式已生效，但没能记住", "settings.json 写入失败：" + Settings.LastSaveError +
+                              "；重启后会回到原来的模式", Theme.Warn, 2);
+                    Settings.ResumeRepair();   // 用户主动保存 = 重新接受自动补回
+                    _modeChanged = false;
                     foreach (var r in _all)
                     {
                         if (r.Proxy && !r.Known) Settings.Touch(r.Exe);
@@ -1508,7 +1545,12 @@ namespace ProxyPicker.UI
                 ownsCheck = true;
                 _checkingOutbound = true;
                 int revision = _revision;
-                string now = await Task.Run(() => Core.Profile.ResolveOutbound());
+                // v1.3.7：周期刷新必须跟「本次规则实际写入的策略组」。
+                // 以前调无参重载 → 没有 policy → 退回 GLOBAL，规则模式下 GLOBAL 常是 DIRECT，
+                // 保存后十秒顶部又变回 DIRECT：v1.3.5 只修了初始读取，这里漏了。
+                string policy = _state.Policy;
+                string globalDummy = "";
+                string now = await Task.Run(() => Core.Profile.ResolveOutbound(out globalDummy, policy));
                 if (!UiAlive || _busy || revision != _revision || string.IsNullOrEmpty(now)) return;
                 string prev = _state.Outbound;
                 if (now == prev) return;
@@ -2450,20 +2492,26 @@ namespace ProxyPicker.UI
         /// 托盘「还原上次保存前的配置」成功后同步界面内存状态：
         /// 旧勾选还在内存里的话，30 秒看守会把刚还原的配置又补回去（复审 P2）。
         /// </summary>
-        public void AfterRollback()
+        public void AfterRollback() { AfterRollback(true); }
+
+        /// <summary>intentCleared=false：内核已清干净但名单文件删不掉，此时不能假装万事大吉。</summary>
+        public void AfterRollback(bool intentCleared)
         {
             if (!UiAlive) return;
             // 作废所有在途看守结果：还原那一刻可能已有一次对账跑到一半，
             // 不改 revision 的话它会按旧结论把刚还原的规则重新推回去（外部评审 P0）。
             _revision++;
-            _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            // 独立审阅第二轮：派生名单也要一起清。以前还原后 _effectiveProxy 还留着
-            // 上一次接管的「预期代理名单」，流量采样会拿旧预期去比新直连，误报分流异常。
-            _effectiveProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            _list.SavedProxy = _savedProxy;
-            foreach (var r in _all) { r.Proxy = false; r.Known = false; }
+            if (intentCleared)
+            {
+                _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                // 独立审阅第二轮：派生名单也要一起清。以前还原后 _effectiveProxy 还留着
+                // 上一次接管的「预期代理名单」，流量采样会拿旧预期去比新直连，误报分流异常。
+                _effectiveProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                _list.SavedProxy = _savedProxy;
+                foreach (var r in _all) { r.Proxy = false; r.Known = false; }
+                _modeChanged = false;
+            }
             _state.Applied = false;
-            _modeChanged = false;
             _autoRepaired = false;
             RebuildVisible(true);
             RefreshAsync();

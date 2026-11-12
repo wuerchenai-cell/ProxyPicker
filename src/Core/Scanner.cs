@@ -44,6 +44,32 @@ namespace ProxyPicker.Core
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool CloseHandle(IntPtr hObject);
 
+        const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+        /// <summary>
+        /// 取进程完整路径，缓冲区不够就扩容重试。
+        /// v1.3.7：以前固定 1024 字符，路径更长的进程会被静默跳过（列表里看不到，
+        /// 也勾不上）。QueryFullProcessImageNameW 在缓冲不足时返回 false 并回填所需长度。
+        /// </summary>
+        static bool TryImagePath(IntPtr h, out string full)
+        {
+            full = "";
+            int cap = 1024;
+            for (int attempt = 0; attempt < 6 && cap <= 65536; attempt++)
+            {
+                var sb = new StringBuilder(cap);
+                uint size = (uint)cap;
+                if (QueryFullProcessImageNameW(h, 0, sb, ref size))
+                {
+                    full = sb.ToString();
+                    return full.Length > 0;
+                }
+                if (Marshal.GetLastWin32Error() != ERROR_INSUFFICIENT_BUFFER) return false;
+                cap *= 2;
+            }
+            return false;
+        }
+
         public static Dictionary<string, ProcInfo> Scan()
         {
             var map = new Dictionary<string, ProcInfo>(StringComparer.OrdinalIgnoreCase);
@@ -61,7 +87,6 @@ namespace ProxyPicker.Core
                 pids = new uint[pids.Length * 2];
             }
             int count = (int)(needed / sizeof(uint));
-            var sb = new StringBuilder(1024);
             // 先按目录记住「这个目录里跑过哪些 exe」，第二遍才能给每个软件找出辅助进程。
             var byDir = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < count; i++)
@@ -72,9 +97,8 @@ namespace ProxyPicker.Core
                 if (h == IntPtr.Zero) continue;
                 try
                 {
-                    uint size = (uint)sb.Capacity;
-                    if (!QueryFullProcessImageNameW(h, 0, sb, ref size)) continue;
-                    string full = sb.ToString();
+                    string full;
+                    if (!TryImagePath(h, out full)) continue;
                     int slash = full.LastIndexOf('\\');
                     string exe = (slash >= 0 ? full.Substring(slash + 1) : full).ToLowerInvariant();
                     if (exe.Length == 0) continue;

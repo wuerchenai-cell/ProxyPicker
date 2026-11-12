@@ -135,8 +135,11 @@ namespace ProxyPicker.UI
                           "当前订阅和你自己添加的规则都原样保留。\n确定要还原吗？",
                     "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
                 string msg;
-                bool ok = Core.Profile.Rollback(out msg);
-                if (ok) _form.AfterRollback();   // 同步内存勾选 + 作废在途看守，别让还原被撤销
+                bool intentCleared;
+                bool ok = Core.Profile.Rollback(out msg, out intentCleared);
+                // 同步内存勾选 + 作废在途看守；名单删不掉时保留界面勾选（意图还在），
+                // 只提示用户手动处理，不假装已经彻底还原（v1.3.7）。
+                if (ok) _form.AfterRollback(intentCleared);
                 // 成功时也要显示 msg：旧版备份、名单删除失败这类警告不能吞掉。
                 MessageBox.Show(ok ? (string.IsNullOrEmpty(msg) ? "已还原为上次保存前的配置" : msg) : msg,
                     "ProxyPicker", MessageBoxButtons.OK,
@@ -286,6 +289,9 @@ namespace ProxyPicker.UI
         {
             if (_exiting) return;      // DoEvents 期间重复点退出不能起第二个还原任务
             _exiting = true;
+            // 退出还原期间禁止再开保存任务：DoEvents 会继续分发点击，
+            // 以前用户还能点「保存」，任务等锁 → 还原放锁 → 抢在 Exit 前又推一次配置。
+            try { _form.BeginShutdown(); } catch { }
             bool restored = false;
             string why = "";
             try
@@ -330,7 +336,7 @@ namespace ProxyPicker.UI
                         "点「是」＝继续运行，稍后用托盘「还原上次保存前的配置」再试一次；\n" +
                         "点「否」＝接受残留并退出（后台还原任务可能尚未结束）。",
                         "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                    if (choice == DialogResult.Yes) { _exiting = false; return; }
+                    if (choice == DialogResult.Yes) { _exiting = false; _form.EndShutdown(); return; }
                 }
                 catch { }
             }

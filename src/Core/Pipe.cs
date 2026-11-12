@@ -75,6 +75,22 @@ namespace ProxyPicker.Core
 
         public void WriteAll(byte[] data)
         {
+            // v1.3.7：WriteFile 是同步调用，服务端不读、管道缓冲满时会一直阻塞，
+            // 以前只在写之前检查剩余时间，拦不住「已经开始阻塞」的那一次写。
+            // 现在把写放到工作线程，超时就关句柄打断它（和 ReadToEnd 同一套做法），
+            // 保证保存请求不会永久占着控制通道锁。
+            var task = Task.Run(() => WriteAllCore(data));
+            int wait = (int)Math.Min(Math.Max(1, RemainingMs), int.MaxValue);
+            if (!task.Wait(wait))
+            {
+                Dispose();
+                throw new TimeoutException("控制管道写入超过总时限（" + wait + " ms）");
+            }
+            task.Wait();   // 把工作线程里的异常抛回调用方
+        }
+
+        void WriteAllCore(byte[] data)
+        {
             int offset = 0;
             while (offset < data.Length)
             {

@@ -201,6 +201,18 @@ namespace ProxyPicker.Core
         /// <summary>找到 mihomo 的控制管道（优先 production）。</summary>
         public static string FindPipe()
         {
+            return FindPipe(null);
+        }
+
+        /// <summary>
+        /// v1.3.7：管道名不再只看「有几个」，还要看「像不像本次选中的那个客户端」。
+        /// Clash Verge Rev 的管道叫 verge-mihomo-*，别的客户端不会用这个前缀；
+        /// 两个客户端同时装、同时开时，以前只要恰好有一个 production 就直接选它，
+        /// 于是可能把 B 的配置推给 A 的内核。现在先按客户端收窄候选；
+        /// 收窄后一个都不剩时保持原候选（宁可退回旧行为，也不能让单客户端用户存不了盘）。
+        /// </summary>
+        public static string FindPipe(string clientHint)
+        {
             var all = EnumNamedPipes();
             var hits = all
                 .Where(n => n.StartsWith("verge-mihomo-", StringComparison.OrdinalIgnoreCase) ||
@@ -216,6 +228,13 @@ namespace ProxyPicker.Core
             }
             _pipeAmbiguous = null;
             if (hits.Count == 0) return null;
+
+            if (!string.IsNullOrEmpty(clientHint) && hits.Count > 1)
+            {
+                var prefer = hits.Where(n => PipeMatchesClient(n, clientHint)).ToList();
+                if (prefer.Count > 0 && prefer.Count < hits.Count) hits = prefer;
+            }
+
             // 同时存在多个内核控制管道时，无法确认「配置 / Secret / 管道」属于同一个客户端实例。
             // 宁可失败关闭，也不能拿 A 的密钥推给 B（评审 R6-2 的保守落地）。
             if (hits.Count > 1)
@@ -226,6 +245,15 @@ namespace ProxyPicker.Core
                 return null;
             }
             return hits[0];
+        }
+
+        /// <summary>Verge 的管道只可能属于 Verge；反过来别的客户端不会用 verge- 前缀。</summary>
+        static bool PipeMatchesClient(string pipe, string clientHint)
+        {
+            bool vergePipe = pipe.StartsWith("verge-", StringComparison.OrdinalIgnoreCase);
+            bool vergeClient = (clientHint ?? "").IndexOf("Verge", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (vergePipe) return vergeClient;
+            return true;
         }
 
         public static string ReadSecret(string knownConfigPath = null)
@@ -353,7 +381,7 @@ namespace ProxyPicker.Core
         static ApiResult TryPipe(string method, string path, string body, int timeoutMs, Stopwatch sw,
                                  string knownConfigPath = null)
         {
-            if (_pipeName == null) _pipeName = FindPipe();
+            if (_pipeName == null) _pipeName = FindPipe(Discovery.ClientForConfig(knownConfigPath));
             if (_pipeName == null && !string.IsNullOrEmpty(_pipeAmbiguous))
                 return new ApiResult { Error = _pipeAmbiguous, Ms = sw.ElapsedMilliseconds };
             if (_pipeName == null) return null;
@@ -639,12 +667,19 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
-        /// <summary>猜端口通道的安全规则：只允许无 body 的读，且绝不发送所选配置的密钥。
-        /// 抽成纯函数供自检直接验证，不依赖真实内核（独立审阅第二轮 P1）。</summary>
+        /// <summary>猜端口通道的安全规则：只允许 GET / HEAD 这类无副作用读，且绝不发送所选配置的密钥。
+        /// 抽成纯函数供自检直接验证，不依赖真实内核（独立审阅第二轮 P1）。
+        ///
+        /// v1.3.7：以前只判断 body == null，于是 `DELETE /connections/{id}`（无请求体）
+        /// 被当成「读操作」放行，与「猜出来的端口绝不写操作」的承诺矛盾。
+        /// 现在按 HTTP 方法白名单判定：写方法即使没有 body 也一律拒绝。</summary>
         internal static bool GuessedEndpointSafe(string method, string body, out bool sendSecret)
         {
             sendSecret = false;                 // 没验明身份，不发 Bearer Secret
-            return body == null;                // 只允许读，不执行任何写操作
+            if (body != null) return false;      // 带体的一律拒绝（GET 也不该带体）
+            string m = (method ?? "").Trim();
+            return m.Equals("GET", StringComparison.OrdinalIgnoreCase) ||
+                   m.Equals("HEAD", StringComparison.OrdinalIgnoreCase);
         }
 
         static ApiResult TryHttp(string method, string path, string body, int timeoutMs, Stopwatch sw,
@@ -669,7 +704,26 @@ namespace ProxyPicker.Core
                     Error = "控制端口是探测猜测出来的，无法确认它属于本次选中的配置；已拒绝写操作",
                     Ms = sw.ElapsedMilliseconds
                 };
-            if (!guessed) { sendSecret = true; if (_secret == null) _secret = ReadSecret(knownConfigPath); }
+            if (!guessed)
+            {
+                // v1.3.7：地址虽然来自配置文件，但「有人在 127.0.0.1:9090 回一段像 mihomo 的
+                // /version」并不能证明它就是加载这份配置的内核。以前会直接把 Bearer Secret
+                // 和整份配置送过去（本地恶意进程可借此拿到控制密钥）。
+                // 现在先按端口反查监听进程：确认是 mihomo / Clash / Verge 内核才继续；
+                // 明确是别的进程就硬阻止，查不到（API 不可用）则放行并留审计，避免误伤。
+                string why;
+                var verdict = ListenerVerdict(ep, out why);
+                if (verdict == ListenerKind.Other)
+                {
+                    _securityError = "控制端口 " + ep + " 的监听进程不是 mihomo / Clash：" + why +
+                                     "；已阻止发送控制密钥";
+                    return new ApiResult { Error = _securityError, Ms = sw.ElapsedMilliseconds };
+                }
+                if (verdict == ListenerKind.Kernel)
+                    AuditLog.Record("CTRL", "控制端口监听进程已核对：" + why);
+            }
+            sendSecret = true;
+            if (_secret == null) _secret = ReadSecret(knownConfigPath);
 
             var r = new ApiResult();
             try
@@ -693,10 +747,9 @@ namespace ProxyPicker.Core
                 }
 
                 using (var resp = (HttpWebResponse)req.GetResponse())
-                using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
                 {
                     r.Status = (int)resp.StatusCode;
-                    r.Body = sr.ReadToEnd();
+                    r.Body = ReadBodyLimited(resp.GetResponseStream(), MaxHttpResponseBytes, timeoutMs, sw);
                 }
             }
             catch (WebException we)
@@ -707,8 +760,7 @@ namespace ProxyPicker.Core
                     r.Status = (int)resp.StatusCode;
                     try
                     {
-                        using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                            r.Body = sr.ReadToEnd();
+                        r.Body = ReadBodyLimited(resp.GetResponseStream(), MaxHttpResponseBytes, timeoutMs, sw);
                     }
                     catch { }
                     resp.Close();
@@ -836,23 +888,37 @@ namespace ProxyPicker.Core
         /// 导致只开 HTTP 控制口且设了 Secret 的客户端完全连不上（外部评审 F6）。
         /// allowSecret=true 时（地址来自同一份客户端配置）才允许带密钥重试。
         /// 评审 R4：knownConfigPath 传入时，重试密钥按该配置读取（与 push 的绑定/推送Secret 同源）。
+        ///
+        /// v1.3.7：返回「明确结果」而不是 bool。以前 ProbeVersion 把所有异常都变成 false，
+        /// 于是超时 / 404 / 500 / 假响应都会被当成「需要认证」，接着就把 Bearer Secret
+        /// 发给一个还没验明身份的服务。现在只有真正的 401/403 才允许带密钥重试。
         /// </summary>
         static bool ProbeMihomo(string ep, bool allowSecret, string knownConfigPath = null,
                                 string sameFileSecret = null)
         {
             // 第一次绝不带 Authorization 头：没设 Secret 的实例不需要多余的信息披露。
-            if (ProbeVersion(ep, null)) return true;
-            if (!allowSecret) return false;
+            var first = ProbeVersion(ep, null);
+            if (first == ProbeResult.Ok) return true;
+            if (!allowSecret || first != ProbeResult.Unauthorized) return false;
             // 收尾批 P3-1：Endpoint 已读过同一份配置时直接复用，不再二次读文件。
             string secret = sameFileSecret ?? ReadSecret(knownConfigPath);
             if (string.IsNullOrEmpty(secret)) return false;
             // 401 只说明「需要认证」，不能据此认定服务可信：地址已被 TryLoopbackEndpoint
             // 限定为本机回环，且带密钥重试后仍必须通过 LooksLikeMihomoVersion 校验响应体。
-            return ProbeVersion(ep, secret);
+            return ProbeVersion(ep, secret) == ProbeResult.Ok;
         }
 
-        static bool ProbeVersion(string ep, string secret)
+        internal enum ProbeResult
         {
+            Error = 0,        // 连不上 / 超时 / 异常
+            Unauthorized = 1, // 明确的 401/403：需要认证
+            NotMihomo = 2,    // 有响应，但不像 mihomo（404/500/普通 HTTP 服务）
+            Ok = 3
+        }
+
+        static ProbeResult ProbeVersion(string ep, string secret)
+        {
+            var sw = Stopwatch.StartNew();
             try
             {
                 var req = (HttpWebRequest)WebRequest.Create("http://" + ep + "/version");
@@ -866,14 +932,48 @@ namespace ProxyPicker.Core
                     req.Headers["Authorization"] = "Bearer " + secret;
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 {
-                    if (resp.StatusCode != HttpStatusCode.OK) return false;
-                    string body;
-                    using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-                        body = sr.ReadToEnd();
-                    return LooksLikeMihomoVersion(body);
+                    if (resp.StatusCode != HttpStatusCode.OK) return ProbeResult.NotMihomo;
+                    string body = ReadBodyLimited(resp.GetResponseStream(), 64 * 1024, 900, sw);
+                    return LooksLikeMihomoVersion(body) ? ProbeResult.Ok : ProbeResult.NotMihomo;
                 }
             }
-            catch { return false; }
+            catch (WebException we)
+            {
+                var resp = we.Response as HttpWebResponse;
+                if (resp != null)
+                {
+                    int st = (int)resp.StatusCode;
+                    resp.Close();
+                    if (st == 401 || st == 403) return ProbeResult.Unauthorized;
+                    return ProbeResult.NotMihomo;
+                }
+                return ProbeResult.Error;
+            }
+            catch { return ProbeResult.Error; }
+        }
+
+        const int MaxHttpResponseBytes = 16 * 1024 * 1024;
+
+        /// <summary>
+        /// 有上限、有总时限的响应读取。以前 HTTP 两处都用 StreamReader.ReadToEnd()，
+        /// 本地控制口返回超大 / 持续增长的响应就会一直吃内存（管道那边本来有 16 MiB 上限）。
+        /// </summary>
+        internal static string ReadBodyLimited(Stream stream, int maxBytes, int deadlineMs, Stopwatch clock)
+        {
+            if (stream == null) return "";
+            var ms = new MemoryStream();
+            var buf = new byte[16 * 1024];
+            while (true)
+            {
+                if (clock != null && clock.ElapsedMilliseconds > Math.Max(1000, deadlineMs))
+                    throw new TimeoutException("读取控制接口响应超过时限（" + deadlineMs + " ms）");
+                int n = stream.Read(buf, 0, buf.Length);
+                if (n <= 0) break;
+                if (ms.Length + n > maxBytes)
+                    throw new IOException("控制接口响应超过 " + (maxBytes / (1024 * 1024)) + " MiB，已中断");
+                ms.Write(buf, 0, n);
+            }
+            return Encoding.UTF8.GetString(ms.ToArray());
         }
 
         static bool LooksLikeMihomoVersion(string body)
@@ -887,6 +987,134 @@ namespace ProxyPicker.Core
                 return root.TryGetValue("meta", out meta) && meta is bool && (bool)meta;
             }
             catch { return false; }
+        }
+
+        // ---------------------------------------------------------------- 监听进程核对
+        //
+        // 「配置里写着 127.0.0.1:9090」不等于「9090 上跑的就是那个内核」。
+        // 本地任意进程都能抢占这个端口并回一段 {"meta":true,...}。所以在发送控制密钥 /
+        // 推送配置之前，先按端口反查监听者 PID，再按进程快照核对它是不是 mihomo / Clash / Verge。
+        // 判定分三档：明确是内核 → 放行；明确是别的进程 → 拒绝；查不到 → 放行但留痕
+        // （查不到通常是系统表不可用，不能因此让所有只开 HTTP 的用户都存不了盘）。
+
+        internal enum ListenerKind { Unknown = 0, Kernel = 1, Other = 2 }
+
+        const int AF_INET = 2;
+        const int AF_INET6 = 23;
+        const int TCP_TABLE_OWNER_PID_LISTENER = 3;
+        const uint ERROR_INSUFFICIENT_BUFFER = 122;
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder,
+            int ulAf, int tableClass, uint reserved);
+
+        static readonly object ListenerGate = new object();
+        static string _listenerEp;
+        static ListenerKind _listenerVerdict;
+        static string _listenerDetail;
+        static long _listenerAtTick;
+
+        internal static ListenerKind ListenerVerdict(string ep, out string detail)
+        {
+            detail = "";
+            // 同一个地址 10 秒内不重复查表：保存一次会连发好几个请求。
+            lock (ListenerGate)
+            {
+                if (string.Equals(_listenerEp, ep, StringComparison.OrdinalIgnoreCase) &&
+                    unchecked((uint)(Environment.TickCount - (int)_listenerAtTick)) < 10000)
+                {
+                    detail = _listenerDetail;
+                    return _listenerVerdict;
+                }
+            }
+
+            var verdict = ListenerKind.Unknown;
+            string why = "控制接口地址格式无法解析";
+            try
+            {
+                string host; int port;
+                if (SplitHostPort(ep, out host, out port) && port > 0)
+                {
+                    int pid;
+                    if (TryFindListenerPid(port, out pid))
+                    {
+                        var chain = ProcessChain((uint)pid);
+                        string name = chain.Count > 0 ? chain[0].Name : "PID " + pid;
+                        if (chain.Count > 0 && chain.Take(2).Any(e => IsKernelExecutable(e.Name)))
+                        {
+                            verdict = ListenerKind.Kernel;
+                            why = "PID " + pid + " · " + name;
+                        }
+                        else
+                        {
+                            verdict = ListenerKind.Other;
+                            why = "PID " + pid + " · " + name;
+                        }
+                    }
+                    else why = "端口 " + port + " 的监听进程查不到";
+                }
+            }
+            catch (Exception ex) { why = "监听进程核对失败：" + ex.Message; }
+
+            lock (ListenerGate)
+            {
+                _listenerEp = ep; _listenerVerdict = verdict;
+                _listenerDetail = why; _listenerAtTick = Environment.TickCount;
+            }
+            detail = why;
+            return verdict;
+        }
+
+        /// <summary>把 "127.0.0.1:9090" / "[::1]:9090" 拆成 host + port；只给监听核对用。</summary>
+        static bool SplitHostPort(string ep, out string host, out int port)
+        {
+            host = ""; port = 0;
+            if (string.IsNullOrEmpty(ep)) return false;
+            int at = ep.LastIndexOf(':');
+            if (at <= 0 || at == ep.Length - 1) return false;
+            host = ep.Substring(0, at).Trim('[', ']');
+            return int.TryParse(ep.Substring(at + 1), out port) && port > 0 && port <= 65535;
+        }
+
+        /// <summary>按本地监听端口查所属进程；查不到返回 false（不代表安全，只代表未知）。</summary>
+        static bool TryFindListenerPid(int port, out int pid)
+        {
+            pid = 0;
+            if (TryFindListenerPidAf(port, AF_INET, out pid)) return true;
+            return TryFindListenerPidAf(port, AF_INET6, out pid);
+        }
+
+        static bool TryFindListenerPidAf(int port, int af, out int pid)
+        {
+            pid = 0;
+            int size = 0;
+            uint rc = GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            if (rc != ERROR_INSUFFICIENT_BUFFER || size <= 0) return false;
+
+            IntPtr buf = Marshal.AllocHGlobal(size);
+            try
+            {
+                rc = GetExtendedTcpTable(buf, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
+                if (rc != 0) return false;
+                int count = Marshal.ReadInt32(buf);
+                int rowSize = af == AF_INET ? 24 : 56;
+                int portOff = af == AF_INET ? 8 : 20;
+                int pidOff = af == AF_INET ? 20 : 52;
+                IntPtr row = IntPtr.Add(buf, 4);
+                for (int i = 0; i < count; i++)
+                {
+                    int rawPort = Marshal.ReadInt32(row, portOff);
+                    int p = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
+                    if (p == port)
+                    {
+                        pid = Marshal.ReadInt32(row, pidOff);
+                        if (pid > 0) return true;
+                    }
+                    row = IntPtr.Add(row, rowSize);
+                }
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+            return false;
         }
 
         /// <summary>
@@ -1111,6 +1339,35 @@ namespace ProxyPicker.Core
             check("R4-5 猜出的端口拒绝写操作", !safeWrite && safeRead, "");
             check("R4-6 猜出的端口读写都不发送所选配置的密钥",
                 noSecretOnWrite && !sendSecret, "");
+            // v1.3.7 回归：DELETE 没有请求体，以前会被「body == null」放行，
+            // 等于允许对猜出来的端口关闭连接；现在按方法白名单拒绝。
+            bool del = GuessedEndpointSafe("DELETE", null, out sendSecret);
+            bool noSecretOnDelete = !sendSecret;
+            bool post = GuessedEndpointSafe("POST", null, out sendSecret);
+            bool putNoBody = GuessedEndpointSafe("PUT", null, out sendSecret);
+            bool head = GuessedEndpointSafe("HEAD", null, out sendSecret);
+            check("v1.3.7 猜出的端口拒绝 DELETE（即使没有请求体）", !del, "");
+            check("v1.3.7 猜出的端口拒绝 POST / PUT（无请求体也算写）", !post && !putNoBody, "");
+            check("v1.3.7 猜出的端口仍允许 HEAD 读", head, "");
+            check("v1.3.7 猜出的端口任何写方法都不发密钥", noSecretOnDelete && !sendSecret, "");
+
+            // 监听进程核对：在本进程开一个临时端口，反查结果必须是「不是内核」——
+            // 这条同时验证 TCP 表解析的字段偏移没写错（错了会永远返回 Unknown）。
+            try
+            {
+                var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+                listener.Start();
+                int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+                string detail;
+                var verdict = ListenerVerdict("127.0.0.1:" + port, out detail);
+                check("v1.3.7 能按端口反查监听进程（并拒绝非内核进程）",
+                    verdict == ListenerKind.Other, verdict + " · " + detail);
+                listener.Stop();
+            }
+            catch (Exception ex)
+            {
+                check("v1.3.7 能按端口反查监听进程（并拒绝非内核进程）", false, ex.Message);
+            }
 
             sb.AppendLine();
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
