@@ -120,15 +120,26 @@ namespace ProxyPicker.Core
         /// <summary>保存成功后把待定模式落盘；失败返回 false，调用方要提示用户。</summary>
         public static bool CommitMode()
         {
+            string old = null;
             lock (Gate)
             {
                 if (_pendingMode == null) return true;
+                old = Current.Mode;
                 Current.Mode = _pendingMode;
-                _pendingMode = null;
             }
             bool ok = Save();
-            if (!ok) AuditLog.Record("MODE", "分流模式写入 settings.json 失败：" + LastSaveError);
-            return ok;
+            if (ok)
+            {
+                lock (Gate) { _pendingMode = null; }
+                return true;
+            }
+            // v1.3.8：写盘失败必须把内存模式退回旧值，并**保留**待提交草稿。
+            // 以前是先改内存、清草稿、再尝试写盘：失败后内存是新的、磁盘是旧的，
+            // 而草稿已经丢了——下一次无关的 Save()（改排序、点开某软件）会把这次
+            // 没写成功的模式悄悄落盘，用户看到的「重启后回到原模式」变成假承诺。
+            lock (Gate) { Current.Mode = old; }
+            AuditLog.Record("MODE", "分流模式写入 settings.json 失败：" + LastSaveError);
+            return false;
         }
 
         public static void CancelPendingMode()
@@ -138,20 +149,71 @@ namespace ProxyPicker.Core
 
         public static bool Ipv6GuardOn { get { lock (Gate) return Current.Ipv6Guard; } }
 
-        /// <summary>还原时名单删不掉 → 暂停自动补回，避免「刚还原又被接管」。</summary>
-        public static bool RepairSuspended { get { lock (Gate) return Current.RepairSuspended; } }
+        /// <summary>还原时名单删不掉 → 暂停自动补回，避免「刚还原又被接管」。
+        /// v1.3.8：settings.json 写不进去时改用独立标记文件，否则重启后残留名单会让看守重新接管。</summary>
+        public static bool RepairSuspended
+        {
+            get
+            {
+                lock (Gate) { if (Current.RepairSuspended) return true; }
+                try { string m = RepairMarkerPath; return m.Length > 0 && File.Exists(m); }
+                catch { return false; }
+            }
+        }
 
-        public static void SuspendRepair()
+        static string RepairMarkerPath
+        {
+            get
+            {
+                try
+                {
+                    string dir = Path.GetDirectoryName(Paths.ListPath);
+                    return string.IsNullOrEmpty(dir) ? "" : Path.Combine(dir, "pp-repair.suspended");
+                }
+                catch { return ""; }
+            }
+        }
+
+        static bool WriteRepairMarker()
+        {
+            try
+            {
+                string p = RepairMarkerPath;
+                if (p.Length == 0) return false;
+                File.WriteAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\n",
+                                  new UTF8Encoding(false));
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static void ClearRepairMarker()
+        {
+            try
+            {
+                string p = RepairMarkerPath;
+                if (p.Length > 0 && File.Exists(p)) File.Delete(p);
+            }
+            catch { }
+        }
+
+        /// <summary>返回「暂停状态是否真的持久化住了」。false 时调用方不能宣称还原已安全撤销。</summary>
+        public static bool SuspendRepair()
         {
             lock (Gate) { Current.RepairSuspended = true; }
-            Save();
-            AuditLog.Record("RESTORE", "勾选名单删除失败，已暂停后台自动补回，直到下次手动保存");
+            bool saved = Save();
+            bool marked = saved || WriteRepairMarker();
+            AuditLog.Record("RESTORE", "勾选名单删除失败，已暂停后台自动补回，直到下次手动保存"
+                + (saved ? "" : (marked ? "（settings.json 写入失败，已改用标记文件）"
+                                        : "（暂停状态未能持久化，重启后可能重新接管）")));
+            return saved || marked;
         }
 
         public static void ResumeRepair()
         {
             bool changed;
             lock (Gate) { changed = Current.RepairSuspended; Current.RepairSuspended = false; }
+            ClearRepairMarker();
             if (changed) Save();
         }
 

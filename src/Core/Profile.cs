@@ -53,6 +53,30 @@ namespace ProxyPicker.Core
 
         static void BumpIntentEpoch() { System.Threading.Interlocked.Increment(ref _intentEpoch); }
 
+        /// <summary>
+        /// 接管意图的**磁盘**指纹（跨进程共享）。_intentEpoch 只是本进程的静态计数：
+        /// 另一个 ProxyPicker 进程执行 --restore 后它不会变，于是「GUI 等锁期间被命令行还原」
+        /// 这种情况代次校验完全发现不了（v1.3.7 的跨进程锁只挡住了同时写，没挡住意图变化）。
+        /// 名单文件是接管意图的唯一载体（还原＝删它），所以用存在性 + 内容哈希当签名。
+        /// </summary>
+        internal static string IntentSignature()
+        {
+            try
+            {
+                string p = Paths.ListPath;
+                if (string.IsNullOrEmpty(p) || !File.Exists(p)) return "absent";
+                return "sha256:" + Sha256Hex(File.ReadAllBytes(p));
+            }
+            catch { return "unreadable"; }
+        }
+
+        /// <summary>等锁前后比对：签名不一致说明期间有人还原或改写了名单。</summary>
+        internal static bool IntentChangedSince(string signature)
+        {
+            if (signature == null) return false;
+            return !string.Equals(IntentSignature(), signature, StringComparison.Ordinal);
+        }
+
         public static bool HasSavedIntent
         {
             get { try { return File.Exists(Paths.ListPath); } catch { return false; } }
@@ -110,23 +134,56 @@ namespace ProxyPicker.Core
             }
         }
 
-        /// <summary>先写临时文件再原子替换：断电 / 强杀时不会留下半个备份或半个 .meta。</summary>
+        /// <summary>先写临时文件再原子替换：断电 / 强杀时不会留下半个备份或半个 .meta。
+        /// v1.3.8：降级路径不再「先删旧文件再改名」——那会在两步之间留下「目标文件不存在」的
+        /// 窗口，此刻掉电就真的丢了备份。改成先把旧文件改名保留成 .prev，再把新文件就位；
+        /// 新文件没成功就位时把旧文件放回去，宁可不更新也不丢内容。</summary>
         internal static void WriteTextAtomic(string path, string text)
         {
             var utf8 = new UTF8Encoding(false);
             string tmp = path + ".tmp";
             File.WriteAllText(tmp, text ?? "", utf8);
+            PromoteTemp(tmp, path);
+        }
+
+        /// <summary>
+        /// 把已经完整写好的临时文件换成正式文件。
+        /// 优先 File.Replace（NTFS 上的原子替换）；文件系统不支持或目标被短暂占用时，
+        /// 改用「旧文件改名保留成 .prev → 新文件就位 → 删除 .prev」。
+        /// v1.3.8 之前这里写的是「删旧文件 → 改名」，两步之间目标文件不存在，
+        /// 此刻断电 / 强杀就真的丢了备份。现在任何一步失败都能把旧文件放回去。
+        /// </summary>
+        static void PromoteTemp(string tmp, string path)
+        {
             try
             {
                 if (File.Exists(path)) File.Replace(tmp, path, null);
                 else File.Move(tmp, path);
+                return;
             }
             catch (Exception)
             {
-                // 某些文件系统不支持 Replace：退化为「删旧 + 改名」，仍是先完整写好再切换。
-                try { if (File.Exists(path)) File.Delete(path); } catch { }
+                // 落到下面的保守路径
+            }
+
+            string prev = path + ".prev";
+            bool movedAside = false;
+            try
+            {
+                try { if (File.Exists(prev)) File.Delete(prev); } catch { }
+                if (File.Exists(path)) { File.Move(path, prev); movedAside = true; }
                 File.Move(tmp, path);
             }
+            catch (Exception ex)
+            {
+                if (movedAside)
+                {
+                    try { if (!File.Exists(path)) File.Move(prev, path); } catch { }
+                }
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                throw new IOException("写入 " + Path.GetFileName(path) + " 失败：" + ex.Message, ex);
+            }
+            try { if (File.Exists(prev)) File.Delete(prev); } catch { }
         }
 
         /// <summary>新版 .meta 两行：来源路径 + 备份时配置内容指纹。旧版只有一行路径。
@@ -247,6 +304,9 @@ namespace ProxyPicker.Core
             /// 对齐到「本次新名单」，否则看守会拿一份磁盘上并不存在的名单去对账；保持旧内存名单
             /// 反而能让下一轮看守把内核自愈回磁盘那份，状态重新一致。</summary>
             public bool PersistFailed;
+            /// <summary>v1.3.8：名单没落盘、且「把内核退回磁盘那份名单」的补偿推送也失败了。
+            /// 此时内核与磁盘确实不一致，界面必须明说，不能只说一句「后台看守会恢复」。</summary>
+            public bool RecoveryRequired;
             public string Message;
             public int RuleCount;
             public long Ms;
@@ -519,6 +579,33 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
+        /// 名单落盘失败后的补偿：按**磁盘上现存的**名单重新生成 payload 推回内核，
+        /// 让「内核规则」和「磁盘名单」重新对齐，而不是等看守下一轮（最多 30 秒，
+        /// 而且看守被暂停 / 程序正在退出时压根不会来）。
+        /// 只在失败路径调用，正常保存不经过这里。
+        /// </summary>
+        static bool RestoreKernelToDisk(string cfg, out string why)
+        {
+            why = "";
+            try
+            {
+                var disk = Load();
+                string text = BuildPayload(cfg, disk);
+                var r = Mihomo.PushConfig(text, 15000, cfg);
+                if (r == null || !r.Ok)
+                {
+                    why = r == null ? "推送无响应"
+                        : (r.Error ?? ("HTTP " + r.Status + " " + Trim(r.Body, 120)));
+                    return false;
+                }
+                Traffic.NotePush();
+                AuditLog.Record("SAVE", "勾选名单落盘失败，已按磁盘名单补偿推送内核");
+                return true;
+            }
+            catch (Exception ex) { why = ex.Message; return false; }
+        }
+
+        /// <summary>
         /// 把勾选结果整理成名单。
         ///
         /// 只写「要代理」的项：未出现在名单里的软件由 rules 段首的 MATCH,DIRECT 兜底。
@@ -727,7 +814,8 @@ namespace ProxyPicker.Core
         /// autoRecover=true 时在锁内推送前再核一次接管意图，消除修复与托盘还原的竞态（评审 P1-②）；
         /// 订阅兼容模式同样核对名单文件——它是接管意图的唯一载体（评审 R1）。</summary>
         public static ApplyOutcome Apply(List<Item> items, bool autoRecover = false,
-                                         string knownConfigPath = null, long expectedEpoch = -1)
+                                         string knownConfigPath = null, long expectedEpoch = -1,
+                                         string expectedIntentSig = null)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using (var gate = CreateApplyMutex())
@@ -741,7 +829,7 @@ namespace ProxyPicker.Core
                     busy.Ms = sw.ElapsedMilliseconds;
                     return busy;
                 }
-                try { return ApplyCore(items, sw, autoRecover, knownConfigPath, expectedEpoch); }
+                try { return ApplyCore(items, sw, autoRecover, knownConfigPath, expectedEpoch, expectedIntentSig); }
                 finally { try { gate.ReleaseMutex(); } catch { } }
             }
         }
@@ -777,7 +865,8 @@ namespace ProxyPicker.Core
         /// 引用，同时由 MainForm.RepairAsync 按同一常量识别「撤销」语义；
         /// Discovery.SelfTest G2d 也锁同一口径，三处不会漂移。</summary>
         static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw, bool autoRecover,
-                                      string knownConfigPath = null, long expectedEpoch = -1)
+                                      string knownConfigPath = null, long expectedEpoch = -1,
+                                      string expectedIntentSig = null)
         {
             var result = new ApplyOutcome();
 
@@ -790,6 +879,16 @@ namespace ProxyPicker.Core
             // 界面保存也要核对「这次保存开始时拿到的意图代次」：保存等锁期间用户点了托盘还原，
             // 锁释放后旧保存任务不能又把配置推回去（v1.3.7）。
             if (expectedEpoch >= 0 && IntentEpoch != expectedEpoch)
+            {
+                result.Ok = false;
+                result.Message = RevokedIntentMessage;
+                result.Ms = sw.ElapsedMilliseconds;
+                return result;
+            }
+            // v1.3.8：跨进程还原。等锁期间另一个 ProxyPicker 进程删掉了名单文件，
+            // 本进程的 _intentEpoch 不会变（它是进程内静态字段），只有磁盘签名会变。
+            // 只用代次判断等于「跨进程锁挡住了同时写，却没挡住意图被撤销」。
+            if (IntentChangedSince(expectedIntentSig))
             {
                 result.Ok = false;
                 result.Message = RevokedIntentMessage;
@@ -946,13 +1045,21 @@ namespace ProxyPicker.Core
             // 否则浏览器里挂着不关的 WebSocket 会一直报「勾了却走直连」的假警报。
             Traffic.NotePush();
             // 两阶段提交第二阶段：内核已确认接收新规则，这里只做一次原子替换。
-            // 换了失败按 PersistFailed 如实上报（界面不回写内存名单，看守下一轮按磁盘旧名单补回）。
             if (!SaveCommit(pendingList, persist))
             {
+                // v1.3.8：名单没落盘、内核却已是新规则。以前只把结果标成「失败」并声称
+                // 「后台看守会按原名单恢复」——那要等最多 30 秒，而且看守被暂停时不成立。
+                // 现在立刻按磁盘上的旧名单做一次补偿推送，把内核退回去；退不回去就如实标记。
+                string backWhy;
+                bool rolledBack = RestoreKernelToDisk(cfg, out backWhy);
                 result.Ok = false;
-                result.PersistFailed = true;   // 收尾批 P3-2：界面不要据此对齐内存名单
+                result.PersistFailed = true;
+                result.RecoveryRequired = !rolledBack;
                 result.Message = "规则已推送，但勾选名单写入失败：" + LastSaveError +
-                    "；本次改动没有落盘，后台看守会按原名单恢复，请检查文件权限后重新保存";
+                    (rolledBack
+                        ? "；已按磁盘原名单把内核退回，请检查文件权限后重新保存"
+                        : "；且把内核退回原名单也失败了（" + backWhy +
+                          "）。内核现在是新规则、与磁盘名单不一致，请立即重新保存或点还原");
                 result.Ms = sw.ElapsedMilliseconds;
                 return result;
             }
@@ -1027,9 +1134,15 @@ namespace ProxyPicker.Core
                 {
                     string mode = Json.Str(conf, "mode");
                     string fpm = Json.Str(conf, "find-process-mode");
-                    if (!string.IsNullOrEmpty(mode) && !mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
+                    // v1.3.8：以前只在「字段非空且不等于 rule」时才判失败，于是返回一个
+                    // 非空 JSON、但连 mode 都没有时（不是 mihomo，或是残废的兼容实现）
+                    // 会被当成「已确认」。mode 是所有版本都有的字段，缺失＝证明不了规则生效。
+                    if (string.IsNullOrEmpty(mode))
+                    { good = false; whyBad = "内核 /configs 里没有 mode 字段，无法确认当前是不是规则模式"; }
+                    else if (!mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
                     { good = false; whyBad = "客户端当前是 " + mode + " 模式，规则不生效，请切到规则模式"; }
                     // strict 是 mihomo 默认档，PROCESS-NAME 规则正常生效；只有 off 才是真的关闭（F1）。
+                    // find-process-mode 在老内核里可能没有，缺省不据此判失败，但存在且为 off 必须拦。
                     else if (!string.IsNullOrEmpty(fpm) && fpm.Equals("off", StringComparison.OrdinalIgnoreCase))
                     { good = false; whyBad = "进程识别已关闭（find-process-mode=off）"; }
                 }
@@ -1042,7 +1155,17 @@ namespace ProxyPicker.Core
             if (good && items.Count > 0)
             {
                 var checks = new List<string>();
-                if (!string.IsNullOrEmpty(result.Policy)) checks.Add(result.Policy);
+                // v1.3.8：只有真有条目用「默认策略」时才核对自动选出的那个组。
+                // 以前无条件先把它塞进来：所有软件都手工指定了策略、而自动识别出的默认组
+                // 恰好是 DIRECT 时，保存会因为一个**没有任何规则在用**的组而失败。
+                bool usesDefault = false;
+                foreach (var it in items)
+                {
+                    string ip = (it.Policy ?? "").Trim();
+                    if (ip.Length == 0 || ip.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase))
+                        usesDefault = true;
+                }
+                if (usesDefault && !string.IsNullOrEmpty(result.Policy)) checks.Add(result.Policy);
                 foreach (var it in items)
                 {
                     string p = (it.Policy ?? "").Trim();
@@ -1162,16 +1285,8 @@ namespace ProxyPicker.Core
                 File.WriteAllText(staged, scrubbed, utf8);
                 if (File.Exists(prev2)) { File.Copy(prev2, prev3, true); CopyBackupMeta(prev2, prev3); }
                 if (File.Exists(recent)) { File.Copy(recent, prev2, true); CopyBackupMeta(recent, prev2); }
-                try
-                {
-                    if (File.Exists(recent)) File.Replace(staged, recent, null);
-                    else File.Move(staged, recent);
-                }
-                catch (Exception)
-                {
-                    try { if (File.Exists(recent)) File.Delete(recent); } catch { }
-                    File.Move(staged, recent);
-                }
+                // 轮转的最后一跳同样不能「先删旧文件」：掉电会把最近一份备份一起抹掉。
+                PromoteTemp(staged, recent);
                 WriteBackupMeta(recent + ".meta", source, fingerprint);
                 return true;
             }
@@ -1390,12 +1505,15 @@ namespace ProxyPicker.Core
                     string clearError2;
                     bool cleared2 = ClearSavedIntent(out clearError2);
                     intentCleared = cleared2;
+                    bool suspended2 = false;
                     if (cleared2) Settings.ClearRestoreBaseline();
-                    else Settings.SuspendRepair();
+                    else suspended2 = Settings.SuspendRepair();
                     message = cleared2
                         ? sourceWhy + "；已按当前订阅重建干净配置，接管状态已清除"
                         : sourceWhy + "；内核规则已按当前订阅清除，但勾选名单文件删除失败：" + clearError2 +
-                          "。请手动删除该文件后重启本程序，否则后台看守可能重新接管";
+                          (suspended2
+                              ? "。已暂停后台自动补回，请手动删除该文件后重启本程序"
+                              : "。且暂停状态没能写进磁盘：请立刻手动删除该文件，否则重启后看守可能重新接管");
                     return true;
                 }
 
@@ -1425,12 +1543,15 @@ namespace ProxyPicker.Core
                 string clearError;
                 bool cleared = ClearSavedIntent(out clearError);
                 intentCleared = cleared;
+                bool suspended = false;
                 if (cleared) Settings.ClearRestoreBaseline();
-                else Settings.SuspendRepair();
+                else suspended = Settings.SuspendRepair();
                 if (!cleared)
                 {
                     message = "配置已还原，但勾选名单文件删除失败：" + clearError +
-                              "；请手动删除该文件后重启本程序，否则后台看守可能重新接管";
+                              (suspended
+                                  ? "。已暂停后台自动补回，请手动删除该文件后重启本程序"
+                                  : "。且暂停状态没能写进磁盘：请立刻手动删除该文件，否则重启后看守可能重新接管");
                     return true;   // 内核已还原成功，界面仍要同步
                 }
                 message = sourceWhy.Length > 0
@@ -1465,10 +1586,26 @@ namespace ProxyPicker.Core
         /// </summary>
         internal static bool IsBlockedPolicy(string proxy)
         {
+            var kind = ClassifyExit(proxy);
+            return kind == ExitKind.Direct || kind == ExitKind.Rejected;
+        }
+
+        /// <summary>
+        /// 出口语义的唯一分类口径。保存校验、状态卡、看守、流量对账全部走这一处：
+        /// v1.3.7 修好了 Profile 的 IsBlockedPolicy，却把 Traffic.ChainOf 留着自己那套
+        /// 字符串判断，漏掉了 REJECT-DROP，于是同一个出口在「保存」和「流量统计」里
+        /// 被算成两种东西。以后再新增阻断型策略只改这里。
+        /// </summary>
+        internal enum ExitKind { Unknown = 0, Proxy = 1, Direct = 2, Rejected = 3 }
+
+        internal static ExitKind ClassifyExit(string proxy)
+        {
             string p = (proxy ?? "").Trim();
-            return p.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
-                   p.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
-                   p.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase);
+            if (p.Length == 0) return ExitKind.Unknown;
+            if (p.Equals("DIRECT", StringComparison.OrdinalIgnoreCase)) return ExitKind.Direct;
+            if (p.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                p.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase)) return ExitKind.Rejected;
+            return ExitKind.Proxy;
         }
 
         /// <summary>mihomo 的策略组类型：这些名字出现在 /proxies 里时，没有 now 也不能当终点。</summary>
@@ -1708,7 +1845,11 @@ namespace ProxyPicker.Core
             // 兼容模式不受这条约束：订阅自带的提前 MATCH 是订阅作者的分流语义。
             bool positionOk = Settings.PatchOnly || !hasOwnRule || firstDirectMatch < 0 ||
                               firstDirectMatch > lastOwnProcess;
-            if (rules.Count > 0 && (hasOwnRule || emptyAllDirect) && hasDirectFallback && positionOk)
+            // v1.3.8：兼容模式不要求 DIRECT 兜底。订阅本身写成 MATCH,节点选择 时，
+            // 规则生成、保存校验、看守都认可它，只有这张状态卡还在硬要 hasDirectFallback，
+            // 于是「实际已生效、界面说没生效」，用户会反复重存。白名单模式仍然必须有直连兜底。
+            bool fallbackOk = Settings.PatchOnly || hasDirectFallback;
+            if (rules.Count > 0 && (hasOwnRule || emptyAllDirect) && fallbackOk && positionOk)
                 st.Applied = true;
             else if (!Settings.PatchOnly && hasOwnRule && hasDirectFallback && !positionOk)
                 st.Error = "直连兜底排在勾选规则前面，勾选的软件会走直连";

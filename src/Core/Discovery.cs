@@ -928,6 +928,37 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
+        /// 找流式列表的配对右括号，跳过双引号 / 单引号里的括号（引号内不算结构）。
+        /// 返回 -1 表示没有闭合——调用方必须按「配置损坏」失败关闭，不能猜。
+        /// v1.3.8：替代原来的 LastIndexOf(']')，它既会把未闭合的输入当合法，
+        /// 也会被值里的 ']' 带偏。
+        /// </summary>
+        static int FindFlowClose(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return -1;
+            char quote = '\0';
+            int depth = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (quote != '\0')
+                {
+                    if (quote == '"' && c == '\\') { i++; continue; }
+                    if (c == quote) quote = '\0';
+                    continue;
+                }
+                if (c == '"' || c == '\'') { quote = c; continue; }
+                if (c == '[') depth++;
+                else if (c == ']')
+                {
+                    depth--;
+                    if (depth == 0) return i;
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
         /// 通用 payload 生成：在 rules: 段首插入规则，并保证 find-process-mode 为 always。
         /// 幂等：每次先移除上一次插入的 PROCESS-NAME 块，不会越积越多。
         ///
@@ -978,9 +1009,20 @@ namespace ProxyPicker.Core
             bool flowRulesStyle = false;
             if (rest.StartsWith("[", StringComparison.Ordinal))
             {
-                int close = rest.LastIndexOf(']');
-                string tail = close >= 0 ? rest.Substring(close + 1).Trim() : "";
-                string inner = close >= 0 ? rest.Substring(1, close - 1) : rest.Substring(1);
+                // v1.3.8：以前用 LastIndexOf(']')，两个问题：
+                //  ① 没闭合的 `rules: ["MATCH,PROXY"` 会把右括号后面的整段当合法内容继续展开，
+                //     等于「替用户猜意图」，最后写出一份谁也没定义过的配置；
+                //  ② 值里本身带 ']' 时（如正则规则）会切错位置。
+                // 现在按配对扫描（跳过引号内的括号）：找不到右括号就失败关闭，不猜。
+                int close = FindFlowClose(rest);
+                if (close < 0)
+                    throw new InvalidOperationException(
+                        "rules: 的流式列表没有闭合的 ]，配置已损坏；为避免写出坏 YAML，已停止保存");
+                string tail = rest.Substring(close + 1).Trim();
+                if (tail.Length > 0 && !tail.StartsWith("#", StringComparison.Ordinal))
+                    throw new InvalidOperationException(
+                        "rules: 的流式列表后面跟着无法识别的内容（" + tail + "）；为避免写出坏 YAML，已停止保存");
+                string inner = rest.Substring(1, close - 1);
                 if (inner.Trim().Length > 0)
                     foreach (var part in SplitTopLevel(inner, ','))
                     {
@@ -1873,6 +1915,58 @@ namespace ProxyPicker.Core
                 try { if (File.Exists(g2fCfg)) File.Delete(g2fCfg); } catch { }
                 try { if (File.Exists(g2fMeta)) File.Delete(g2fMeta); } catch { }
             }
+
+            // G3（v1.3.8）：跨进程接管意图（磁盘签名）与流式 rules 的失败关闭。
+            string g3List = Path.Combine(Path.GetTempPath(),
+                "pp-selftest-intent-" + Guid.NewGuid().ToString("N") + ".yaml");
+            string g3Saved = Paths.ListPathOverride;
+            try
+            {
+                Paths.ListPathOverride = g3List;
+                string sigAbsent = Profile.IntentSignature();
+                check("G3-a 名单不存在时意图签名为 absent", sigAbsent == "absent", sigAbsent);
+                File.WriteAllText(g3List, "payload:\n  - 'PROCESS-NAME,a.exe,PP-FIXED'\n",
+                                  new UTF8Encoding(false));
+                string sigA = Profile.IntentSignature();
+                check("G3-b 名单出现后签名变化，且自身一致（跨进程还原才可能被发现）",
+                    sigA != sigAbsent && !Profile.IntentChangedSince(sigA), sigA);
+                File.WriteAllText(g3List, "payload:\n  - 'PROCESS-NAME,b.exe,PP-FIXED'\n",
+                                  new UTF8Encoding(false));
+                check("G3-c 名单内容被改写后签名不再匹配", Profile.IntentChangedSince(sigA), "");
+                File.Delete(g3List);
+                check("G3-d 名单被删掉（另一个进程执行还原）后签名不再匹配",
+                    Profile.IntentChangedSince(sigA), "");
+            }
+            finally
+            {
+                Paths.ListPathOverride = g3Saved;
+                try { if (File.Exists(g3List)) File.Delete(g3List); } catch { }
+            }
+
+            // 未闭合 / 尾部有垃圾的流式 rules：必须按配置损坏失败关闭，不能替用户猜。
+            bool threwUnclosed = false;
+            try
+            {
+                BuildPayload("mode: rule\nrules: [\"MATCH,PROXY\"\n",
+                    new List<Profile.Item>(), "PP-FIXED", true);
+            }
+            catch (InvalidOperationException) { threwUnclosed = true; }
+            check("G3-e 未闭合的流式 rules 按配置损坏处理（不猜意图）", threwUnclosed, "");
+
+            bool threwTrailing = false;
+            try
+            {
+                BuildPayload("mode: rule\nrules: [\"MATCH,PROXY\"] garbage\n",
+                    new List<Profile.Item>(), "PP-FIXED", true);
+            }
+            catch (InvalidOperationException) { threwTrailing = true; }
+            check("G3-f 流式 rules 后面的垃圾内容也失败关闭", threwTrailing, "");
+
+            string flowOk = BuildPayload("mode: rule\nrules: [\"MATCH,PROXY\"]\n",
+                new List<Profile.Item>(), "PP-FIXED", true);
+            check("G3-g 正常的流式 rules 仍能展开为块式",
+                flowOk.IndexOf("rules: [", StringComparison.Ordinal) < 0 &&
+                flowOk.IndexOf("MATCH,PROXY", StringComparison.Ordinal) >= 0, "");
 
             // G4：find-process-mode 原值以磁盘订阅为准，不能把工具写的 always 当成基线。
             check("G4-a 磁盘里的 strict 被正确读出",

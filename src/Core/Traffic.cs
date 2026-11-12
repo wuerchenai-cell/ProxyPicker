@@ -348,7 +348,9 @@ namespace ProxyPicker.Core
             return s;
         }
 
-        /// <summary>看真实链路：DIRECT 算直连，REJECT 单独归类，其余算代理，读不出来算未知。</summary>
+        /// <summary>看真实链路：DIRECT 算直连，REJECT / REJECT-DROP 算被拒，其余算代理，读不出来算未知。
+        /// v1.3.8：出口分类改走 Profile.ClassifyExit 这一处口径。以前这里自己判字符串，
+        /// 只认 DIRECT 和 REJECT，REJECT-DROP 的连接被算成「走代理」，和保存校验对不上。</summary>
         static Chain ChainOf(Dictionary<string, object> conn)
         {
             object raw;
@@ -357,8 +359,9 @@ namespace ProxyPicker.Core
             if (chains == null || chains.Count == 0) return Chain.Unknown;
             string last = chains[chains.Count - 1] as string ?? "";
             if (last.Length == 0) return Chain.Unknown;
-            if (last.Equals("DIRECT", StringComparison.OrdinalIgnoreCase)) return Chain.Direct;
-            if (last.Equals("REJECT", StringComparison.OrdinalIgnoreCase)) return Chain.Rejected;
+            var kind = Profile.ClassifyExit(last);
+            if (kind == Profile.ExitKind.Direct) return Chain.Direct;
+            if (kind == Profile.ExitKind.Rejected) return Chain.Rejected;
             return Chain.Proxy;
         }
 
@@ -414,6 +417,26 @@ namespace ProxyPicker.Core
             check("T8 派生进程走代理不算异常", !bad && verdict == "正常");
             TryVerdict(new Route { Expected = true, Proxy = 0, Direct = 0 }, out verdict, out bad);
             check("T9 没有可用样本时不下结论", !bad && verdict == "链路未知");
+
+            // v1.3.8：出口分类必须与保存校验同源。以前这里自己判字符串，
+            // REJECT-DROP 的连接被算成「走代理」，和 Profile.IsBlockedPolicy 对不上。
+            var connRejectDrop = new Dictionary<string, object>
+            {
+                { "chains", new List<object> { "REJECT-DROP" } }
+            };
+            var connReject = new Dictionary<string, object>
+            {
+                { "chains", new List<object> { "REJECT" } }
+            };
+            check("T10 REJECT-DROP 与 REJECT 归属同一类（不再被当成走代理）",
+                ChainOf(connRejectDrop) == Chain.Rejected &&
+                ChainOf(connReject) == Chain.Rejected &&
+                Profile.ClassifyExit("REJECT-DROP") == Profile.ExitKind.Rejected &&
+                Profile.IsBlockedPolicy("REJECT-DROP"));
+            check("T11 真实节点仍算代理、DIRECT 仍算直连",
+                Profile.ClassifyExit("日本 01") == Profile.ExitKind.Proxy &&
+                !Profile.IsBlockedPolicy("日本 01") &&
+                Profile.ClassifyExit("direct") == Profile.ExitKind.Direct);
 
             sb.AppendLine(pass + "/" + total + " 流量对账口径通过");
             return sb.ToString();

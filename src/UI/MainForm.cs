@@ -1007,6 +1007,9 @@ namespace ProxyPicker.UI
                 ownsBusy = true;
                 int saveRevision = _revision;
                 long saveEpoch = Profile.IntentEpoch;   // 等锁期间若发生还原，代次会变
+                // v1.3.8：代次只是本进程的静态计数，另一个 ProxyPicker 进程做 --restore
+                // 不会改它。名单文件的磁盘签名才能发现「等锁期间被跨进程还原」。
+                string saveIntentSig = Profile.IntentSignature();
                 bool modeChanged = _modeChanged;
                 BeginBusy();
                 SetStatus("正在保存并更新分流…", Theme.Dim);
@@ -1031,7 +1034,8 @@ namespace ProxyPicker.UI
                     // v1.3.7：整段都在跨进程锁内，托盘还原无法插到「推送完成、删除连接之前」。
                     string cfg = Paths.ClashYaml;
                     p.Snapshot = Profile.CaptureConnections(changed, cfg); // 先快照旧连接，再推新规则
-                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies), false, cfg, saveEpoch);
+                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies), false, cfg,
+                                            saveEpoch, saveIntentSig);
                     if (p.Apply.Ok && changed.Count > 0 && p.Snapshot.Error == null)
                         p.Reconnect = Profile.CloseCapturedConnections(p.Snapshot, cfg);
                     return p;
@@ -1078,15 +1082,24 @@ namespace ProxyPicker.UI
                         + pack.Apply.RuleCount + " 条规则，" + pack.Apply.Ms + "ms"
                         + (pack.Apply.Ipv6Off ? "，IPv6 已关" : "") + "；重连 " + changed.Count + " 个");
 
+                    // v1.3.8：模式切换改变的是「未勾选软件」的路由语义。我们只能精确清理
+                    // 名单里现在和过去的软件；其余软件的既有连接不会自己重匹配，
+                    // 这一点必须说清楚，不能只报一句「已生效」让人以为全部切换完成。
+                    string modeHint = modeChanged
+                        ? " · 模式已切换：未勾选软件的旧连接可能仍走旧路由，重启这些软件可立即生效"
+                        : "";
                     if (changed.Count == 0)
                     {
-                        SetStatus("已生效 · 没有需要重连的软件 · " + pack.Apply.Ms + "ms", Theme.Ok);
-                        Toast("已生效", "名单没有变化，规则已是最新 · " + pack.Apply.Ms + " ms", Theme.Ok, 0);
+                        SetStatus("已生效 · 没有需要重连的软件 · " + pack.Apply.Ms + "ms" + modeHint,
+                            modeChanged ? Theme.Warn : Theme.Ok);
+                        Toast(modeChanged ? "已生效（模式已切换）" : "已生效",
+                            "名单没有变化，规则已是最新 · " + pack.Apply.Ms + " ms" + modeHint,
+                            modeChanged ? Theme.Warn : Theme.Ok, modeChanged ? 2 : 0);
                     }
                     else if (pack.Snapshot.Error != null)
                     {
                         SetStatus("规则已生效，但旧连接自动清理失败；请新开页面", Theme.Warn);
-                        Toast("规则已生效", "旧连接没能自动清理，新开一个页面即可", Theme.Warn, 1);
+                        Toast("规则已生效", "旧连接没能自动清理，新开一个页面即可" + modeHint, Theme.Warn, 1);
                     }
                     else
                     {
@@ -1094,10 +1107,11 @@ namespace ProxyPicker.UI
                         int failed = pack.Reconnect == null ? 0 : pack.Reconnect.Failed;
                         string msg = "已生效 · 重连 " + changed.Count + " 个软件 · 清理 " + closed + " 条旧连接";
                         if (failed > 0) msg += " · " + failed + " 条失败";
-                        SetStatus(msg, failed > 0 ? Theme.Warn : Theme.Ok);
+                        msg += modeHint;
+                        SetStatus(msg, (failed > 0 || modeChanged) ? Theme.Warn : Theme.Ok);
                         Toast(failed > 0 ? "已生效（部分旧连接未清理）" : "已生效，可以继续用了",
-                            "重连 " + changed.Count + " 个软件 · 清理 " + closed + " 条旧连接 · " + pack.Apply.Ms + " ms",
-                            failed > 0 ? Theme.Warn : Theme.Ok, failed > 0 ? 1 : 0);
+                            "重连 " + changed.Count + " 个软件 · 清理 " + closed + " 条旧连接 · " + pack.Apply.Ms + " ms" + modeHint,
+                            (failed > 0 || modeChanged) ? Theme.Warn : Theme.Ok, (failed > 0 || modeChanged) ? 1 : 0);
                     }
 
                     // 名单变了，流量分类的基准也跟着变
@@ -1106,6 +1120,10 @@ namespace ProxyPicker.UI
                 else
                 {
                     CrashLog.Write(new InvalidOperationException("应用返回失败，内核未确认生效"), "保存规则");
+                    // v1.3.8：内核已经是新规则、磁盘名单却没写进去，而且补偿推送也失败——
+                    // 这是「内核与磁盘不一致」的严重状态，必须进审计，不能只弹一次提示。
+                    if (pack.Apply.RecoveryRequired)
+                        AuditLog.Record("SAVE", "内核与磁盘名单不一致（补偿推送失败）：" + pack.Apply.Message);
                     SetStatus(pack.Apply.Message, Theme.Warn);
                     Toast("没能生效", pack.Apply.Message, Theme.Warn, 1);
                 }

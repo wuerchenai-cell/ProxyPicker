@@ -6,7 +6,7 @@ ProxyPicker 怎么发给朋友
 
 一、就给两三个人 → 微信 / QQ 直接发文件（首选）
 --------------------------------------------------
-把 ProxyPicker-v1.3.7-share.zip（约 166 KB；本地包名是 ProxyPicker-分享版.zip）拖进聊天窗口发过去，就完了。
+把 ProxyPicker-v1.3.8-share.zip（约 166 KB；本地包名是 ProxyPicker-分享版.zip）拖进聊天窗口发过去，就完了。
 
   好处：不用注册、不用登录、不会过期、不经过任何网盘审核。
   缺点：只适合一个个发，不能给一大群人。
@@ -43,7 +43,7 @@ ProxyPicker 怎么发给朋友
 https://github.com/wuerchenai-cell/ProxyPicker/releases/latest
 
 程序里的「检查更新」就是查这个地址。
-注意：GitHub 上最新 Release 是 v1.3.7，和这个分享包是同一版。
+注意：GitHub 上最新 Release 是 v1.3.8，和这个分享包是同一版。
 程序里的「检查更新」只在 GitHub 上的版本号比本机大时才提醒，不会把人引去下载旧包；
 它只提示 + 打开下载页，绝不自动下载或替换自己。
 国内有时打不开或很慢，所以它只当备份，不当主入口。
@@ -63,7 +63,7 @@ https://github.com/wuerchenai-cell/ProxyPicker/releases/latest
    网盘对 .exe 的审核比压缩包严，有些会直接拦下来。我们本来就有 zip。
 
 2. 文件名保持中性。
-   就叫「ProxyPicker-v1.3.7-share.zip」（本地包叫「ProxyPicker-分享版.zip」），别改成"翻墙/机场/加速器/科学上网"之类。
+   就叫「ProxyPicker-v1.3.8-share.zip」（本地包叫「ProxyPicker-分享版.zip」），别改成"翻墙/机场/加速器/科学上网"之类。
    更不要发到论坛、贴吧、公众号、公开群里。
    这类工具在国内平台审核很严，容易删文件、封号。
    只私下发给认识的人，链接给谁你自己控制。
