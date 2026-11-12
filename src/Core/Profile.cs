@@ -684,8 +684,24 @@ namespace ProxyPicker.Core
         /// </summary>
         internal static System.Threading.Mutex CreateApplyMutex()
         {
-            try { return new System.Threading.Mutex(false, @"Global\ProxyPicker.Apply"); }
+            // 名字带上当前用户 SID：跨会话（本地桌面 + 远程桌面）能互斥，
+            // 同一台电脑的另一个 Windows 账户又不会撞到同一把锁（否则第二个账户存不了盘）。
+            try { return new System.Threading.Mutex(false, ApplyMutexName()); }
             catch { return new System.Threading.Mutex(false, @"Local\ProxyPicker.Apply"); }
+        }
+
+        static string ApplyMutexName()
+        {
+            try
+            {
+                using (var id = System.Security.Principal.WindowsIdentity.GetCurrent())
+                {
+                    if (id != null && id.User != null)
+                        return @"Global\ProxyPicker.Apply." + id.User.Value;
+                }
+            }
+            catch { }
+            return @"Global\ProxyPicker.Apply";
         }
 
         /// <summary>

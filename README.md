@@ -2,7 +2,7 @@
 
 只让「你勾选的软件」走代理 —— 一个给 Clash / mihomo 系客户端用的**按进程分流**小面板。
 
-单文件 exe，1,043,992 字节（约 1020 KB），不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
+单文件 exe，1,044,504 字节（约 1020 KB），不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
 
 [**下载最新版**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
 [直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
