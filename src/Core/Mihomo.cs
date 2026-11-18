@@ -271,6 +271,15 @@ namespace ProxyPicker.Core
             return hits[0];
         }
 
+        /// <summary>判断管道名称是否属于可无额外命令行证据即信任的专属客户端命名管道。</summary>
+        internal static bool IsGenericMihomoPipe(string pipe)
+        {
+            if (string.IsNullOrEmpty(pipe)) return false;
+            string p = pipe.Trim().ToLowerInvariant();
+            return p == "mihomo" || p.StartsWith("mihomo-", StringComparison.Ordinal) ||
+                   p == "clash" || p.StartsWith("clash-", StringComparison.Ordinal);
+        }
+
         /// <summary>管道名与选中客户端家族的一致性核对（默认拒绝未明确匹配的管道）。</summary>
         internal static bool PipeMatchesClient(string pipe, string clientHint)
         {
@@ -471,6 +480,15 @@ namespace ProxyPicker.Core
                         // 同样尚未写出密钥：不卡死本地 HTTP 控制端口回退；若 HTTP 也不可用，RequestCore 会把 _securityError 暴露出来
                         _pipeName = null;
                         _securityError = "已阻止向命名管道发送控制密钥：" + trustError;
+                        return null;
+                    }
+                    // 若管道只是通用名字（如 Sparkle / Party / 裸内核使用的 mihomo-*），发送密钥前必须再核对服务端进程命令行 `-f`/`-d` 是否确为当前配置
+                    string cfgToProve = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : _boundConfigPath;
+                    if (IsGenericMihomoPipe(_pipeName) && !string.IsNullOrEmpty(cfgToProve) &&
+                        !PidProvesConfig(pipe.ServerProcessId, cfgToProve))
+                    {
+                        _pipeName = null;
+                        _securityError = "已阻止向通用命名管道发送控制密钥：监听进程命令行未证明加载当前配置";
                         return null;
                     }
 
@@ -1109,12 +1127,14 @@ namespace ProxyPicker.Core
             {
                 if (!string.IsNullOrEmpty(explicitCfg))
                 {
+                    if (!Path.IsPathRooted(explicitCfg)) return false;
                     string gotFull = Path.GetFullPath(explicitCfg);
                     return string.Equals(gotFull, expectedFull, StringComparison.OrdinalIgnoreCase);
                 }
                 if (!string.IsNullOrEmpty(explicitDir) &&
                     string.Equals(Path.GetFileName(expectedFull), "config.yaml", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (!Path.IsPathRooted(explicitDir)) return false;
                     string gotDir = Path.GetFullPath(explicitDir).TrimEnd('\\');
                     string expectedDir = (Path.GetDirectoryName(expectedFull) ?? "").TrimEnd('\\');
                     return string.Equals(gotDir, expectedDir, StringComparison.OrdinalIgnoreCase);
@@ -2046,7 +2066,9 @@ namespace ProxyPicker.Core
                 !PipeMatchesClient("mihomo-999", "Clash Verge Rev") &&
                 !PipeMatchesClient("verge-mihomo-production-1", "Clash Nyanpasu") &&
                 PipeMatchesClient("nyanpasu-mihomo", "Clash Nyanpasu") &&
-                PipeMatchesClient("mihomo-abc", "Sparkle") &&
+                PipeMatchesClient("sparkle-mihomo", "Sparkle") &&
+                IsGenericMihomoPipe("mihomo-abc") &&
+                !IsGenericMihomoPipe("sparkle-mihomo") &&
                 !PipeMatchesClient("weird-custom-pipe", "Sparkle"),
                 "");
 
@@ -2074,6 +2096,7 @@ namespace ProxyPicker.Core
                 CommandLineProvesConfig("mihomo.exe -f \"C:\\A\\cfg.yaml\"", @"C:\A\cfg.yaml") &&
                 !CommandLineProvesConfig("mihomo.exe -f \"C:\\B\\cfg.yaml\"", @"C:\A\cfg.yaml") &&
                 !CommandLineProvesConfig("mihomo.exe", @"C:\A\cfg.yaml") &&
+                !CommandLineProvesConfig("mihomo.exe -f \"cfg.yaml\"", @"C:\A\cfg.yaml") &&
                 CommandLineProvesConfig("mihomo.exe -d \"C:\\A\"", @"C:\A\config.yaml") &&
                 !CommandLineProvesConfig("mihomo.exe -d \"C:\\A\"", @"C:\A\clash-verge.yaml"),
                 "");
@@ -2158,6 +2181,12 @@ namespace ProxyPicker.Core
                         if (trustError != null)
                         {
                             sb.AppendLine("[已阻止] 未发送控制密钥：" + trustError);
+                            return sb.ToString();
+                        }
+                        if (IsGenericMihomoPipe(pipe) && !string.IsNullOrEmpty(_boundConfigPath) &&
+                            !PidProvesConfig(p.ServerProcessId, _boundConfigPath))
+                        {
+                            sb.AppendLine("[已阻止] 通用管道未通过当前配置命令行证明，拒绝发送密钥");
                             return sb.ToString();
                         }
 

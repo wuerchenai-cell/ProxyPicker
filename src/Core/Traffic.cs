@@ -192,9 +192,9 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
-        public static Sample Poll(ICollection<string> proxyExes, bool judgeMismatch = true, IList<Regex> proxyPathRegexes = null)
+        public static Sample Poll(ICollection<string> proxyExes, bool judgeMismatch = true, IList<Regex> proxyPathRegexes = null, string knownConfigPath = null)
         {
-            var root = Mihomo.GetJson("/connections", 8000);
+            var root = Mihomo.GetJson("/connections", 8000, knownConfigPath);
             if (root == null)
             {
                 return new Sample
@@ -260,16 +260,16 @@ namespace ProxyPicker.Core
                 if (id.Length > 0) now[id] = new Mark { Up = up, Down = down };
 
                 Mark before;
-                long du = up, dd = down;
+                long du = 0, dd = 0;
                 if (id.Length > 0 && _prev.TryGetValue(id, out before))
                 {
-                    du = up - before.Up; dd = down - before.Down;
-                    if (du < 0) du = up;
-                    if (dd < 0) dd = down;
+                    // 只有上一拍已见过的连接才做差值；计数回绕/重置时不把当前累计当成突发尖峰，改为 0 重新入基线。
+                    du = up >= before.Up ? up - before.Up : 0;
+                    dd = down >= before.Down ? down - before.Down : 0;
                 }
-                else if (_prevTicks != 0)
+                else
                 {
-                    // 新连接：本次的全部字节就是它这一轮的增量
+                    // 新出现在列表里的连接，upload/download 是其从建立起的全部历史累计；首见先记入基线、当秒增量记 0 防止虚假封顶尖峰。
                 }
 
                 bool expected = proxyExes != null && exe.Length > 0 && proxyExes.Contains(exe);
@@ -672,6 +672,34 @@ namespace ProxyPicker.Core
             var seqSample = AnalyzeConnections(seqConns, expectedSet, true, nowUtc.AddMinutes(-5), pathRegexes, nowUtc.Ticks, false);
             check("T17 同进程先缺路径后命中目录规则时升级 Expected，防顺序误报",
                 seqSample.Mismatch == 0 && seqSample.Routes["helper.exe"].Expected);
+
+            // T18：新出现且已有高累计流量的连接首见当秒增量计为 0，仅在后续差值里计算增量（防切图/长连接虚假尖峰）
+            Reset();
+            var seedBase = new Dictionary<string, object> { { "connections", new List<object>() } };
+            AnalyzeConnections(seedBase, expectedSet, false, nowUtc, null, nowUtc.Ticks, true);
+            var lateConn = new Dictionary<string, object>
+            {
+                {
+                    "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "long-lived-99" },
+                            { "upload", 50000000.0 },
+                            { "download", 200000000.0 },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-B", "PP-FIXED" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "curl.exe" } } }
+                        }
+                    }
+                }
+            };
+            var lateFirst = AnalyzeConnections(lateConn, expectedSet, false, nowUtc, null, nowUtc.AddSeconds(1).Ticks, true);
+            ((Dictionary<string, object>)((List<object>)lateConn["connections"])[0])["download"] = 200005120.0;
+            var lateNext = AnalyzeConnections(lateConn, expectedSet, false, nowUtc, null, nowUtc.AddSeconds(2).Ticks, true);
+            check("T18 新连接首见高累计字节当秒增量记 0，仅在第二拍按实增计算，防虚假尖峰",
+                lateFirst.ProxyDown == 0 && lateNext.ProxyDown >= 5000 && lateNext.ProxyDown < 10000);
+            Reset();
 
             sb.AppendLine(pass + "/" + total + " 流量对账口径通过");
             return sb.ToString();

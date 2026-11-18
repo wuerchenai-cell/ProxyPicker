@@ -202,6 +202,7 @@ namespace ProxyPicker.UI
         string _delayNode = "";
         string _delayError = "";
         bool _delayTimedOut;
+        int _delayTimeoutStreak;
         DateTime _lastDelayTestAt = DateTime.MinValue;
         DateTime _lastDelayAlertAt = DateTime.MinValue;
         bool _delayAlertActive;
@@ -1945,7 +1946,8 @@ namespace ProxyPicker.UI
                 // 全局模式下所有流量走 GLOBAL，订阅兼容里未勾选走订阅规则，均不能判成分流异常。
                 bool wasTrafficOk = _traffic != null && _traffic.Ok;
                 bool isRule = _state.ConfigOk && Profile.IsRuleMode(_state.Mode);
-                var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly && isRule, pathRegexes));
+                string cfgForTraffic = Paths.ClashYaml;
+                var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly && isRule, pathRegexes, cfgForTraffic));
                 if (!UiAlive || !Visible) return;
                 _traffic = s;
                 if (s.Ok) ApplyCoverage(s);
@@ -2298,18 +2300,21 @@ namespace ProxyPicker.UI
                 string prev = _state.Outbound;
                 _state.Chain = snap.Detail.Chain;
                 _state.NodeAlive = snap.Detail.Alive;
-                _state.DelayMs = snap.Detail.HistoryDelayMs > 0 ? snap.Detail.HistoryDelayMs : -1;
                 if (snap.Detail.Outbound == prev)
                 {
+                    // 同一出口优先保留最新实时测速延迟（超时则保持 -1），防止被 /proxies 的历史延迟覆盖。
+                    _state.DelayMs = _delayTimedOut ? -1 : (_delayMs > 0 ? _delayMs : (snap.Detail.HistoryDelayMs > 0 ? snap.Detail.HistoryDelayMs : -1));
                     _nodesPage.SetCurrentOutbound(_state.Outbound, _state.DelayMs, _delayTimedOut, _state.ProxyActive);
                     _qualityPage.SetCurrentOutbound(_state.Outbound);
                     InvalidateNavBar();
                     Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + SummaryH + 4)));
                     return;
                 }
+                _state.DelayMs = snap.Detail.HistoryDelayMs > 0 ? snap.Detail.HistoryDelayMs : -1;
                 _state.Outbound = snap.Detail.Outbound;
                 _delayMs = -1;
                 _delayTimedOut = false;
+                _delayTimeoutStreak = 0;
                 _delayAlertActive = false;
                 _delayNode = snap.Detail.Outbound;
                 _nodesPage.SetCurrentOutbound(_state.Outbound, _state.DelayMs, false, _state.ProxyActive);
@@ -2327,13 +2332,24 @@ namespace ProxyPicker.UI
 
         bool ShouldRunPeriodicDelayTest()
         {
+            if (_batchDelayRunning || _failoverBusy || _nodeActionBusy) return false;
             int interval = Settings.DelayCheckSeconds;
             if (interval <= 0) return false;
             if (!_state.ConfigOk || !_state.ProxyActive) return false;
             if (!Visible && !Profile.HasSavedIntent && !Settings.AutoFailover) return false;
             string node = _state.Outbound;
             if (string.IsNullOrEmpty(node) || Profile.ClassifyExit(node) != Profile.ExitKind.Proxy) return false;
-            return (DateTime.UtcNow - _lastDelayTestAt).TotalSeconds >= interval;
+            double effectiveInterval = (Settings.AutoFailover && _delayTimeoutStreak == 1)
+                ? Math.Min(interval, 6)
+                : interval;
+            return (DateTime.UtcNow - _lastDelayTestAt).TotalSeconds >= effectiveInterval;
+        }
+
+        /// <summary>判断测速超时后是否可以进入自动切换：手动测速或连续 2 轮确认超时后放行，防止单次瞬间抖动/503 误切可用节点。</summary>
+        internal static bool ShouldTriggerFailoverAfterTimeout(bool manual, int streak, bool autoFailoverEnabled, bool busy)
+        {
+            if (!autoFailoverEnabled || busy) return false;
+            return manual || streak >= 2;
         }
 
         /// <summary>托盘菜单与摘要胶囊共用的主动测速入口。</summary>
@@ -2346,7 +2362,7 @@ namespace ProxyPicker.UI
 
         async Task RunDelayTestAsync(bool manual)
         {
-            if (!UiAlive || _delayTesting || _nodeActionBusy) return;
+            if (!UiAlive || _delayTesting || _nodeActionBusy || _batchDelayRunning || _failoverBusy) return;
             string node = _state.Outbound;
             if (string.IsNullOrEmpty(node) || Profile.ClassifyExit(node) != Profile.ExitKind.Proxy)
             {
@@ -2360,6 +2376,7 @@ namespace ProxyPicker.UI
             }
 
             _delayTesting = true;
+            if (!string.Equals(_delayNode, node, StringComparison.OrdinalIgnoreCase)) _delayTimeoutStreak = 0;
             _delayNode = node;
             _lastDelayTestAt = DateTime.UtcNow;
             if (manual) SetStatus("正在通过 Clash 测试「" + CleanEmoji(node) + "」延迟…", Theme.Dim);
@@ -2368,7 +2385,8 @@ namespace ProxyPicker.UI
             bool triggeredFailover = false;
             try
             {
-                var res = await Task.Run(() => Profile.MeasureDelay(node));
+                string cfg = Paths.ClashYaml;
+                var res = await Task.Run(() => Profile.MeasureDelayConfirmed(node, null, 0, cfg));
                 if (!UiAlive) return;
                 // 若测速期间用户已经切到了别的节点，不拿旧结果覆盖新节点状态
                 if (!string.Equals(node, _state.Outbound, StringComparison.OrdinalIgnoreCase)) return;
@@ -2386,9 +2404,10 @@ namespace ProxyPicker.UI
 
                 if (res.Ok)
                 {
-                    bool wasTimeout = _delayAlertActive;
+                    bool wasTimeout = _delayAlertActive || _delayTimeoutStreak > 0;
                     _delayMs = res.DelayMs;
                     _delayTimedOut = false;
+                    _delayTimeoutStreak = 0;
                     _delayError = "";
                     _delayAlertActive = false;
                     _state.DelayMs = res.DelayMs;
@@ -2412,24 +2431,30 @@ namespace ProxyPicker.UI
                     return;
                 }
 
-                // 节点测速超时或不可达
+                // 节点经过二次交叉确认后仍然超时或不可达
                 _delayMs = -1;
                 _delayTimedOut = res.TimedOut;
                 _delayError = res.Error ?? "节点测速失败";
                 if (res.TimedOut)
                 {
+                    _delayTimeoutStreak = string.Equals(_delayNode, node, StringComparison.OrdinalIgnoreCase)
+                        ? _delayTimeoutStreak + 1 : 1;
                     _state.DelayMs = -1;
                     _state.NodeAlive = false;
                     _nodesPage.UpdateSingleNodeDelay(node, -2, false, _delayError);
                     InvalidateNavBar();
 
-                    // 开启「超时自动切换」且满足冷却时，自动从备选池找延迟最低的可用节点切过去
+                    // 开启「超时自动切换」：需经过连续两轮确认（或用户手动测速双测失败）并满足冷却时间，防止瞬间抖动或 503 误踢可用节点
                     bool cooldownOk = _lastFailoverAt == DateTime.MinValue ||
                                       (DateTime.UtcNow - _lastFailoverAt).TotalSeconds >= (manual ? 15 : 30);
-                    if (Settings.AutoFailover && !_failoverBusy && !_nodeActionBusy && cooldownOk)
+                    if (ShouldTriggerFailoverAfterTimeout(manual, _delayTimeoutStreak, Settings.AutoFailover, _failoverBusy || _nodeActionBusy) && cooldownOk)
                     {
                         triggeredFailover = true;
                         _ = TryAutoFailoverAsync(node);
+                    }
+                    else if (Settings.AutoFailover && !manual && _delayTimeoutStreak == 1)
+                    {
+                        SetStatus("「" + CleanEmoji(node) + "」首次测速未通过（" + _delayError + "），将在几秒后自动复检确认…", Theme.Warn);
                     }
                     else
                     {
@@ -2565,6 +2590,7 @@ namespace ProxyPicker.UI
         {
             _delayMs = -1;
             _delayTimedOut = false;
+            _delayTimeoutStreak = 0;
             _delayAlertActive = false;
             _delayNode = "";
         }
@@ -2868,7 +2894,9 @@ namespace ProxyPicker.UI
                        "确认启动全量节点评估吗？")
                     : ("未能准备独立旁路引擎（" + previewErr + "），将改用主客户端临时切换模式评估共 " + concrete.Count + " 个节点：\n\n" +
                        "• 预筛连通节点并跳过超时节点；\n" +
-                       "• 评估期间逐一短暂切换主节点（完成后自动恢复原节点与原模式）；\n\n" +
+                       (plan != null && plan.Ok && plan.NeedsTempGlobal
+                           ? "• 评估期间将临时切换主内核为全局模式并逐一测节点（完成后自动恢复原节点与原模式）；\n\n"
+                           : "• 评估期间逐一短暂切换主节点（完成后自动恢复原节点与原模式）；\n\n") +
                        "确认开始全量节点评估吗？");
                 if (MessageBox.Show(this, tip, "全量节点评估", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                     return;
@@ -2924,7 +2952,7 @@ namespace ProxyPicker.UI
                                     if (_batchQualityCancel || !UiAlive || _shuttingDown) return;
                                     string err;
                                     int ms = sidecar.MeasureDelay(n.Name, 2200, out err);
-                                    n.LiveDelayMs = ms;
+                                    n.LiveDelayMs = ms > 0 ? ms : -2;
                                     n.Alive = ms > 0;
                                     n.LastError = ms > 0 ? "" : err;
                                     int cur = System.Threading.Interlocked.Increment(ref preDone);
@@ -2934,7 +2962,7 @@ namespace ProxyPicker.UI
                                         BeginInvoke(new Action(() =>
                                         {
                                             if (!UiAlive) return;
-                                            _nodesPage.UpdateSingleNodeDelay(n.Name, ms, ms > 0, n.LastError);
+                                            _nodesPage.UpdateSingleNodeDelay(n.Name, n.LiveDelayMs, n.Alive, n.LastError);
                                             _qualityPage.SetBatchScanning(true, cur, concrete.Count, "预筛 " + n.Name);
                                         }));
                                     }
@@ -2946,6 +2974,7 @@ namespace ProxyPicker.UI
                     {
                         await Task.Run(() =>
                         {
+                            bool ignoreUnreachable;
                             NodeManager.BatchMeasureNodes(concrete, 2200,
                                 () => _batchQualityCancel || !UiAlive || _shuttingDown,
                                 n =>
@@ -2953,7 +2982,7 @@ namespace ProxyPicker.UI
                                     if (!UiAlive) return;
                                     try { BeginInvoke(new Action(() => { if (UiAlive) _nodesPage.UpdateSingleNodeDelay(n.Name, n.LiveDelayMs, n.Alive, n.LastError); })); }
                                     catch { }
-                                }, cfg);
+                                }, cfg, out ignoreUnreachable);
                         });
                     }
 
@@ -2986,6 +3015,7 @@ namespace ProxyPicker.UI
                     SetStatus((isolated ? "已筛选 " : "筛选出 ") + total + " 个连通节点，正在" +
                         (isolated ? "零干扰旁路通道" : "临时通道") + "评估 IP、风控与主流服务…", Theme.Dim);
 
+                    bool restoreWarning = false;
                     await Task.Run(() =>
                     {
                         string origMode = plan != null && !string.IsNullOrEmpty(plan.OriginalMode) ? plan.OriginalMode : "rule";
@@ -3013,7 +3043,8 @@ namespace ProxyPicker.UI
                                 if (_batchQualityCancel || !UiAlive || _shuttingDown) break;
                                 if (UiAlive)
                                 {
-                                    try { BeginInvoke(new Action(() => { if (UiAlive) _qualityPage.SetBatchScanning(true, done, total, n.Name); })); }
+                                    int cur = done;
+                                    try { BeginInvoke(new Action(() => { if (UiAlive) _qualityPage.SetBatchScanning(true, cur, total, n.Name); })); }
                                     catch { }
                                 }
 
@@ -3034,6 +3065,7 @@ namespace ProxyPicker.UI
 
                                     if (UiAlive)
                                     {
+                                        int curDone = done;
                                         try
                                         {
                                             BeginInvoke(new Action(() =>
@@ -3041,7 +3073,7 @@ namespace ProxyPicker.UI
                                                 if (!UiAlive) return;
                                                 _qualityPage.UpsertBatchReport(rep);
                                                 _nodesPage.CacheQualityReport(rep);
-                                                _qualityPage.SetBatchScanning(true, done, total, n.Name);
+                                                _qualityPage.SetBatchScanning(true, curDone, total, n.Name);
                                             }));
                                         }
                                         catch { }
@@ -3055,14 +3087,40 @@ namespace ProxyPicker.UI
                         }
                         finally
                         {
+                            // 每个恢复步骤独立捕获异常并检查返回值，避免某一步报错导致后续模式恢复被跳过。
                             if (!isolated)
                             {
                                 if (useTempGlobal && !string.IsNullOrEmpty(origGlobal))
-                                    NodeManager.SwitchProxyNode("GLOBAL", origGlobal, false, "", cfg);
+                                {
+                                    try
+                                    {
+                                        if (!NodeManager.SwitchProxyNode("GLOBAL", origGlobal, false, "", cfg).Ok)
+                                            restoreWarning = true;
+                                    }
+                                    catch { restoreWarning = true; }
+                                }
                                 if (!string.IsNullOrEmpty(cat.GroupName) && !string.IsNullOrEmpty(origSelection))
-                                    NodeManager.SwitchProxyNode(cat.GroupName, origSelection, false, "", cfg);
+                                {
+                                    try
+                                    {
+                                        if (!NodeManager.SwitchProxyNode(cat.GroupName, origSelection, false, "", cfg).Ok)
+                                            restoreWarning = true;
+                                    }
+                                    catch { restoreWarning = true; }
+                                }
                                 if (switchedMode)
-                                    NodeManager.SetKernelModeTemp(origMode, cfg);
+                                {
+                                    try
+                                    {
+                                        if (!NodeManager.SetKernelModeTemp(origMode, cfg))
+                                        {
+                                            System.Threading.Thread.Sleep(150);
+                                            if (!NodeManager.SetKernelModeTemp(origMode, cfg))
+                                                restoreWarning = true;
+                                        }
+                                    }
+                                    catch { restoreWarning = true; }
+                                }
                             }
                         }
                     });
@@ -3071,11 +3129,19 @@ namespace ProxyPicker.UI
                     _qualityPage.SetBatchScanning(false, done, total, "");
                     AuditLog.Record("QUALITY_BATCH",
                         "全量节点评估完成：isolated=" + isolated + " done=" + done + "/" + total +
-                        " full4=" + ready4 + " geminiReady=" + aiReady);
+                        " full4=" + ready4 + " geminiReady=" + aiReady + (restoreWarning ? " restoreWarn=True" : ""));
                     string summary = _batchQualityCancel
                         ? ("已停止全量评估（完成 " + done + "/" + total + " · 四项全通 " + ready4 + " 个）")
                         : ("全量评估完成：共评估 " + done + " 个可用节点 · 四项主流服务全通 " + ready4 + " 个");
-                    SetStatus(summary, ready4 > 0 || aiReady > 0 ? Theme.Ok : Theme.Warn);
+                    if (restoreWarning)
+                    {
+                        SetStatus(summary + "（部分恢复失败，请检查当前节点与模式）", Theme.Warn);
+                        Toast("部分主内核状态未能自动还原", "请在 Clash 客户端确认已回到原来的「规则模式」与原节点", Theme.Warn, 2);
+                    }
+                    else
+                    {
+                        SetStatus(summary, ready4 > 0 || aiReady > 0 ? Theme.Ok : Theme.Warn);
+                    }
                     Toast("全量节点评估完成",
                         "已测 " + done + " 个节点 · 四项服务全通 " + ready4 + " 个，可一键纳入备选池",
                         ready4 > 0 || aiReady > 0 ? Theme.Ok : Theme.Warn,
@@ -3110,7 +3176,7 @@ namespace ProxyPicker.UI
                 SetStatus("正在停止批量测速…", Theme.Dim);
                 return;
             }
-            if (_nodeActionBusy) return;
+            if (_nodeActionBusy || _failoverBusy) return;
             var targets = _nodesPage.SnapshotConcreteNodes();
             if (targets.Count == 0) { Toast("没有可测速节点", "请先刷新或确认策略组有节点", Theme.Warn, 1); return; }
 
@@ -3118,6 +3184,7 @@ namespace ProxyPicker.UI
             _batchDelayCancel = false;
             int total = targets.Count;
             int done = 0;
+            bool kernelUnreachable = false;
             _nodesPage.SetBatchTesting(true, 0, total);
             SetStatus("正在批量测速 " + total + " 个节点（按延迟排队，可随时点停测）…", Theme.Dim);
             string cfg = Paths.ClashYaml;
@@ -3126,12 +3193,13 @@ namespace ProxyPicker.UI
             {
                 await Task.Run(() =>
                 {
+                    bool unreach;
                     NodeManager.BatchMeasureNodes(
-                        targets, 2500,
+                        targets, 2800,
                         () => _batchDelayCancel || !UiAlive || _shuttingDown,
                         n =>
                         {
-                            done++;
+                            int curDone = System.Threading.Interlocked.Increment(ref done);
                             if (!UiAlive) return;
                             try
                             {
@@ -3139,11 +3207,12 @@ namespace ProxyPicker.UI
                                 {
                                     if (!UiAlive) return;
                                     _nodesPage.UpdateSingleNodeDelay(n.Name, n.LiveDelayMs, n.Alive, n.LastError);
-                                    _nodesPage.SetBatchTesting(true, done, total);
+                                    _nodesPage.SetBatchTesting(true, curDone, total);
                                 }));
                             }
                             catch { }
-                        }, cfg);
+                        }, cfg, out unreach);
+                    kernelUnreachable = unreach;
                 });
             }
             catch (Exception ex) { ReportFailure("批量测速", ex); }
@@ -3153,10 +3222,18 @@ namespace ProxyPicker.UI
                 if (UiAlive)
                 {
                     _nodesPage.SetBatchTesting(false, done, total);
-                    SetStatus(_batchDelayCancel
-                        ? ("已停止批量测速（完成 " + done + "/" + total + " 个）")
-                        : ("批量测速完成（共 " + done + " 个节点）"), Theme.Ok);
-                    Toast("全测延迟完成", "已测 " + done + "/" + total + " 个节点，可在列表左侧勾选加入备选池", Theme.Ok, 0);
+                    if (kernelUnreachable)
+                    {
+                        SetStatus("批量测速中断：内核控制接口已断开（已测 " + done + "/" + total + "）", Theme.Warn);
+                        Toast("批量测速已中断", "与 Clash 控制接口的连接已断开，请确认客户端仍在运行", Theme.Warn, 2);
+                    }
+                    else
+                    {
+                        SetStatus(_batchDelayCancel
+                            ? ("已停止批量测速（完成 " + done + "/" + total + " 个）")
+                            : ("批量测速完成（共 " + done + " 个节点）"), Theme.Ok);
+                        Toast("全测延迟完成", "已测 " + done + "/" + total + " 个节点，可在列表左侧勾选加入备选池", Theme.Ok, 0);
+                    }
                 }
             }
         }
@@ -3189,6 +3266,7 @@ namespace ProxyPicker.UI
                 _delayNode = outcome.NewOutbound;
                 _delayMs = -1;
                 _delayTimedOut = false;
+                _delayTimeoutStreak = 0;
                 _delayAlertActive = false;
                 _nodesPage.SetCurrentOutbound(outcome.NewOutbound, -1, false);
                 _qualityPage.SetCurrentOutbound(outcome.NewOutbound);
@@ -3214,7 +3292,7 @@ namespace ProxyPicker.UI
 
         async Task TryAutoFailoverAsync(string timedOutNode)
         {
-            if (!UiAlive || _failoverBusy || _nodeActionBusy || _shuttingDown) return;
+            if (!UiAlive || _failoverBusy || _nodeActionBusy || _batchDelayRunning || _shuttingDown) return;
             _failoverBusy = true;
             _lastFailoverAt = DateTime.UtcNow;
             string timeTag = DateTime.Now.ToString("HH:mm:ss");
@@ -3233,46 +3311,110 @@ namespace ProxyPicker.UI
                     return;
                 }
 
-                SetStatus("「" + CleanEmoji(timedOutNode) + "」超时，正在测速备选池寻找最低延迟节点…", Theme.Warn);
+                SetStatus("「" + CleanEmoji(timedOutNode) + "」连续确认超时，正在并发复核备选池寻找稳定节点…", Theme.Warn);
                 var result = await Task.Run(() =>
                 {
                     var cat = NodeManager.LoadCatalog(cfg);
                     if (!cat.Ok || string.IsNullOrEmpty(cat.GroupName))
-                        return new { HasPool = true, Best = (NodeManager.ProxyNodeInfo)null, Sw = (NodeManager.SwitchOutcome)null, Tested = 0, Err = cat.Error };
+                        return new { Ok = false, Unreachable = false, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = cat.Error };
 
                     var pool = cat.Nodes
                         .Where(n => !n.IsGroup && n.IsCandidate && !string.Equals(n.Name, timedOutNode, StringComparison.OrdinalIgnoreCase))
                         .ToList();
                     if (pool.Count == 0)
-                        return new { HasPool = false, Best = (NodeManager.ProxyNodeInfo)null, Sw = (NodeManager.SwitchOutcome)null, Tested = 0, Err = "备选池里除当前超时节点外无其他节点" };
+                        return new { Ok = false, Unreachable = false, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = "备选池里除当前超时节点外无其他节点" };
 
-                    NodeManager.BatchMeasureNodes(pool, Math.Min(Settings.DelayTimeoutMs, 2500),
-                        () => _shuttingDown || !UiAlive, null, cfg);
-                    var best = NodeManager.PickBestFailoverCandidate(pool, timedOutNode, Settings.DesiredRegion);
-                    if (best == null)
-                        return new { HasPool = true, Best = (NodeManager.ProxyNodeInfo)null, Sw = (NodeManager.SwitchOutcome)null, Tested = pool.Count, Err = "备选池内 " + pool.Count + " 个节点均超时" };
+                    // 1. 并发快速预筛备选池（带 expected=204 过滤假活节点）
+                    bool unreachable = NodeManager.BatchMeasureFailoverPool(pool, Math.Max(2000, Math.Min(Settings.DelayTimeoutMs, 4000)),
+                        () => _shuttingDown || !UiAlive, cfg);
+                    if (unreachable)
+                        return new { Ok = false, Unreachable = true, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = "与 Clash 控制接口的连接已断开" };
 
-                    var sw = NodeManager.SwitchProxyNode(cat.GroupName, best.Name, true, timedOutNode, cfg);
-                    return new { HasPool = true, Best = best, Sw = sw, Tested = pool.Count, Err = sw.Ok ? "" : sw.Message };
+                    // 2. 切前先复检原节点：若这几秒内原节点已恢复正常可用，直接留在原节点不断开现有连接
+                    var origNow = Profile.MeasureDelayConfirmed(timedOutNode, null, Math.Max(2500, Math.Min(Settings.DelayTimeoutMs, 4500)), cfg);
+                    if (origNow.KernelUnreachable)
+                        return new { Ok = false, Unreachable = true, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = origNow.Error };
+                    if (origNow.Ok && origNow.DelayMs > 0)
+                        return new { Ok = false, Unreachable = false, OrigRecovered = true, OrigDelay = origNow.DelayMs, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = "" };
+
+                    var ranked = NodeManager.RankFailoverCandidates(pool, timedOutNode, Settings.DesiredRegion);
+                    if (ranked.Count == 0)
+                        return new { Ok = false, Unreachable = false, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = "备选池内 " + pool.Count + " 个节点均超时" };
+
+                    // 3. 对低延迟候选依次做「切前二次确认 -> 切换 -> 切后实地延迟复核」，拒绝盲切到假活/超时节点
+                    string lastErr = "备选节点切后实地复核均超时";
+                    string origSelection = cat.CurrentSelection;
+                    string currentOut = timedOutNode;
+                    int maxTry = Math.Min(4, ranked.Count);
+                    for (int i = 0; i < maxTry; i++)
+                    {
+                        if (_shuttingDown || !UiAlive) break;
+                        var cand = ranked[i];
+                        var preConfirm = Profile.MeasureDelay(cand.Name, null, Math.Max(2500, Math.Min(Settings.DelayTimeoutMs, 4000)), cfg);
+                        if (preConfirm.KernelUnreachable)
+                            return new { Ok = false, Unreachable = true, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = preConfirm.Error };
+                        if (!preConfirm.Ok || preConfirm.DelayMs <= 0)
+                        {
+                            cand.LiveDelayMs = -2;
+                            cand.Alive = false;
+                            continue;
+                        }
+
+                        var sw = NodeManager.SwitchProxyNode(cat.GroupName, cand.Name, true, currentOut, cfg);
+                        if (!sw.Ok) { lastErr = sw.Message; continue; }
+                        currentOut = sw.NewOutbound;
+
+                        var postVerify = Profile.MeasureDelayConfirmed(sw.NewOutbound, null, Math.Max(3000, Settings.DelayTimeoutMs), cfg);
+                        if (postVerify.Ok && postVerify.DelayMs > 0)
+                            return new { Ok = true, Unreachable = false, OrigRecovered = false, OrigDelay = -1, BestDelay = postVerify.DelayMs, Sw = sw, Err = "" };
+
+                        lastErr = CleanEmoji(cand.Name) + " 切换后实测仍超时（已尝试后续备选）";
+                    }
+
+                    // 全部试用备选切换后均超时：还原先前选择，避免留在刚测出超时的节点上
+                    if (!string.IsNullOrEmpty(origSelection) && !string.Equals(currentOut, timedOutNode, StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { NodeManager.SwitchProxyNode(cat.GroupName, origSelection, false, "", cfg); } catch { }
+                    }
+                    return new { Ok = false, Unreachable = false, OrigRecovered = false, OrigDelay = -1, BestDelay = -1, Sw = (NodeManager.SwitchOutcome)null, Err = lastErr };
                 });
 
                 if (!UiAlive) return;
-                if (result.Best != null && result.Sw != null && result.Sw.Ok)
+                if (result.OrigRecovered)
+                {
+                    _delayNode = timedOutNode;
+                    _delayMs = result.OrigDelay;
+                    _delayTimedOut = false;
+                    _delayTimeoutStreak = 0;
+                    _delayAlertActive = false;
+                    _state.DelayMs = result.OrigDelay;
+                    _state.NodeAlive = true;
+                    _lastDelayTestAt = DateTime.UtcNow;
+                    _nodesPage.UpdateSingleNodeDelay(timedOutNode, result.OrigDelay, true, "");
+                    AuditLog.Record("FAILOVER", "复检原节点已恢复可用，免切换保留原连接：" + timedOutNode + "（" + result.OrigDelay + "ms）");
+                    string keepMsg = "原节点「" + CleanEmoji(timedOutNode) + "」已恢复（" + result.OrigDelay + "ms），无需切换";
+                    _nodesPage.SetLastFailoverSummary("最近复检 " + timeTag + "：原节点已恢复正常");
+                    SetStatus(keepMsg, Theme.Ok);
+                    return;
+                }
+
+                if (result.Ok && result.Sw != null && result.Sw.Ok)
                 {
                     _state.Outbound = result.Sw.NewOutbound;
                     _delayNode = result.Sw.NewOutbound;
-                    _delayMs = result.Best.LiveDelayMs;
+                    _delayMs = result.BestDelay;
                     _delayTimedOut = false;
+                    _delayTimeoutStreak = 0;
                     _delayAlertActive = false;
-                    _state.DelayMs = result.Best.LiveDelayMs;
+                    _state.DelayMs = result.BestDelay;
                     _state.NodeAlive = true;
                     _lastDelayTestAt = DateTime.UtcNow;
 
                     AuditLog.Record("FAILOVER",
-                        "当前节点超时（" + timedOutNode + "），自动切至备选低延迟节点：" +
-                        result.Sw.NewOutbound + "（" + result.Best.LiveDelayMs + "ms · 清理连接 " + result.Sw.ClosedConnections + " 条）");
-                    string msg = BuildFailoverNotifyText(CleanEmoji(timedOutNode), CleanEmoji(result.Sw.NewOutbound), result.Best.LiveDelayMs);
-                    _nodesPage.SetCurrentOutbound(result.Sw.NewOutbound, result.Best.LiveDelayMs, false, _state.ProxyActive);
+                        "当前节点超时（" + timedOutNode + "），自动切至已验证备选节点：" +
+                        result.Sw.NewOutbound + "（切后实测 " + result.BestDelay + "ms · 清理连接 " + result.Sw.ClosedConnections + " 条）");
+                    string msg = BuildFailoverNotifyText(CleanEmoji(timedOutNode), CleanEmoji(result.Sw.NewOutbound), result.BestDelay);
+                    _nodesPage.SetCurrentOutbound(result.Sw.NewOutbound, result.BestDelay, false, _state.ProxyActive);
                     _nodesPage.SetLastFailoverSummary("最近自动切换 " + timeTag + "：" + msg);
                     _qualityPage.SetCurrentOutbound(result.Sw.NewOutbound);
                     SetStatus(msg, Theme.Ok);
@@ -3280,17 +3422,18 @@ namespace ProxyPicker.UI
                     // 无论窗口在后台还是打开着，都主动弹系统托盘气泡通知用户，以免错过（用户要求）
                     if (TrayBalloon != null)
                         TrayBalloon("ProxyPicker 已自动切换节点", msg +
-                            (result.Sw.ClosedConnections > 0 ? ("\n已断开 " + result.Sw.ClosedConnections + " 条旧连接") : "\n已切换为备选低延迟节点"));
+                            (result.Sw.ClosedConnections > 0 ? ("\n已断开 " + result.Sw.ClosedConnections + " 条旧连接") : "\n切后实测可用"));
                     if (_nodesLoadedOnce) _ = LoadNodesCatalogAsync();
                 }
                 else
                 {
                     AuditLog.Record("FAILOVER", "自动切换未成功：" + result.Err);
                     _nodesPage.SetLastFailoverSummary("最近切换未成功 " + timeTag + "：" + result.Err);
-                    SetStatus("节点超时 · " + result.Err, Theme.Warn);
-                    Toast("备选节点均不可用", result.Err, Theme.Warn, 2);
+                    SetStatus((result.Unreachable ? "控制接口已断开 · " : "节点超时 · ") + result.Err, Theme.Warn);
+                    Toast(result.Unreachable ? "内核连接已断开" : "备选节点均未通过实测", result.Err, Theme.Warn, 2);
                     if (TrayBalloon != null)
-                        TrayBalloon("节点超时且备选不可用", result.Err);
+                        TrayBalloon(result.Unreachable ? "控制接口已断开" : "备选节点均不可用", result.Err);
+                    if (_nodesLoadedOnce) _ = LoadNodesCatalogAsync();
                 }
             }
             catch (Exception ex) { ReportFailure("自动切换备用节点", ex); }

@@ -364,7 +364,13 @@ namespace ProxyPicker.UI
                         "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
                     if (choice == DialogResult.Yes) { _exiting = false; _form.EndShutdown(); return; }
                 }
-                catch { }
+                catch
+                {
+                    // 对话框弹出异常时不能静默强杀未结束的后台还原，保守留在托盘并记一次状态提示
+                    _exiting = false;
+                    _form.EndShutdown();
+                    return;
+                }
             }
 
             _icon.Visible = false;

@@ -1536,6 +1536,7 @@ namespace ProxyPicker.Core
                     return true;
                 }
 
+                string readFp = ConfigFingerprint(currentCfg);
                 string text = File.ReadAllText(chosen, Encoding.UTF8);
                 if (text.IndexOf("<备份时已移除", StringComparison.Ordinal) >= 0)
                 {
@@ -1548,6 +1549,18 @@ namespace ProxyPicker.Core
                         return false;
                     }
                     text = RestoreSecretLine(text, secret);
+                }
+                // 推送前再复检一次配置指纹，防止刚才读取快照的瞬间用户正好在客户端更换了订阅。
+                string nowFp = ConfigFingerprint(currentCfg);
+                if (!string.Equals(readFp, nowFp, StringComparison.Ordinal))
+                {
+                    string cleanBack = BuildCleanRollbackPayload(currentCfg);
+                    if (cleanBack == null)
+                    {
+                        message = "还原过程中检测到客户端配置刚刚变更，且当前配置不可读；为避免旧备份覆盖新订阅，已停止推送";
+                        return false;
+                    }
+                    text = cleanBack;
                 }
                 var push = Mihomo.PushConfig(text, 15000, currentCfg);   // 收尾批 P2-1
                 if (!push.Ok)
@@ -1951,7 +1964,42 @@ namespace ProxyPicker.Core
             return r;
         }
 
-        /// <summary>调用 Clash `/proxies/{节点}/delay` 对当前真实代理出口做一次测速。</summary>
+        internal const string FallbackDelayTestUrl = "http://cp.cloudflare.com/generate_204";
+
+        /// <summary>判断是否使用内置/常见 204 测速接口，用以启用 expected=204 过滤返回错误页面的假活节点。</summary>
+        internal static bool ShouldUseExpected204(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return false;
+            return url.IndexOf("generate_204", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   url.IndexOf("gen_204", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        internal static string BuildDelayRequestPath(string node, string url, int budgetMs, bool includeExpected204)
+        {
+            string path = "/proxies/" + Uri.EscapeDataString(node ?? "") +
+                          "/delay?timeout=" + Math.Max(500, budgetMs) +
+                          "&url=" + Uri.EscapeDataString(url ?? "");
+            if (includeExpected204) path += "&expected=204";
+            return path;
+        }
+
+        /// <summary>判断测速结果是否属于可经短暂重试确认的瞬态故障（如单次超时或 500/502/503/504 抖动），排除内核断联与节点不存在。</summary>
+        internal static bool ShouldRetryDelayFailure(DelayResult r)
+        {
+            return r != null && !r.Ok && !r.KernelUnreachable && r.TimedOut;
+        }
+
+        /// <summary>为默认 gstatic 204 探测提供干净轻量备用 204 地址，防止单站点瞬时 503 误杀正常节点；自定义地址则原地址复测。</summary>
+        internal static string SelectConfirmDelayUrl(string primaryUrl)
+        {
+            string u = (primaryUrl ?? "").Trim();
+            if (u.Equals(Settings.Current.DelayTestUrl, StringComparison.OrdinalIgnoreCase) &&
+                u.IndexOf("gstatic.com", StringComparison.OrdinalIgnoreCase) >= 0)
+                return FallbackDelayTestUrl;
+            return u;
+        }
+
+        /// <summary>调用 Clash `/proxies/{节点}/delay` 对当前真实代理出口做一次测速（支持 expected=204 防假活，并在老内核不认参数时自动回退）。</summary>
         public static DelayResult MeasureDelay(string node, string testUrl = null, int timeoutMs = 0,
                                                string knownConfigPath = null)
         {
@@ -1970,11 +2018,41 @@ namespace ProxyPicker.Core
                 };
             }
 
-            string path = "/proxies/" + Uri.EscapeDataString(node) +
-                          "/delay?timeout=" + budget +
-                          "&url=" + Uri.EscapeDataString(url);
+            bool useExp = ShouldUseExpected204(url);
+            string path = BuildDelayRequestPath(node, url, budget, useExp);
             var res = Mihomo.FetchJson(path, budget + 2500, knownConfigPath);
+            if (useExp && res != null && !res.Ok && res.Status == 400)
+            {
+                // 兼容个别旧版内核不识别 expected 参数的情况，无缝退回标准请求格式
+                path = BuildDelayRequestPath(node, url, budget, false);
+                res = Mihomo.FetchJson(path, budget + 2500, knownConfigPath);
+            }
             return ParseDelayResponse(res, node, url, budget);
+        }
+
+        /// <summary>
+        /// 带确认重试的测速：主探测遇到 HTTP 503/502/504/超时等瞬态抖动时，短暂停顿并用备用 204/原地址复测一次，
+        /// 避免将仍正常可用的节点因单包波动或上游 503 误判为「超时断线」。
+        /// </summary>
+        public static DelayResult MeasureDelayConfirmed(string node, string testUrl = null, int timeoutMs = 0,
+                                                        string knownConfigPath = null)
+        {
+            DelayResult first = MeasureDelay(node, testUrl, timeoutMs, knownConfigPath);
+            if (!ShouldRetryDelayFailure(first)) return first;
+
+            System.Threading.Thread.Sleep(220);
+            string retryUrl = SelectConfirmDelayUrl(first.Url);
+            DelayResult second = MeasureDelay(node, retryUrl, timeoutMs, knownConfigPath);
+            if (second.Ok || second.KernelUnreachable) return second;
+
+            // 若二次复测换用了备用地址也失败、且错误更早指向 HTTP 503，再用原地址最后核对一次
+            if (!string.Equals(retryUrl, first.Url, StringComparison.OrdinalIgnoreCase))
+            {
+                System.Threading.Thread.Sleep(180);
+                DelayResult third = MeasureDelay(node, first.Url, timeoutMs, knownConfigPath);
+                if (third.Ok || third.KernelUnreachable) return third;
+            }
+            return second;
         }
 
         public sealed class KernelState

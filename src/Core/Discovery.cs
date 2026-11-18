@@ -273,8 +273,8 @@ namespace ProxyPicker.Core
                 }
                 else
                 {
-                    // 裸内核 / 自定义目录：只有明确叫 mihomo 或 clash 的进程才算。
-                    if (n == "mihomo" || n == "clash" || n.IndexOf("mihomo") == 0 || n.IndexOf("clash") == 0) return true;
+                    // 未识别出已知品牌目录时，仅匹配精确裸内核名，防止 Verge/Party 进程点亮无关旧 clash 目录。
+                    if (n == "mihomo" || n == "mihomo-alpha" || n == "clash") return true;
                 }
             }
             return false;
@@ -1163,9 +1163,12 @@ namespace ProxyPicker.Core
             {
                 while (p < lines.Length)
                 {
-                    string t = lines[p].Trim();
-                    if (t.Length == 0 || t.StartsWith("#", StringComparison.Ordinal) || t.StartsWith("-", StringComparison.Ordinal))
-                    { block.Add(lines[p]); p++; continue; }
+                    string rawLine = lines[p];
+                    string t = rawLine.Trim();
+                    bool indented = rawLine.Length > 0 && (rawLine[0] == ' ' || rawLine[0] == '\t');
+                    if (t.Length == 0 || t.StartsWith("#", StringComparison.Ordinal) ||
+                        t.StartsWith("-", StringComparison.Ordinal) || indented)
+                    { block.Add(rawLine); p++; continue; }
                     break;
                 }
             }
@@ -2897,6 +2900,33 @@ namespace ProxyPicker.Core
             }
             catch { pruneOk = false; }
             check("v2.2.2 NodesPage/QualityPage 订阅重载后按新节点目录清理已删节点缓存", pruneOk, "");
+
+            // v2.2.4 测速精确性/抗抖动/自动切换验证 + YAML 合并键 + UTF-16 JSON 代理对等综合回归
+            string mergeYaml = "mode: rule\nrules:\n  <<: *base_rules\n  - DOMAIN,example.com,DIRECT\nproxy-groups:\n  - name: Proxy\n";
+            string mergeOut = BuildPayload(mergeYaml, new[] { new Profile.Item("chrome.exe", "Proxy") }, "Proxy", false, "always");
+            int idxMerge = mergeOut.IndexOf("<<: *base_rules", StringComparison.Ordinal);
+            int idxEx = mergeOut.IndexOf("example.com,DIRECT", StringComparison.Ordinal);
+            int idxPg = mergeOut.IndexOf("proxy-groups:", StringComparison.Ordinal);
+
+            string p204 = Profile.BuildDelayRequestPath("node", "http://www.gstatic.com/generate_204", 3500, true);
+            var d503 = new Profile.DelayResult { Ok = false, TimedOut = true, Error = "HTTP 503" };
+            var dUnreach = new Profile.DelayResult { Ok = false, TimedOut = false, KernelUnreachable = true };
+            var surrObj = Json.AsObject(Json.Parse("{\"emo\":\"\\uD83D\\uDE00\",\"bad\":\"\\uD800\"}"));
+
+            check("v2.2.4 测速抗抖动/防假活/合并键规则与 JSON 代理对回归校验",
+                p204.IndexOf("&expected=204", StringComparison.Ordinal) > 0 &&
+                Profile.ShouldUseExpected204("http://www.gstatic.com/generate_204") &&
+                !Profile.ShouldUseExpected204("https://example.com") &&
+                Profile.ShouldRetryDelayFailure(d503) &&
+                !Profile.ShouldRetryDelayFailure(dUnreach) &&
+                Profile.SelectConfirmDelayUrl(Settings.Current.DelayTestUrl) != Settings.Current.DelayTestUrl &&
+                !ProxyPicker.UI.MainForm.ShouldTriggerFailoverAfterTimeout(false, 1, true, false) &&
+                ProxyPicker.UI.MainForm.ShouldTriggerFailoverAfterTimeout(false, 2, true, false) &&
+                ProxyPicker.UI.MainForm.ShouldTriggerFailoverAfterTimeout(true, 1, true, false) &&
+                !IsClientRunning(@"C:\Users\u\AppData\Roaming\custom-clash", new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "clash-verge" }) &&
+                idxMerge > 0 && idxEx > idxMerge && idxPg > idxEx &&
+                Json.Str(surrObj, "emo") == "\uD83D\uDE00" && Json.Str(surrObj, "bad") == "\uFFFD",
+                "");
 
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();

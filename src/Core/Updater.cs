@@ -95,6 +95,7 @@ namespace ProxyPicker.Core
                 req.UserAgent = "ProxyPicker/" + CurrentText;
                 req.Accept = "application/vnd.github+json";
                 req.KeepAlive = false;
+                req.AllowAutoRedirect = false;
                 req.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
 
                 using (var resp = (HttpWebResponse)req.GetResponse())
@@ -109,11 +110,13 @@ namespace ProxyPicker.Core
 
                     info.Ok = true;
                     info.Latest = Clean(tag);
-                    info.Url = Json.Str(root, "html_url");
+                    string rawHtmlUrl = Json.Str(root, "html_url") ?? "";
+                    string safeReleases = "https://github.com/" + RepoSlug + "/releases";
+                    info.Url = rawHtmlUrl.StartsWith(safeReleases, StringComparison.OrdinalIgnoreCase)
+                        ? rawHtmlUrl : safeReleases;
                     string published = Json.Str(root, "published_at");
                     if (published.Length >= 10) info.Date = published.Substring(0, 10);
                     info.Newer = NewerThan(info.Latest, Current);
-                    if (string.IsNullOrEmpty(info.Url)) info.Url = "https://github.com/" + RepoSlug + "/releases";
                 }
             }
             catch (WebException wex)

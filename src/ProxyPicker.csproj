@@ -19,9 +19,9 @@
     <Product>ProxyPicker</Product>
     <AssemblyTitle>ProxyPicker</AssemblyTitle>
     <Company>ProxyPicker</Company>
-    <Version>2.2.3</Version>
-    <FileVersion>2.2.3.0</FileVersion>
-    <AssemblyVersion>2.2.3.0</AssemblyVersion>
+    <Version>2.2.4</Version>
+    <FileVersion>2.2.4.0</FileVersion>
+    <AssemblyVersion>2.2.4.0</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>

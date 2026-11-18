@@ -171,8 +171,33 @@ namespace ProxyPicker.Core
                         int cp;
                         if (i + 4 > s.Length || !int.TryParse(s.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out cp))
                             throw new FormatException("JSON Unicode 转义无效");
-                        sb.Append((char)cp);
                         i += 4;
+                        char ch = (char)cp;
+                        if (char.IsHighSurrogate(ch))
+                        {
+                            // 若后紧跟 `\uXXXX` 低代理项，按完整标量验证并保留 UTF-16 代理对；孤立半代理替换成 U+FFFD 防产生非法字符串
+                            int cp2;
+                            if (i + 6 <= s.Length && s[i] == '\\' && s[i + 1] == 'u' &&
+                                int.TryParse(s.Substring(i + 2, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out cp2) &&
+                                char.IsLowSurrogate((char)cp2))
+                            {
+                                sb.Append(ch);
+                                sb.Append((char)cp2);
+                                i += 6;
+                            }
+                            else
+                            {
+                                sb.Append('\uFFFD');
+                            }
+                        }
+                        else if (char.IsLowSurrogate(ch))
+                        {
+                            sb.Append('\uFFFD');
+                        }
+                        else
+                        {
+                            sb.Append(ch);
+                        }
                         break;
                     default: throw new FormatException("JSON 转义无效");
                 }

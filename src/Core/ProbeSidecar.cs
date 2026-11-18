@@ -137,10 +137,12 @@ namespace ProxyPicker.Core
                 }
                 try
                 {
-                    string url = "/proxies/" + Uri.EscapeDataString(nodeName) +
-                                 "/delay?timeout=" + Math.Max(500, timeoutMs) +
-                                 "&url=" + Uri.EscapeDataString(Settings.DelayTestUrl);
+                    string testUrl = Settings.DelayTestUrl;
+                    bool useExp = Profile.ShouldUseExpected204(testUrl);
+                    string url = Profile.BuildDelayRequestPath(nodeName, testUrl, timeoutMs, useExp);
                     var res = HttpJson("GET", url, null, timeoutMs + 1500);
+                    if (useExp && res != null && !res.Ok && res.Status == 400)
+                        res = HttpJson("GET", Profile.BuildDelayRequestPath(nodeName, testUrl, timeoutMs, false), null, timeoutMs + 1500);
                     if (!res.Ok || res.Data == null)
                     {
                         error = string.IsNullOrEmpty(res.Error) ? ("HTTP " + res.Status + " / 超时") : res.Error;
@@ -163,10 +165,12 @@ namespace ProxyPicker.Core
                 if (_disposed || string.IsNullOrWhiteSpace(nodeName)) return -1;
                 try
                 {
-                    string url = "/proxies/" + Uri.EscapeDataString(nodeName) +
-                                 "/delay?timeout=" + Math.Max(500, timeoutMs) +
-                                 "&url=" + Uri.EscapeDataString(string.IsNullOrEmpty(testUrl) ? Settings.DelayTestUrl : testUrl);
+                    string target = string.IsNullOrEmpty(testUrl) ? Settings.DelayTestUrl : testUrl;
+                    bool useExp = Profile.ShouldUseExpected204(target);
+                    string url = Profile.BuildDelayRequestPath(nodeName, target, timeoutMs, useExp);
                     var res = HttpJson("GET", url, null, timeoutMs + 1500);
+                    if (useExp && res != null && !res.Ok && res.Status == 400)
+                        res = HttpJson("GET", Profile.BuildDelayRequestPath(nodeName, target, timeoutMs, false), null, timeoutMs + 1500);
                     if (!res.Ok || res.Data == null) return -1;
                     object dv;
                     if (res.Data.TryGetValue("delay", out dv) && dv is double)
@@ -460,10 +464,17 @@ namespace ProxyPicker.Core
             sb.Append("secret: ").Append(Json.Quote(secret ?? "")).Append('\n');
             sb.Append("profile:\n  store-selected: false\n");
             sb.Append("tun:\n  enable: false\n");
-            sb.Append("dns:\n  enable: false\n");
+            // 仅启用纯内核内置域名解析以兼容域名类节点/proxy-providers，不绑定系统/本地 DNS 监听端口
+            sb.Append("dns:\n  enable: true\n  enhanced-mode: normal\n  nameserver:\n    - 223.5.5.5\n    - 119.29.29.29\n");
 
             if (origYamlLines != null)
             {
+                string dataRootFull = "";
+                if (!string.IsNullOrEmpty(origDataDir))
+                {
+                    try { dataRootFull = Path.GetFullPath(origDataDir).TrimEnd('\\') + "\\"; }
+                    catch { dataRootFull = ""; }
+                }
                 bool keep = false;
                 bool inProviders = false;
                 foreach (var raw in origYamlLines)
@@ -481,8 +492,8 @@ namespace ProxyPicker.Core
                     }
                     if (!keep) continue;
 
-                    // 若 proxy-providers 中包含相对 path（如 ./proxy_providers/foo.yaml），重写为绝对路径以免沙箱找不到订阅文件
-                    if (inProviders && !string.IsNullOrEmpty(origDataDir))
+                    // 若 proxy-providers 中包含相对 path（如 ./proxy_providers/foo.yaml），重写为绝对路径以免沙箱找不到订阅文件，并拦截 `..` 越界逃逸
+                    if (inProviders && !string.IsNullOrEmpty(dataRootFull))
                     {
                         int pIdx = ln.IndexOf("path:", StringComparison.OrdinalIgnoreCase);
                         if (pIdx >= 0)
@@ -492,8 +503,13 @@ namespace ProxyPicker.Core
                             if (!string.IsNullOrEmpty(val) && !Path.IsPathRooted(val))
                             {
                                 string cleanRel = val.Replace('/', '\\').TrimStart('.', '\\');
-                                string abs = Path.GetFullPath(Path.Combine(origDataDir, cleanRel));
-                                ln = head + " " + Json.Quote(abs);
+                                try
+                                {
+                                    string abs = Path.GetFullPath(Path.Combine(dataRootFull, cleanRel));
+                                    if (abs.StartsWith(dataRootFull, StringComparison.OrdinalIgnoreCase))
+                                        ln = head + " " + Json.Quote(abs);
+                                }
+                                catch { }
                             }
                         }
                     }

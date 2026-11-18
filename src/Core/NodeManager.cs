@@ -190,7 +190,7 @@ namespace ProxyPicker.Core
         static readonly Regex RxHk = new Regex(@"(?<![A-Za-z])(?:HK|HKG)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxKr = new Regex(@"(?<![A-Za-z])(?:KR|KOR|ICN)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxGb = new Regex(@"(?<![A-Za-z])(?:UK|GB|GBR|LHR)(?![A-Za-z])", RegexOptions.IgnoreCase);
-        static readonly Regex RxDe = new Regex(@"(?<![A-Za-z])(?:DE|DEU|FRA)(?![A-Za-z])", RegexOptions.IgnoreCase);
+        static readonly Regex RxDe = new Regex(@"(?<![A-Za-z])(?:DE|DEU)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxCa = new Regex(@"(?<![A-Za-z])(?:CA|CAN|YYZ|YVR)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxAu = new Regex(@"(?<![A-Za-z])(?:AU|AUS|SYD|MEL)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxFr = new Regex(@"(?<![A-Za-z])(?:FR|FRA|CDG)(?![A-Za-z])", RegexOptions.IgnoreCase);
@@ -542,6 +542,42 @@ namespace ProxyPicker.Core
             return best;
         }
 
+        /// <summary>按「延迟优先、同延迟优先匹配期望地区」排序返回所有可用故障切换候选（供上层顺序复核与切后验真）。</summary>
+        public static List<ProxyNodeInfo> RankFailoverCandidates(
+            IList<ProxyNodeInfo> nodes,
+            string currentTimedOutNode,
+            string preferredRegion = null)
+        {
+            var list = new List<ProxyNodeInfo>();
+            if (nodes == null || nodes.Count == 0) return list;
+            string pref = (preferredRegion ?? "").Trim().ToUpperInvariant();
+            if (pref == "AUTO" || pref == "ANY") pref = "";
+
+            foreach (var n in nodes)
+            {
+                if (n == null || n.IsGroup || !n.IsCandidate) continue;
+                if (!string.IsNullOrEmpty(currentTimedOutNode) &&
+                    string.Equals(n.Name, currentTimedOutNode, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (n.LiveDelayMs <= 0) continue;
+                list.Add(n);
+            }
+
+            list.Sort((a, b) =>
+            {
+                int cmp = a.LiveDelayMs.CompareTo(b.LiveDelayMs);
+                if (cmp != 0) return cmp;
+                if (pref.Length == 2)
+                {
+                    bool ap = string.Equals(a.ExpectedRegion, pref, StringComparison.OrdinalIgnoreCase);
+                    bool bp = string.Equals(b.ExpectedRegion, pref, StringComparison.OrdinalIgnoreCase);
+                    if (ap != bp) return ap ? -1 : 1;
+                }
+                return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            });
+            return list;
+        }
+
         /// <summary>
         /// 通过 Mihomo PUT /proxies/{group} 切换节点，并可选断开卡死在旧节点上的连接。
         /// 严格复用 knownConfigPath 遵守监听器与跨配置安全边界。
@@ -666,6 +702,20 @@ namespace ProxyPicker.Core
             Action<ProxyNodeInfo> onEachDone,
             string knownConfigPath = null)
         {
+            bool unreachable;
+            return BatchMeasureNodes(targets, perNodeTimeoutMs, shouldCancel, onEachDone, knownConfigPath, out unreachable);
+        }
+
+        /// <summary>顺序批量测速指定节点列表（带取消、内核失联标志与状态清理），不抢占保存事务。</summary>
+        public static List<ProxyNodeInfo> BatchMeasureNodes(
+            IList<ProxyNodeInfo> targets,
+            int perNodeTimeoutMs,
+            Func<bool> shouldCancel,
+            Action<ProxyNodeInfo> onEachDone,
+            string knownConfigPath,
+            out bool kernelUnreachable)
+        {
+            kernelUnreachable = false;
             var results = new List<ProxyNodeInfo>();
             if (targets == null || targets.Count == 0) return results;
             string cfgPath = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
@@ -679,6 +729,10 @@ namespace ProxyPicker.Core
                 var d = Profile.MeasureDelay(node.Name, Settings.DelayTestUrl, budget, cfgPath);
                 if (d.KernelUnreachable)
                 {
+                    kernelUnreachable = true;
+                    // 内核失联时同步将当前项标为失效（-2 / false），避免 UI 继续显示测前遗留的绿字旧延迟
+                    node.LiveDelayMs = -2;
+                    node.Alive = false;
                     node.LastError = d.Error;
                     results.Add(node);
                     if (onEachDone != null) onEachDone(node);
@@ -703,6 +757,58 @@ namespace ProxyPicker.Core
             return results;
         }
 
+        /// <summary>并发预筛自动切换候选池（控制度 4），大幅缩短大量超时节点引起的阻塞延迟窗口。</summary>
+        public static bool BatchMeasureFailoverPool(
+            IList<ProxyNodeInfo> pool,
+            int perNodeTimeoutMs,
+            Func<bool> shouldCancel,
+            string knownConfigPath)
+        {
+            if (pool == null || pool.Count == 0) return false;
+            string cfgPath = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
+            int budget = Math.Max(2000, Math.Min(4500, perNodeTimeoutMs));
+            int hitUnreachable = 0;
+
+            System.Threading.Tasks.Parallel.ForEach(
+                pool,
+                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 4 },
+                (node, state) =>
+                {
+                    if (node == null || node.IsGroup) return;
+                    if (System.Threading.Volatile.Read(ref hitUnreachable) != 0 ||
+                        (shouldCancel != null && shouldCancel()))
+                    {
+                        state.Stop();
+                        return;
+                    }
+
+                    var d = Profile.MeasureDelay(node.Name, Settings.DelayTestUrl, budget, cfgPath);
+                    if (d.KernelUnreachable)
+                    {
+                        System.Threading.Interlocked.Exchange(ref hitUnreachable, 1);
+                        node.LiveDelayMs = -2;
+                        node.Alive = false;
+                        node.LastError = d.Error;
+                        state.Stop();
+                        return;
+                    }
+                    if (d.Ok && d.DelayMs > 0)
+                    {
+                        node.LiveDelayMs = d.DelayMs;
+                        node.HistoryDelayMs = d.DelayMs;
+                        node.Alive = true;
+                        node.LastError = "";
+                    }
+                    else
+                    {
+                        node.LiveDelayMs = -2;
+                        node.Alive = false;
+                        node.LastError = d.Error ?? "超时";
+                    }
+                });
+            return hitUnreachable != 0;
+        }
+
         // ---------------------------------------------------------------- 自检
 
         public static string SelfTest()
@@ -715,17 +821,27 @@ namespace ProxyPicker.Core
                 else { fail++; sb.AppendLine("FAIL  " + name + (string.IsNullOrEmpty(detail) ? "" : " | " + detail)); }
             };
 
-            // 1. Region tag parsing without substring false positives
-            check("NM1 节点名地区解析（日本/美国/新加坡/台湾/香港/韩国/假阳性拦截）",
+            // 1. Region tag parsing without substring false positives (含法国 FRA vs 德国法兰克福消歧)
+            check("NM1 节点名地区解析（日本/美国/新加坡/台湾/香港/韩国/法德FRA消歧/假阳性拦截）",
                 ParseRegionFromNodeName("🇯🇵日本-B(流量)") == "JP" &&
                 ParseRegionFromNodeName("🇺🇸 LosAngeles VLESS 02") == "US" &&
                 ParseRegionFromNodeName("🇸🇬 狮城 SG-01") == "SG" &&
                 ParseRegionFromNodeName("台北 TW-Relay") == "TW" &&
                 ParseRegionFromNodeName("HK-BGP-03") == "HK" &&
                 ParseRegionFromNodeName("🇰🇷 首尔 KR1") == "KR" &&
+                ParseRegionFromNodeName("🇫🇷 法国 FRA") == "FR" &&
+                ParseRegionFromNodeName("FRA-01") == "FR" &&
+                ParseRegionFromNodeName("🇩🇪 法兰克福 01") == "DE" &&
+                ParseRegionFromNodeName("德国 FRA-BGP") == "DE" &&
+                ParseRegionFromNodeName("Frankfurt-01") == "DE" &&
+                ParseRegionFromNodeName("🇬🇧 伦敦 UK1") == "GB" &&
+                ParseRegionFromNodeName("🇦🇺 悉尼 AU1") == "AU" &&
                 ParseRegionFromNodeName("Focus-VIP-01") == "" &&
                 ParseRegionFromNodeName("Russia-MOW") == "RU",
-                "Focus=" + ParseRegionFromNodeName("Focus-VIP-01") + " RU=" + ParseRegionFromNodeName("Russia-MOW"));
+                "Focus=" + ParseRegionFromNodeName("Focus-VIP-01") +
+                " RU=" + ParseRegionFromNodeName("Russia-MOW") +
+                " FRA01=" + ParseRegionFromNodeName("FRA-01") +
+                " DE_FRA=" + ParseRegionFromNodeName("德国 FRA-BGP"));
 
             // 2. Proxies catalog & switchable selector discovery (nested PP-FIXED -> 主组)
             string mockJson = @"{
@@ -772,9 +888,18 @@ namespace ProxyPicker.Core
                 new ProxyNodeInfo { Name = "🇯🇵日本-C", IsCandidate = true, LiveDelayMs = 92, ExpectedRegion = "JP" }
             };
             var picked = PickBestFailoverCandidate(candList, "🇯🇵日本-A", "US");
-            check("NM4 Failover 严格只从勾选备选池选最低延迟活节点并跳过当前节点",
-                picked != null && picked.Name == "🇯🇵日本-C",
-                "picked=" + (picked == null ? "null" : picked.Name));
+            var sameDelayTie = new List<ProxyNodeInfo>
+            {
+                new ProxyNodeInfo { Name = "🇯🇵日本-1", IsCandidate = true, LiveDelayMs = 100, ExpectedRegion = "JP" },
+                new ProxyNodeInfo { Name = "🇫🇷 法国 FRA-01", IsCandidate = true, LiveDelayMs = 100, ExpectedRegion = ParseRegionFromNodeName("🇫🇷 法国 FRA-01") }
+            };
+            var tiePickedFr = PickBestFailoverCandidate(sameDelayTie, "其他", "FR");
+            var ranked = RankFailoverCandidates(candList, "🇯🇵日本-A", "US");
+            check("NM4 Failover 严格只从勾选备选池选最低延迟活节点并跳过当前节点（同延迟优选期望地区 + 候选有序排列）",
+                picked != null && picked.Name == "🇯🇵日本-C" &&
+                tiePickedFr != null && tiePickedFr.Name == "🇫🇷 法国 FRA-01" &&
+                ranked.Count == 2 && ranked[0].Name == "🇯🇵日本-C" && ranked[1].Name == "🇺🇸美国-B",
+                "picked=" + (picked == null ? "null" : picked.Name) + " tie=" + (tiePickedFr == null ? "null" : tiePickedFr.Name));
 
             var noneAlive = PickBestFailoverCandidate(new List<ProxyNodeInfo>
             {
