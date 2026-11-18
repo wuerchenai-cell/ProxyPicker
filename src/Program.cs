@@ -44,7 +44,7 @@ namespace ProxyPicker
         }
 
         /// <summary>认识的开关白名单；拼错时不能悄悄打开图形界面（复审 P3）。</summary>
-        const string KnownFlags = "|--scan|--dryrun|--payload|--apply|--restore|--list|--checkupdate|--version|--selftest|--raw|--pipes|--api|--audit|--diag|--cleanlegacy|";
+        internal const string KnownFlags = "|--scan|--dryrun|--payload|--apply|--restore|--list|--checkupdate|--version|--selftest|--raw|--pipes|--api|--audit|--diag|--delay|--nodecheck|--cleanlegacy|";
 
         /// <summary>各命令行开关至少需要几个参数（含开关本身）。</summary>
         static int MinArgs(string flag)
@@ -110,23 +110,27 @@ namespace ProxyPicker
             // 用法：--scan <输出.txt>。不结束、不重启任何进程，不改任何配置。
             if (args.Length >= 2 && args[0] == "--scan")
             {
-                var procs = Core.Scanner.Scan();
-                var scan = new StringBuilder();
-                scan.AppendLine("进程识别摘要 · 共 " + procs.Count + " 种 exe");
-                int conflicts = 0, withPeers = 0;
-                foreach (var kv in procs)
+                try
                 {
-                    var p = kv.Value;
-                    if (p.NameConflict) conflicts++;
-                    if (p.DirPeers.Count > 0) withPeers++;
-                    scan.AppendLine(kv.Key + "  进程 " + p.Count + " · 路径 " + p.AllPaths.Count
-                        + " · 相关 " + string.Join(",", p.DirPeers.ToArray())
-                        + (p.TreePeers.Count > 0 ? " · 安装目录内 " + string.Join(",", p.TreePeers.ToArray()) : ""));
-                    foreach (string path in p.AllPaths) scan.AppendLine("    " + path);
+                    var procs = Core.Scanner.Scan();
+                    var scan = new StringBuilder();
+                    scan.AppendLine("进程识别摘要 · 共 " + procs.Count + " 种 exe");
+                    int conflicts = 0, withPeers = 0;
+                    foreach (var kv in procs)
+                    {
+                        var p = kv.Value;
+                        if (p.NameConflict) conflicts++;
+                        if (p.DirPeers.Count > 0) withPeers++;
+                        scan.AppendLine(kv.Key + "  进程 " + p.Count + " · 路径 " + p.AllPaths.Count
+                            + " · 相关 " + string.Join(",", p.DirPeers.ToArray())
+                            + (p.TreePeers.Count > 0 ? " · 安装目录内 " + string.Join(",", p.TreePeers.ToArray()) : ""));
+                        foreach (string path in p.AllPaths) scan.AppendLine("    " + path);
+                    }
+                    scan.AppendLine();
+                    scan.AppendLine("同名冲突 " + conflicts + " 个 · 有同目录相关进程 " + withPeers + " 个");
+                    File.WriteAllText(args[1], Core.Redactor.Apply(scan.ToString()), new UTF8Encoding(false));
                 }
-                scan.AppendLine();
-                scan.AppendLine("同名冲突 " + conflicts + " 个 · 有同目录相关进程 " + withPeers + " 个");
-                File.WriteAllText(args[1], Core.Redactor.Apply(scan.ToString()), new UTF8Encoding(false));
+                catch (Exception ex) { CliFailure(args[1], ex); }
                 return;
             }
 
@@ -365,7 +369,8 @@ namespace ProxyPicker
                 try
                 {
                     string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest()
-                                  + Core.Traffic.SelfTest();
+                                  + Core.Traffic.SelfTest() + Core.NodeManager.SelfTest()
+                                  + Core.NodeQuality.SelfTest() + Core.ProbeSidecar.SelfTest();
                     System.IO.File.WriteAllText(args[1], result, new System.Text.UTF8Encoding(false));
                     if (result.Contains("FAIL  ")) Environment.ExitCode = 1;
                 }
@@ -498,7 +503,7 @@ namespace ProxyPicker
                     string msg;
                     bool ok = Core.Profile.LeaveNoTrace(out msg);
                     File.WriteAllText(args[1],
-                        "ok=" + ok + "\nmsg=" + (ok ? "已撤掉内核里的规则块（IPv6 也已恢复）" : msg),
+                        Core.Redactor.Apply("ok=" + ok + "\nmsg=" + (ok ? "已撤掉内核里的规则块（IPv6 也已恢复）" : msg)),
                         new System.Text.UTF8Encoding(false));
                     if (!ok) Environment.ExitCode = 1;
                 }
@@ -514,6 +519,72 @@ namespace ProxyPicker
                 try
                 {
                     System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(Core.Discovery.Diagnose()), new System.Text.UTF8Encoding(false));
+                }
+                catch (Exception ex)
+                {
+                    CliFailure(args[1], ex);
+                }
+                return;
+            }
+
+            // 只读节点质量/风控体检出口：探测当前节点延迟抖动、丢包、落地地区、IP 风控分与 Antigravity 可用性。
+            if (args.Length >= 2 && args[0] == "--nodecheck")
+            {
+                try
+                {
+                    string cfg = Core.Discovery.Detect().ConfigPath;
+                    var cat = Core.NodeManager.LoadCatalog(cfg);
+                    var st = Core.Profile.ReadKernelState(cfg);
+                    string target = !string.IsNullOrEmpty(cat.CurrentOutbound) ? cat.CurrentOutbound : st.Outbound;
+                    var rep = Core.NodeQuality.RunQualityProbe(target, Core.Settings.DesiredRegion, false, cfg);
+                    var sb = new StringBuilder();
+                    sb.AppendLine("policy=" + cat.PolicyName);
+                    sb.AppendLine("group=" + cat.GroupName);
+                    sb.AppendLine("outbound=" + rep.TargetNode);
+                    sb.AppendLine("nodesTotal=" + cat.Nodes.Count);
+                    sb.AppendLine("autoFailover=" + Core.Settings.AutoFailover);
+                    sb.AppendLine("candidates=" + Core.Settings.GetCandidateNodes().Count);
+                    sb.AppendLine("tun=" + rep.TunEnabled + " stack=" + rep.TunStack + " mode=" + rep.KernelMode + " ipv6=" + rep.KernelIpv6On);
+                    sb.AppendLine("avgMs=" + rep.Net.AvgMs + " jitterMs=" + rep.Net.JitterMs + " lossPct=" + rep.Net.LossPercent);
+                    sb.AppendLine("routedDirect=" + rep.RoutedDirect + " ipv6Checked=" + rep.Ipv6LeakChecked + " ipv6Leak=" + rep.DirectIpv6Leak);
+                    sb.AppendLine("country=" + rep.CountryCode + " city=" + rep.City + " asn=" + rep.Asn + " isp=" + rep.Isp);
+                    sb.AppendLine("regionMatched=" + rep.RegionMatched + " regionNote=" + rep.RegionNote);
+                    sb.AppendLine("riskScore=" + rep.RiskScore + " level=" + rep.Level + " ipKind=" + rep.IpKindLabel);
+                    sb.AppendLine("googleAiUsable=" + rep.GoogleAiUsable + " mainstreamReady=" + rep.MainstreamReadyCount + "/4");
+                    sb.AppendLine("gateGoogle=" + rep.GoogleSearch.Ok + " (" + rep.GoogleSearch.StatusCode + ": " + rep.GoogleSearch.Detail + ")");
+                    sb.AppendLine("gateGoogleAI=" + rep.GeminiApi.Ok + " (" + rep.GeminiApi.StatusCode + ": " + rep.GeminiApi.Detail + ")");
+                    sb.AppendLine("gateOpenAI=" + rep.OpenAiApi.Ok + " (" + rep.OpenAiApi.StatusCode + ": " + rep.OpenAiApi.Detail + ")");
+                    sb.AppendLine("gateClaude=" + rep.ClaudeApi.Ok + " (" + rep.ClaudeApi.StatusCode + ": " + rep.ClaudeApi.Detail + ")");
+                    sb.AppendLine("gateCloudflare=" + rep.Cloudflare.Ok + " colo=" + rep.CfColo + " (" + rep.Cloudflare.Detail + ")");
+                    sb.AppendLine("verdict=" + rep.VerdictTitle + " | " + rep.VerdictDetail);
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(sb.ToString()), new System.Text.UTF8Encoding(false));
+                }
+                catch (Exception ex)
+                {
+                    CliFailure(args[1], ex);
+                }
+                return;
+            }
+
+            // 只读测速出口：检测当前策略链路与真实代理出口节点延迟，写入报告文件（不改动任何配置）。
+            if (args.Length >= 2 && args[0] == "--delay")
+            {
+                try
+                {
+                    string cfg = Core.Discovery.Detect().ConfigPath;
+                    var st = Core.Profile.ReadKernelState(cfg);
+                    var d = Core.Profile.MeasureDelay(st.Outbound, null, 0, cfg);
+                    var sb = new StringBuilder();
+                    sb.AppendLine("policy=" + st.Policy);
+                    sb.AppendLine("outbound=" + st.Outbound);
+                    sb.AppendLine("chain=" + st.Chain);
+                    sb.AppendLine("ok=" + d.Ok);
+                    sb.AppendLine("timedOut=" + d.TimedOut);
+                    sb.AppendLine("kernelUnreachable=" + d.KernelUnreachable);
+                    sb.AppendLine("delayMs=" + d.DelayMs);
+                    if (!string.IsNullOrEmpty(d.Error)) sb.AppendLine("error=" + d.Error);
+                    System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(sb.ToString()), new System.Text.UTF8Encoding(false));
+                    if (!d.Ok) Environment.ExitCode = 1;
                 }
                 catch (Exception ex)
                 {

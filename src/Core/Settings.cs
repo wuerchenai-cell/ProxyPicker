@@ -66,6 +66,18 @@ namespace ProxyPicker.Core
             // 后台看守下一轮会把它补回来。置位后看守暂停自动补回，等用户下次
             // 主动保存（或手动删掉名单文件）再恢复。v1.3.7。
             public bool RepairSuspended;
+            // v1.4.0：定期向 Clash /proxies/{节点}/delay 测速的间隔与超时阈值，
+            // 延迟超阈值或测速超时时及时提醒用户切换节点。
+            public int DelayCheckSeconds = 60;
+            public int DelayTimeoutMs = 5000;
+            public string DelayTestUrl = "http://www.gstatic.com/generate_204";
+            // v1.5.0：节点备选池、超时自动切换最低延迟节点、以及预期落地地区校验。
+            public bool AutoFailover;
+            public string DesiredRegion = "auto";
+            public List<string> CandidateNodes = new List<string>();
+            // v2.1.0：记住用户拖拽调整的窗口逻辑宽高（默认 880×600，最小兼容最初版 466 宽度）
+            public int WinW = 880;
+            public int WinH = 600;
         }
 
         static Data _data;
@@ -253,6 +265,7 @@ namespace ProxyPicker.Core
         {
             string key = SourceKey(knownConfigPath);
             if (key.Length == 0) return;
+            bool changed = false;
             lock (Gate)
             {
                 var d = Current;
@@ -261,18 +274,25 @@ namespace ProxyPicker.Core
                 {
                     d.Ipv6Original = "";
                     d.FindProcessOriginal = "";
+                    changed = true;
                 }
-                d.RestoreSource = key;
+                if (!string.Equals(d.RestoreSource, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    d.RestoreSource = key;
+                    changed = true;
+                }
             }
-            Save();
+            if (changed) Save();
         }
 
-        /// <summary>从磁盘订阅文本里读 find-process-mode；没有这一行返回 "absent"，传 null 返回 null。</summary>
+        /// <summary>从磁盘订阅文本里读顶层 find-process-mode；没有这一行返回 "absent"，传 null 返回 null。</summary>
         internal static string ParseFindProcessFromYaml(string yaml)
         {
             if (yaml == null) return null;
             foreach (var raw in yaml.Replace("\r\n", "\n").Split('\n'))
             {
+                // 只看顶格键：缩进子节（如 sniffer / tun / sub）里的同名键不能覆盖顶层设置。
+                if (raw.Length > 0 && (raw[0] == ' ' || raw[0] == '\t')) continue;
                 string t = raw.Trim();
                 if (t.StartsWith("find-process-mode:", StringComparison.OrdinalIgnoreCase))
                 {
@@ -427,6 +447,96 @@ namespace ProxyPicker.Core
         /// 锁内先取一份不可变快照再序列化；UI 同时改排序/集合时不会写坏文件（评审 R6-9）。
         /// 返回是否真的写成功，调用方可以据此提示失败，而不是假装成功。
         /// </summary>
+        static void AppendStringArray(StringBuilder sb, string key, IEnumerable<string> items)
+        {
+            sb.Append("  ").Append(Json.Quote(key)).Append(": [");
+            int n = 0;
+            foreach (var v in items)
+            {
+                if (n++ > 0) sb.Append(", ");
+                sb.Append(Json.Quote(v));
+            }
+            sb.Append("]");
+        }
+
+        internal static string SerializeData(Data d)
+        {
+            string sortMode = d.SortMode, mode = d.Mode, ipv6Original = d.Ipv6Original ?? "";
+            string findProcessOriginal = d.FindProcessOriginal ?? "";
+            string restoreSource = d.RestoreSource ?? "";
+            string latestVersion = d.LatestVersion ?? "", latestUrl = d.LatestUrl ?? "";
+            int tab = d.Tab;
+            long checkedAt = d.UpdateCheckedAt;
+            bool firstRun = d.FirstRun, trayHint = d.TrayHintShown,
+                 updateCheck = d.UpdateCheck, ipv6Guard = d.Ipv6Guard,
+                 loginWindowProxy = d.LoginWindowProxy,
+                 repairSuspended = d.RepairSuspended,
+                 autoFailover = d.AutoFailover;
+            int delayCheckSeconds = ClampDelayCheckSeconds(d.DelayCheckSeconds);
+            int delayTimeoutMs = ClampDelayTimeoutMs(d.DelayTimeoutMs);
+            string delayTestUrl = NormalizeDelayUrl(d.DelayTestUrl);
+            string desiredRegion = NormalizeDesiredRegion(d.DesiredRegion);
+            int winW = ClampWindowW(d.WinW);
+            int winH = ClampWindowH(d.WinH);
+            var order = new List<string>(d.Order);
+            var usage = new Dictionary<string, int>(d.Usage, StringComparer.OrdinalIgnoreCase);
+            var lastUsed = new Dictionary<string, long>(d.LastUsed, StringComparer.OrdinalIgnoreCase);
+            var hidden = new List<string>(d.Hidden);
+            var custom = new List<string>(d.Custom);
+            var candidateNodes = new List<string>(d.CandidateNodes);
+
+            var sb = new StringBuilder();
+            sb.Append("{\n");
+            sb.Append("  \"sortMode\": ").Append(Json.Quote(sortMode)).Append(",\n");
+            sb.Append("  \"mode\": ").Append(Json.Quote(mode)).Append(",\n");
+            sb.Append("  \"tab\": ").Append(tab).Append(",\n");
+            sb.Append("  \"firstRun\": ").Append(firstRun ? "true" : "false").Append(",\n");
+            sb.Append("  \"trayHintShown\": ").Append(trayHint ? "true" : "false").Append(",\n");
+            sb.Append("  \"updateCheck\": ").Append(updateCheck ? "true" : "false").Append(",\n");
+            sb.Append("  \"updateCheckedAt\": ").Append(checkedAt).Append(",\n");
+            sb.Append("  \"updateLastOk\": ").Append(d.UpdateLastOk ? "true" : "false").Append(",\n");
+            sb.Append("  \"latestVersion\": ").Append(Json.Quote(latestVersion)).Append(",\n");
+            sb.Append("  \"latestUrl\": ").Append(Json.Quote(latestUrl)).Append(",\n");
+            sb.Append("  \"ipv6Guard\": ").Append(ipv6Guard ? "true" : "false").Append(",\n");
+            sb.Append("  \"ipv6Original\": ").Append(Json.Quote(ipv6Original)).Append(",\n");
+            sb.Append("  \"findProcessOriginal\": ").Append(Json.Quote(findProcessOriginal)).Append(",\n");
+            sb.Append("  \"restoreSource\": ").Append(Json.Quote(restoreSource)).Append(",\n");
+            sb.Append("  \"loginWindowProxy\": ").Append(loginWindowProxy ? "true" : "false").Append(",\n");
+            sb.Append("  \"repairSuspended\": ").Append(repairSuspended ? "true" : "false").Append(",\n");
+            sb.Append("  \"delayCheckSeconds\": ").Append(delayCheckSeconds).Append(",\n");
+            sb.Append("  \"delayTimeoutMs\": ").Append(delayTimeoutMs).Append(",\n");
+            sb.Append("  \"delayTestUrl\": ").Append(Json.Quote(delayTestUrl)).Append(",\n");
+            sb.Append("  \"autoFailover\": ").Append(autoFailover ? "true" : "false").Append(",\n");
+            sb.Append("  \"desiredRegion\": ").Append(Json.Quote(desiredRegion)).Append(",\n");
+            sb.Append("  \"winW\": ").Append(winW).Append(",\n");
+            sb.Append("  \"winH\": ").Append(winH).Append(",\n");
+
+            AppendStringArray(sb, "order", order); sb.Append(",\n");
+
+            sb.Append("  \"usage\": {");
+            int n = 0;
+            foreach (var kv in usage)
+            {
+                if (n++ > 0) sb.Append(", ");
+                sb.Append(Json.Quote(kv.Key)).Append(": ").Append(kv.Value);
+            }
+            sb.Append("},\n");
+
+            sb.Append("  \"lastUsed\": {");
+            n = 0;
+            foreach (var kv in lastUsed)
+            {
+                if (n++ > 0) sb.Append(", ");
+                sb.Append(Json.Quote(kv.Key)).Append(": ").Append(kv.Value);
+            }
+            sb.Append("},\n");
+
+            AppendStringArray(sb, "hidden", hidden); sb.Append(",\n");
+            AppendStringArray(sb, "custom", custom); sb.Append(",\n");
+            AppendStringArray(sb, "candidateNodes", candidateNodes); sb.Append("\n}\n");
+            return sb.ToString();
+        }
+
         public static bool Save()
         {
             lock (Gate)
@@ -435,89 +545,10 @@ namespace ProxyPicker.Core
                 string temp = null;
                 try
                 {
-                    var d = _data;
-                    string sortMode = d.SortMode, mode = d.Mode, ipv6Original = d.Ipv6Original ?? "";
-                    string findProcessOriginal = d.FindProcessOriginal ?? "";
-                    string restoreSource = d.RestoreSource ?? "";
-                    string latestVersion = d.LatestVersion ?? "", latestUrl = d.LatestUrl ?? "";
-                    int tab = d.Tab;
-                    long checkedAt = d.UpdateCheckedAt;
-                    bool firstRun = d.FirstRun, trayHint = d.TrayHintShown,
-                         updateCheck = d.UpdateCheck, ipv6Guard = d.Ipv6Guard,
-                         loginWindowProxy = d.LoginWindowProxy,
-                         repairSuspended = d.RepairSuspended;
-                    var order = new List<string>(d.Order);
-                    var usage = new Dictionary<string, int>(d.Usage, StringComparer.OrdinalIgnoreCase);
-                    var lastUsed = new Dictionary<string, long>(d.LastUsed, StringComparer.OrdinalIgnoreCase);
-                    var hidden = new List<string>(d.Hidden);
-                    var custom = new List<string>(d.Custom);
-
-                    var sb = new StringBuilder();
-                    sb.Append("{\n");
-                    sb.Append("  \"sortMode\": ").Append(Json.Quote(sortMode)).Append(",\n");
-                    sb.Append("  \"mode\": ").Append(Json.Quote(mode)).Append(",\n");
-                    sb.Append("  \"tab\": ").Append(tab).Append(",\n");
-                    sb.Append("  \"firstRun\": ").Append(firstRun ? "true" : "false").Append(",\n");
-                    sb.Append("  \"trayHintShown\": ").Append(trayHint ? "true" : "false").Append(",\n");
-                    sb.Append("  \"updateCheck\": ").Append(updateCheck ? "true" : "false").Append(",\n");
-                    sb.Append("  \"updateCheckedAt\": ").Append(checkedAt).Append(",\n");
-                    sb.Append("  \"updateLastOk\": ").Append(d.UpdateLastOk ? "true" : "false").Append(",\n");
-                    sb.Append("  \"latestVersion\": ").Append(Json.Quote(latestVersion)).Append(",\n");
-                    sb.Append("  \"latestUrl\": ").Append(Json.Quote(latestUrl)).Append(",\n");
-                    sb.Append("  \"ipv6Guard\": ").Append(ipv6Guard ? "true" : "false").Append(",\n");
-                    sb.Append("  \"ipv6Original\": ").Append(Json.Quote(ipv6Original)).Append(",\n");
-                    sb.Append("  \"findProcessOriginal\": ").Append(Json.Quote(findProcessOriginal)).Append(",\n");
-                    sb.Append("  \"restoreSource\": ").Append(Json.Quote(restoreSource)).Append(",\n");
-                    sb.Append("  \"loginWindowProxy\": ").Append(loginWindowProxy ? "true" : "false").Append(",\n");
-                    sb.Append("  \"repairSuspended\": ").Append(repairSuspended ? "true" : "false").Append(",\n");
-
-                    sb.Append("  \"order\": [");
-                    for (int i = 0; i < order.Count; i++)
-                    {
-                        if (i > 0) sb.Append(", ");
-                        sb.Append(Json.Quote(order[i]));
-                    }
-                    sb.Append("],\n");
-
-                    sb.Append("  \"usage\": {");
-                    int n = 0;
-                    foreach (var kv in usage)
-                    {
-                        if (n++ > 0) sb.Append(", ");
-                        sb.Append(Json.Quote(kv.Key)).Append(": ").Append(kv.Value);
-                    }
-                    sb.Append("},\n");
-
-                    sb.Append("  \"lastUsed\": {");
-                    n = 0;
-                    foreach (var kv in lastUsed)
-                    {
-                        if (n++ > 0) sb.Append(", ");
-                        sb.Append(Json.Quote(kv.Key)).Append(": ").Append(kv.Value);
-                    }
-                    sb.Append("},\n");
-
-                    sb.Append("  \"hidden\": [");
-                    n = 0;
-                    foreach (var v in hidden)
-                    {
-                        if (n++ > 0) sb.Append(", ");
-                        sb.Append(Json.Quote(v));
-                    }
-                    sb.Append("],\n");
-
-                    sb.Append("  \"custom\": [");
-                    n = 0;
-                    foreach (var v in custom)
-                    {
-                        if (n++ > 0) sb.Append(", ");
-                        sb.Append(Json.Quote(v));
-                    }
-                    sb.Append("]\n}\n");
-
+                    string json = SerializeData(_data);
                     string path = FilePath;
                     temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                    byte[] bytes = new UTF8Encoding(false).GetBytes(sb.ToString());
+                    byte[] bytes = new UTF8Encoding(false).GetBytes(json);
                     using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
                     {
                         stream.Write(bytes, 0, bytes.Length);
@@ -557,86 +588,7 @@ namespace ProxyPicker.Core
                 if (new FileInfo(path).Length > 1024 * 1024)
                     throw new FormatException("偏好文件超过 1 MiB，未加载");
                 var root = Json.AsObject(Json.Parse(File.ReadAllText(path, Encoding.UTF8)));
-                if (root == null) throw new FormatException("偏好必须是 JSON 对象");
-
-                // 已有配置文件才是「老用户」：缺 mode 字段是 v1.0.x 以前留下的配置，
-                // 那时默认就是订阅兼容，必须原样保持，绝不因升级悄悄改成代理白名单。
-                // 损坏文件也不能悄悄升级成完全接管 —— 直接判失败走下面的保守回退。
-                string split = Json.Str(root, "mode");
-                if (!root.ContainsKey("mode")) d.Mode = ModePatch;
-                else if (split == ModePatch || split == ModeWhitelist) d.Mode = split;
-                else throw new FormatException("偏好的分流模式无效");
-
-                string mode = Json.Str(root, "sortMode");
-                if (mode == "smart" || mode == "manual" || mode == "name") d.SortMode = mode;
-
-                object v;
-                if (root.TryGetValue("tab", out v) && v is double)
-                    d.Tab = Math.Max(0, Math.Min(3, (int)(double)v));
-                if (root.TryGetValue("firstRun", out v) && v is bool) d.FirstRun = (bool)v;
-                if (root.TryGetValue("trayHintShown", out v) && v is bool) d.TrayHintShown = (bool)v;
-                if (root.TryGetValue("updateCheck", out v) && v is bool) d.UpdateCheck = (bool)v;
-                if (root.TryGetValue("updateCheckedAt", out v) && v is double) d.UpdateCheckedAt = (long)(double)v;
-                if (root.TryGetValue("updateLastOk", out v) && v is bool) d.UpdateLastOk = (bool)v;
-                d.LatestVersion = Json.Str(root, "latestVersion") ?? "";
-                d.LatestUrl = Json.Str(root, "latestUrl") ?? "";
-                if (root.TryGetValue("ipv6Guard", out v) && v is bool) d.Ipv6Guard = (bool)v;
-                string ipv6Orig = Json.Str(root, "ipv6Original");
-                if (ipv6Orig == "true" || ipv6Orig == "false" || ipv6Orig == "absent") d.Ipv6Original = ipv6Orig;
-                string fpmOrig = Json.Str(root, "findProcessOriginal");
-                if (fpmOrig == "always" || fpmOrig == "smart" || fpmOrig == "strict" ||
-                    fpmOrig == "off" || fpmOrig == "absent") d.FindProcessOriginal = fpmOrig;
-                if (root.TryGetValue("restoreSource", out v) && v is string) d.RestoreSource = (string)v;
-                // v1.2.5 漏了这一项：字段有默认值却没写进 JSON，用户在 settings.json 里
-                // 把 loginWindowProxy 改成 false 根本不会被读到，登录窗口例外无法关闭。
-                if (root.TryGetValue("loginWindowProxy", out v) && v is bool) d.LoginWindowProxy = (bool)v;
-                if (root.TryGetValue("repairSuspended", out v) && v is bool) d.RepairSuspended = (bool)v;
-
-                Dictionary<string, object> obj;
-                if (root.TryGetValue("order", out v))
-                {
-                    var arr = Json.AsArray(v);
-                    if (arr != null)
-                        foreach (var item in arr)
-                        {
-                            var s = item as string;
-                            if (!string.IsNullOrEmpty(s)) d.Order.Add(s);
-                        }
-                }
-                if (root.TryGetValue("usage", out v))
-                {
-                    obj = Json.AsObject(v);
-                    if (obj != null)
-                        foreach (var kv in obj)
-                            if (kv.Value is double) d.Usage[kv.Key] = (int)(double)kv.Value;
-                }
-                if (root.TryGetValue("lastUsed", out v))
-                {
-                    obj = Json.AsObject(v);
-                    if (obj != null)
-                        foreach (var kv in obj)
-                            if (kv.Value is double) d.LastUsed[kv.Key] = (long)(double)kv.Value;
-                }
-                if (root.TryGetValue("hidden", out v))
-                {
-                    var arr = Json.AsArray(v);
-                    if (arr != null)
-                        foreach (var item in arr)
-                        {
-                            var s = item as string;
-                            if (!string.IsNullOrEmpty(s)) d.Hidden.Add(s);
-                        }
-                }
-                if (root.TryGetValue("custom", out v))
-                {
-                    var arr = Json.AsArray(v);
-                    if (arr != null)
-                        foreach (var item in arr)
-                        {
-                            var s = item as string;
-                            if (!string.IsNullOrEmpty(s)) d.Custom.Add(s);
-                        }
-                }
+                return PopulateFromObject(root);
             }
             catch (Exception ex)
             {
@@ -645,7 +597,108 @@ namespace ProxyPicker.Core
                 // 把用户原本所有未点名的软件全改成直连。保守回退到订阅兼容。
                 return new Data { Mode = ModePatch };
             }
+        }
+
+        internal static Data ParseDataJson(string jsonText)
+        {
+            var root = Json.AsObject(Json.Parse(jsonText));
+            return PopulateFromObject(root);
+        }
+
+        static Data PopulateFromObject(Dictionary<string, object> root)
+        {
+            var d = new Data();
+            if (root == null) throw new FormatException("偏好必须是 JSON 对象");
+
+            // 已有配置文件才是「老用户」：缺 mode 字段是 v1.0.x 以前留下的配置，
+            // 那时默认就是订阅兼容，必须原样保持，绝不因升级悄悄改成代理白名单。
+            // 损坏文件也不能悄悄升级成完全接管 —— 直接判失败走下面的保守回退。
+            string split = Json.Str(root, "mode");
+            if (!root.ContainsKey("mode")) d.Mode = ModePatch;
+            else if (split == ModePatch || split == ModeWhitelist) d.Mode = split;
+            else throw new FormatException("偏好的分流模式无效");
+
+            string mode = Json.Str(root, "sortMode");
+            if (mode == "smart" || mode == "manual" || mode == "name") d.SortMode = mode;
+
+            object v;
+            if (root.TryGetValue("tab", out v) && v is double)
+                d.Tab = Math.Max(0, Math.Min(3, (int)(double)v));
+            if (root.TryGetValue("firstRun", out v) && v is bool) d.FirstRun = (bool)v;
+            if (root.TryGetValue("trayHintShown", out v) && v is bool) d.TrayHintShown = (bool)v;
+            if (root.TryGetValue("updateCheck", out v) && v is bool) d.UpdateCheck = (bool)v;
+            if (root.TryGetValue("updateCheckedAt", out v) && v is double) d.UpdateCheckedAt = (long)(double)v;
+            if (root.TryGetValue("updateLastOk", out v) && v is bool) d.UpdateLastOk = (bool)v;
+            d.LatestVersion = Json.Str(root, "latestVersion") ?? "";
+            d.LatestUrl = Json.Str(root, "latestUrl") ?? "";
+            if (root.TryGetValue("ipv6Guard", out v) && v is bool) d.Ipv6Guard = (bool)v;
+            string ipv6Orig = Json.Str(root, "ipv6Original");
+            if (ipv6Orig == "true" || ipv6Orig == "false" || ipv6Orig == "absent") d.Ipv6Original = ipv6Orig;
+            string fpmOrig = Json.Str(root, "findProcessOriginal");
+            if (fpmOrig == "always" || fpmOrig == "smart" || fpmOrig == "strict" ||
+                fpmOrig == "off" || fpmOrig == "absent") d.FindProcessOriginal = fpmOrig;
+            if (root.TryGetValue("restoreSource", out v) && v is string) d.RestoreSource = (string)v;
+            // v1.2.5 漏了这一项：字段有默认值却没写进 JSON，用户在 settings.json 里
+            // 把 loginWindowProxy 改成 false 根本不会被读到，登录窗口例外无法关闭。
+            if (root.TryGetValue("loginWindowProxy", out v) && v is bool) d.LoginWindowProxy = (bool)v;
+            if (root.TryGetValue("repairSuspended", out v) && v is bool) d.RepairSuspended = (bool)v;
+            if (root.TryGetValue("delayCheckSeconds", out v) && v is double)
+                d.DelayCheckSeconds = ClampDelayCheckSeconds((int)(double)v);
+            if (root.TryGetValue("delayTimeoutMs", out v) && v is double)
+                d.DelayTimeoutMs = ClampDelayTimeoutMs((int)(double)v);
+            string delayUrl = Json.Str(root, "delayTestUrl");
+            if (!string.IsNullOrEmpty(delayUrl)) d.DelayTestUrl = NormalizeDelayUrl(delayUrl);
+            if (root.TryGetValue("autoFailover", out v) && v is bool) d.AutoFailover = (bool)v;
+            string desiredRegion = Json.Str(root, "desiredRegion");
+            if (!string.IsNullOrEmpty(desiredRegion)) d.DesiredRegion = NormalizeDesiredRegion(desiredRegion);
+            if (root.TryGetValue("winW", out v) && v is double) d.WinW = ClampWindowW((int)(double)v);
+            if (root.TryGetValue("winH", out v) && v is double) d.WinH = ClampWindowH((int)(double)v);
+
+            Dictionary<string, object> obj;
+            ReadStringList(root, "order", d.Order);
+            if (root.TryGetValue("usage", out v))
+            {
+                obj = Json.AsObject(v);
+                if (obj != null)
+                    foreach (var kv in obj)
+                        if (kv.Value is double) d.Usage[kv.Key] = (int)(double)kv.Value;
+            }
+            if (root.TryGetValue("lastUsed", out v))
+            {
+                obj = Json.AsObject(v);
+                if (obj != null)
+                    foreach (var kv in obj)
+                        if (kv.Value is double) d.LastUsed[kv.Key] = (long)(double)kv.Value;
+            }
+            if (root.TryGetValue("hidden", out v))
+            {
+                var arr = Json.AsArray(v);
+                if (arr != null)
+                    foreach (var item in arr)
+                    {
+                        var s = item as string;
+                        if (!string.IsNullOrEmpty(s)) d.Hidden.Add(s);
+                    }
+            }
+            ReadStringList(root, "custom", d.Custom);
+            ReadStringList(root, "candidateNodes", d.CandidateNodes, true);
             return d;
+        }
+
+        static void ReadStringList(Dictionary<string, object> root, string key, List<string> target, bool dedupe = false)
+        {
+            object v;
+            if (!root.TryGetValue(key, out v)) return;
+            var arr = Json.AsArray(v);
+            if (arr == null) return;
+            var seen = dedupe ? new HashSet<string>(StringComparer.OrdinalIgnoreCase) : null;
+            foreach (var item in arr)
+            {
+                var s = item as string;
+                if (string.IsNullOrEmpty(s)) continue;
+                if (seen != null && !seen.Add(s)) continue;
+                target.Add(s);
+            }
         }
 
         /// <summary>记一次「被勾上」：用于智能排序，越常勾的越靠前。</summary>
@@ -766,6 +819,179 @@ namespace ProxyPicker.Core
         public static string CachedLatestUrl
         {
             get { lock (Gate) return Current.LatestUrl ?? ""; }
+        }
+
+        const string DefaultDelayTestUrl = "http://www.gstatic.com/generate_204";
+
+        static int ClampDelayCheckSeconds(int seconds)
+        {
+            if (seconds <= 0) return 0;
+            return Math.Max(15, Math.Min(3600, seconds));
+        }
+
+        static int ClampDelayTimeoutMs(int ms)
+        {
+            return Math.Max(1000, Math.Min(15000, ms));
+        }
+
+        static string NormalizeDelayUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return DefaultDelayTestUrl;
+            string s = url.Trim();
+            Uri u;
+            if (!Uri.TryCreate(s, UriKind.Absolute, out u)) return DefaultDelayTestUrl;
+            if (!string.Equals(u.Scheme, "http", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(u.Scheme, "https", StringComparison.OrdinalIgnoreCase))
+                return DefaultDelayTestUrl;
+            return s;
+        }
+
+        /// <summary>定期测速间隔（秒），0 表示仅手动/切节点时测速。</summary>
+        public static int DelayCheckSeconds
+        {
+            get { lock (Gate) return ClampDelayCheckSeconds(Current.DelayCheckSeconds); }
+        }
+
+        /// <summary>单次测速超时阈值（毫秒）。</summary>
+        public static int DelayTimeoutMs
+        {
+            get { lock (Gate) return ClampDelayTimeoutMs(Current.DelayTimeoutMs); }
+        }
+
+        /// <summary>测速目标 URL（默认 gstatic generate_204）。</summary>
+        public static string DelayTestUrl
+        {
+            get { lock (Gate) return NormalizeDelayUrl(Current.DelayTestUrl); }
+        }
+
+        internal static readonly string[] DesiredRegionOrder =
+        {
+            "auto", "any", "JP", "US", "SG", "TW", "HK", "KR", "GB", "DE"
+        };
+
+        internal static string NormalizeDesiredRegion(string code)
+        {
+            string c = (code ?? "").Trim();
+            if (c.Equals("auto", StringComparison.OrdinalIgnoreCase)) return "auto";
+            if (c.Equals("any", StringComparison.OrdinalIgnoreCase)) return "any";
+            if (c.Equals("UK", StringComparison.OrdinalIgnoreCase)) return "GB";
+            foreach (var k in DesiredRegionOrder)
+            {
+                if (k.Length == 2 && k.Equals(c, StringComparison.OrdinalIgnoreCase)) return k;
+            }
+            return "auto";
+        }
+
+        /// <summary>当前节点超时时是否自动切到备选节点池中延迟最低的可用节点。</summary>
+        public static bool AutoFailover
+        {
+            get { lock (Gate) return Current.AutoFailover; }
+        }
+
+        public static void SetAutoFailover(bool on)
+        {
+            lock (Gate) { Current.AutoFailover = on; Save(); }
+        }
+
+        /// <summary>期望落地国家/地区代码（"auto" = 按节点名自动匹配，"any" = 不限，或两位 ISO 国家码）。</summary>
+        public static string DesiredRegion
+        {
+            get { lock (Gate) return NormalizeDesiredRegion(Current.DesiredRegion); }
+        }
+
+        public static void SetDesiredRegion(string region)
+        {
+            lock (Gate) { Current.DesiredRegion = NormalizeDesiredRegion(region); Save(); }
+        }
+
+        public static string CycleDesiredRegion()
+        {
+            lock (Gate)
+            {
+                string cur = NormalizeDesiredRegion(Current.DesiredRegion);
+                int idx = Array.IndexOf(DesiredRegionOrder, cur);
+                string next = DesiredRegionOrder[(idx < 0 ? 0 : idx + 1) % DesiredRegionOrder.Length];
+                Current.DesiredRegion = next;
+                Save();
+                return next;
+            }
+        }
+
+        /// <summary>返回用户勾选的备选节点池（保序去重副本）。</summary>
+        public static List<string> GetCandidateNodes()
+        {
+            lock (Gate) return new List<string>(Current.CandidateNodes);
+        }
+
+        static int ClampWindowW(int w)
+        {
+            if (w <= 0) return 880;
+            return Math.Max(466, Math.Min(2400, w));
+        }
+
+        static int ClampWindowH(int h)
+        {
+            if (h <= 0) return 600;
+            return Math.Max(500, Math.Min(1600, h));
+        }
+
+        public static void SetWindowSize(int logicalW, int logicalH)
+        {
+            lock (Gate)
+            {
+                int cw = ClampWindowW(logicalW);
+                int ch = ClampWindowH(logicalH);
+                if (Current.WinW == cw && Current.WinH == ch) return;
+                Current.WinW = cw;
+                Current.WinH = ch;
+                Save();
+            }
+        }
+
+        public static HashSet<string> CandidateSet()
+        {
+            lock (Gate) return new HashSet<string>(Current.CandidateNodes, StringComparer.OrdinalIgnoreCase);
+        }
+
+        public static bool IsCandidateNode(string nodeName)
+        {
+            if (string.IsNullOrEmpty(nodeName)) return false;
+            lock (Gate)
+            {
+                foreach (var n in Current.CandidateNodes)
+                    if (string.Equals(n, nodeName, StringComparison.OrdinalIgnoreCase)) return true;
+                return false;
+            }
+        }
+
+        public static void SetCandidateNode(string nodeName, bool selected)
+        {
+            if (string.IsNullOrWhiteSpace(nodeName)) return;
+            lock (Gate)
+            {
+                var list = Current.CandidateNodes;
+                list.RemoveAll(x => string.Equals(x, nodeName, StringComparison.OrdinalIgnoreCase));
+                if (selected) list.Add(nodeName);
+                Save();
+            }
+        }
+
+        public static void SetCandidateNodes(IEnumerable<string> nodeNames)
+        {
+            lock (Gate)
+            {
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                Current.CandidateNodes.Clear();
+                if (nodeNames != null)
+                {
+                    foreach (var n in nodeNames)
+                    {
+                        if (!string.IsNullOrWhiteSpace(n) && seen.Add(n))
+                            Current.CandidateNodes.Add(n);
+                    }
+                }
+                Save();
+            }
         }
     }
 }

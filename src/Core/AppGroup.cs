@@ -44,16 +44,28 @@ namespace ProxyPicker.Core
         static readonly object CacheGate = new object();
         sealed class CacheEntry { public int Count; public DateTime At; }
 
+        /// <summary>独立语言解释器/命令行运行时：直接勾选它们时退回按需/不生成安装目录整树规则。</summary>
+        static readonly HashSet<string> StandaloneRuntimeExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "node.exe", "node64.exe", "node_repl.exe", "npm.exe",
+            "python.exe", "python3.exe", "pythonw.exe",
+            "java.exe", "javaw.exe", "ruby.exe", "perl.exe", "php.exe",
+            "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe",
+            "go.exe", "cargo.exe", "rustc.exe", "dotnet.exe"
+        };
+
         /// <summary>
         /// 从一个 exe 的完整路径推出「软件根目录」。
         /// 只是往上收一层隔层（bin / resources / app-1.2.3 之类），不做任何猜测式搜索。
-        /// 找不到可信的根就返回 null，调用方退回按进程名处理。
+        /// 找不到可信的根（或属于 node/python/java 等共用运行时）就返回 null，调用方退回按进程名处理。
         /// </summary>
         public static string RootFor(string exePath)
         {
             try
             {
                 if (string.IsNullOrEmpty(exePath)) return null;
+                string exeName = Path.GetFileName(exePath);
+                if (StandaloneRuntimeExes.Contains(exeName)) return null;
                 string dir = Path.GetDirectoryName(exePath);
                 if (string.IsNullOrEmpty(dir)) return null;
                 if (IsContainer(dir)) return null;   // exe 直接躺在 Program Files / Public 里
@@ -163,7 +175,33 @@ namespace ProxyPicker.Core
                     seg[i + 1].Equals("common", StringComparison.OrdinalIgnoreCase) &&
                     i + 2 == n) return true;
             }
+
+            // 共享语言运行时与包管理器安装目录（如 C:\Program Files\nodejs、Python312、Java\jdk-21）：
+            // 不能当成某个单一桌面软件生成整树规则，避免连带把脚本与全局 CLI 工具一起代理。
+            if (IsSharedRuntimeDirName(seg[n - 1])) return true;
+            if (n >= 2 && IsSharedRuntimeDirName(seg[n - 2]) && SkipLevels.Contains(seg[n - 1])) return true;
+
             return false;
+        }
+
+        static bool IsSharedRuntimeDirName(string dirName)
+        {
+            string s = (dirName ?? "").Trim().ToLowerInvariant();
+            if (s.Length == 0) return false;
+            if (s == "nodejs" || s == "node" || s == "java" || s == "go" || s == "golang" ||
+                s == "nvm" || s == ".nvm" || s == ".pyenv" || s == ".cargo" || s == ".rustup" ||
+                s == "scoop" || s == "chocolatey" || s == "dotnet" || s == "python")
+                return true;
+            return s.StartsWith("python2", StringComparison.Ordinal) ||
+                   s.StartsWith("python3", StringComparison.Ordinal) ||
+                   s.StartsWith("miniconda", StringComparison.Ordinal) ||
+                   s.StartsWith("anaconda", StringComparison.Ordinal) ||
+                   s.StartsWith("pyenv", StringComparison.Ordinal) ||
+                   s.StartsWith("jdk", StringComparison.Ordinal) ||
+                   s.StartsWith("jre", StringComparison.Ordinal) ||
+                   s.StartsWith("ruby", StringComparison.Ordinal) ||
+                   s.StartsWith("perl", StringComparison.Ordinal) ||
+                   s.StartsWith("php", StringComparison.Ordinal);
         }
 
         /// <summary>整树里有多少个 exe；有上限，遇到权限问题就停，不抛异常。</summary>

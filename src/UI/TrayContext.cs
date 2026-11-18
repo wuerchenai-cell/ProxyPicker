@@ -112,6 +112,26 @@ namespace ProxyPicker.UI
                 _form.ShowPanel();
                 _form.RefreshAsync();
             });
+            menu.Items.Add("立即测速（当前节点）", null, (s, e) =>
+            {
+                _form.ShowPanel();
+                _form.TestDelayPublic();
+            });
+            menu.Items.Add("节点策略与故障切换…", null, (s, e) =>
+            {
+                _form.ShowPanel();
+                _form.SwitchPagePublic(1);
+            });
+            menu.Items.Add("链路体检与风险评估…", null, (s, e) =>
+            {
+                _form.ShowPanel();
+                _form.SwitchPagePublic(2);
+            });
+            menu.Items.Add("一键修复分流异常", null, (s, e) =>
+            {
+                _form.ShowPanel();
+                _form.RepairMismatchPublic();
+            });
             menu.Items.Add("全部设为直连", null, (s, e) =>
             {
                 _form.ShowPanel();
@@ -194,6 +214,12 @@ namespace ProxyPicker.UI
             _form.CloseRequested += ExitApp;
 
             if (showOnStart) ShowPanel();
+            else
+            {
+                // --tray 后台启动也预创建隐藏句柄，确保 BeginInvoke 与单实例二次启动唤醒立即可用。
+                try { if (!_form.IsHandleCreated) { var unused = _form.Handle; } }
+                catch { }
+            }
             // 放在托盘图标和气泡委托都就绪之后：后台启动也会自检，且提示能真的弹出来。
             // 必须排进消息队列再跑 —— 此刻 Application.Run 还没启动，
             // 直接调 async 方法会捕获不到 UI 同步上下文，网络回调落回线程池线程。

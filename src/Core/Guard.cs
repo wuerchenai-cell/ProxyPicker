@@ -37,6 +37,7 @@ namespace ProxyPicker.Core
             /// 订阅自带、排在 MATCH 之后的 PROCESS-NAME 会让正常配置被误判成故障。</summary>
             public int LastWantedIndex = -1;
             public bool FirstRuleIsMatch;   // 第一条规则就是 MATCH（空名单白名单模式）
+            public bool TunEnabled;         // 内核当前是否开启了 TUN 虚拟网卡
             public bool Ipv6On;            // 内核开着 IPv6 = 流量可以从物理网卡直出
             public string FindProcess = "";
             public string Mode = "";
@@ -61,14 +62,32 @@ namespace ProxyPicker.Core
             var it = new Intent();
             // 收尾批 P2-1：看守对账的两次读（/configs 与 /rules）锁到同一份配置，
             // 不与 5 秒缓存窗口里的另一次 Detect 交叉。不传时保持原行为。
-            var cfg = Mihomo.GetJson("/configs", 6000, knownConfigPath);
-            if (cfg == null) { it.Error = "读不到内核配置"; return it; }
+            var cfgRes = Mihomo.FetchJson("/configs", 6000, knownConfigPath);
+            if (!cfgRes.Ok || cfgRes.Data == null)
+            {
+                it.Error = "读不到内核配置" + (!string.IsNullOrEmpty(cfgRes.Error) ? "：" + cfgRes.Error : "");
+                return it;
+            }
+            var cfg = cfgRes.Data;
 
+            var tun = Json.Obj(cfg, "tun");
+            it.TunEnabled = Json.Bool(tun, "enable", false);
             it.Ipv6On = Json.Bool(cfg, "ipv6", false);
             it.FindProcess = Json.Str(cfg, "find-process-mode") ?? "";
             it.Mode = Json.Str(cfg, "mode") ?? "";
 
-            var rules = Profile.ReadRules(knownConfigPath);
+            bool rulesOk;
+            var rules = Profile.ReadRules(out rulesOk, knownConfigPath);
+            if (!rulesOk) { it.Error = "内核规则表读取失败（/rules 不可用或鉴权失败）"; return it; }
+            return AuditRules(rules, wanted, policies, it);
+        }
+
+        /// <summary>纯规则审计（遵循 mihomo 自上而下首次命中优先）：同 payload 后续重复项不覆盖首条索引与策略。</summary>
+        internal static Intent AuditRules(List<Profile.RuleInfo> rules, IEnumerable<string> wanted,
+                                          Dictionary<string, string> policies, Intent into = null)
+        {
+            var it = into ?? new Intent();
+            rules = rules ?? new List<Profile.RuleInfo>();
             it.RuleCount = rules.Count;
             if (rules.Count == 0) { it.Error = "内核没有返回规则表"; return it; }
             it.Ok = true;
@@ -88,9 +107,13 @@ namespace ProxyPicker.Core
                 {
                     it.ProcessRules++;
                     it.LastProcessIndex = i;
-                    if (!string.IsNullOrEmpty(r.Payload)) { present.Add(r.Payload); presentIndex[r.Payload] = i; }
-                    if (!string.IsNullOrEmpty(r.Payload) && !string.IsNullOrEmpty(r.Proxy))
-                        presentPolicy[r.Payload] = r.Proxy;
+                    if (!string.IsNullOrEmpty(r.Payload))
+                    {
+                        present.Add(r.Payload);
+                        if (!presentIndex.ContainsKey(r.Payload)) presentIndex[r.Payload] = i;
+                        if (!string.IsNullOrEmpty(r.Proxy) && !presentPolicy.ContainsKey(r.Payload))
+                            presentPolicy[r.Payload] = r.Proxy;
+                    }
                     if (!string.IsNullOrEmpty(r.Proxy)) it.Policy = r.Proxy;
                 }
                 else if (type.Equals("RuleSet", StringComparison.OrdinalIgnoreCase) &&
@@ -279,13 +302,16 @@ namespace ProxyPicker.Core
             return string.Join("\n", list);
         }
 
-        /// <summary>读顶层 ipv6 键，给自检用；没有这一行返回 "absent"。</summary>
+        /// <summary>读顶层 ipv6 键，给自检用；支持行尾 # 注释与引号，没有这一行返回 "absent"。</summary>
         public static string Ipv6Value(string yaml)
         {
             foreach (var line in (yaml ?? "").Replace("\r\n", "\n").Split('\n'))
             {
                 if (!line.StartsWith("ipv6:", StringComparison.Ordinal)) continue;
-                string v = line.Substring(5).Trim().ToLowerInvariant();
+                string v = line.Substring(5).Trim();
+                int hash = v.IndexOf('#');
+                if (hash >= 0) v = v.Substring(0, hash).Trim();
+                v = v.Trim('\'', '"').ToLowerInvariant();
                 return v == "true" || v == "false" ? v : "absent";
             }
             return "absent";

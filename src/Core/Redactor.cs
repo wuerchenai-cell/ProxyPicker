@@ -58,6 +58,16 @@ namespace ProxyPicker.Core
 
             // 节点名和管道实例 ID 会暴露订阅来源 / 这台机器的标识。
             s = Regex.Replace(s, @"(?m)^节点：.*$", "节点：<节点名已隐藏>");
+            s = Regex.Replace(s, @"(?m)^链路：(.*)$", m => "链路：" + MaskChain(m.Groups[1].Value));
+            // --delay 报告中的策略组/出口/链路字段同样隐藏真名，仅保留 DIRECT / REJECT 等状态词。
+            s = Regex.Replace(s, @"(?m)^policy=(.*)$", m => "policy=" + MaskName(m.Groups[1].Value));
+            s = Regex.Replace(s, @"(?m)^group=(.*)$", m => "group=" + MaskName(m.Groups[1].Value));
+            s = Regex.Replace(s, @"(?m)^outbound=(.*)$", m => "outbound=" + MaskExit(m.Groups[1].Value));
+            s = Regex.Replace(s, @"(?m)^chain=(.*)$", m => "chain=" + MaskChain(m.Groups[1].Value));
+            // v1.5.0：隐藏 FAILOVER / 测速日志与节点检验记录中的真实节点名称，避免分享日志带出机场节点名。
+            s = Regex.Replace(s, @"(当前节点超时（)[^）\r\n]+(），自动切至备选低延迟节点：)[^\s（\r\n]+", "$1<节点名已隐藏>$2<节点名已隐藏>");
+            s = Regex.Replace(s, @"(节点测速超时：)[^·\r\n]+", "$1<节点名已隐藏> ");
+            s = Regex.Replace(s, @"(节点已恢复可用：)[^·\r\n]+", "$1<节点名已隐藏> ");
             // v1.3.7：--diag 里「策略组：X · 出口：Y · GLOBAL：Z」是组合行，
             // 以前只盖住独立的「节点：」行，组合行里的组名和节点名照旧带出去。
             // 只隐藏名字，保留 DIRECT / REJECT / 未找到 这类排查必需的状态词。
@@ -83,6 +93,10 @@ namespace ProxyPicker.Core
             s = Regex.Replace(s,
                 @"((?:""|')?(?:password|passwd|token|secret|authorization|api[_-]?key|access[_-]?key)(?:""|')?\s*[:=]\s*(?:""|'))([^""'\r\n]+)(""|')",
                 "$1<敏感值已隐藏>$3", RegexOptions.IgnoreCase);
+            // 系统代理串里若包含非回环企业代理域名 / 内网主机名 / 认证信息，统一隐藏
+            s = Regex.Replace(s, @"系统代理开启\(([^)\r\n]+)\)",
+                m => "系统代理开启(" + MaskProxyEndpoint(m.Groups[1].Value) + ")");
+
             return s;
         }
 
@@ -94,15 +108,33 @@ namespace ProxyPicker.Core
             return "<组名已隐藏>";
         }
 
-        /// <summary>出口名：DIRECT / REJECT 这类状态词要留着，节点名隐藏。</summary>
+        /// <summary>出口名：DIRECT / REJECT 这类状态词及延迟后缀保留，节点名隐藏。</summary>
         static string MaskExit(string v)
+        {
+            string t = (v ?? "").Trim();
+            if (t.Length == 0 || t == "未找到" || t == "未读取" || t == "-") return t;
+            string suffix = "";
+            int paren = t.IndexOf('（');
+            if (paren > 0 && (t.EndsWith("ms）", StringComparison.Ordinal) || t.EndsWith("已失活）", StringComparison.Ordinal)))
+            {
+                suffix = t.Substring(paren);
+                t = t.Substring(0, paren).Trim();
+            }
+            if (t.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                t.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                t.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase)) return t.ToUpperInvariant() + suffix;
+            return "<节点名已隐藏>" + suffix;
+        }
+
+        /// <summary>多级链路：只保留 DIRECT / REJECT 状态词，节点级联名称整体隐藏。</summary>
+        static string MaskChain(string v)
         {
             string t = (v ?? "").Trim();
             if (t.Length == 0 || t == "未找到" || t == "未读取" || t == "-") return t;
             if (t.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
                 t.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
                 t.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase)) return t.ToUpperInvariant();
-            return "<节点名已隐藏>";
+            return "<链路已隐藏>";
         }
 
         /// <summary>
@@ -116,6 +148,62 @@ namespace ProxyPicker.Core
             if (string.IsNullOrEmpty(text)) return text ?? "";
             return Regex.Replace(text, @"(?m)^([A-Za-z0-9_.\-]{3,})-([0-9A-Fa-f]{8,})\s*$",
                 "$1-<实例标识已隐藏>");
+        }
+
+        /// <summary>系统代理端点脱敏：仅保留本机回环 host:port；PAC 与非回环域名/公网地址一律打码。</summary>
+        public static string MaskProxyEndpoint(string raw)
+        {
+            string t = (raw ?? "").Trim();
+            if (t.Length == 0) return "-";
+            if (t.StartsWith("PAC:", StringComparison.OrdinalIgnoreCase))
+            {
+                string u = t.Substring(4).Trim();
+                Uri parsed;
+                if (Uri.TryCreate(u, UriKind.Absolute, out parsed))
+                {
+                    string h = (parsed.Host ?? "").Trim('[', ']');
+                    IPAddress ip;
+                    if (h.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                        (IPAddress.TryParse(h, out ip) && IPAddress.IsLoopback(ip)))
+                        return "PAC(" + h + (parsed.Port > 0 ? (":" + parsed.Port) : "") + ")";
+                }
+                return "PAC(<链接已隐藏>)";
+            }
+
+            string[] parts = t.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+            var cleanParts = new System.Collections.Generic.List<string>(parts.Length);
+            foreach (var rawPart in parts)
+            {
+                string item = rawPart.Trim();
+                int eq = item.IndexOf('=');
+                string prefix = eq > 0 ? item.Substring(0, eq + 1) : "";
+                string hp = eq > 0 ? item.Substring(eq + 1).Trim() : item;
+                int at = hp.IndexOf("://", StringComparison.Ordinal);
+                if (at >= 0) hp = hp.Substring(at + 3);
+                int slash = hp.IndexOf('/');
+                if (slash >= 0) hp = hp.Substring(0, slash);
+                int userAt = hp.LastIndexOf('@');
+                if (userAt >= 0) hp = hp.Substring(userAt + 1);
+
+                string host = hp;
+                string portPart = "";
+                int colon = hp.LastIndexOf(':');
+                if (colon > 0)
+                {
+                    host = hp.Substring(0, colon).Trim('[', ']');
+                    portPart = hp.Substring(colon);
+                }
+                else
+                {
+                    host = host.Trim('[', ']');
+                }
+                IPAddress parsedIp;
+                bool isLoopback = host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                                  (IPAddress.TryParse(host, out parsedIp) && IPAddress.IsLoopback(parsedIp));
+                if (!isLoopback) return "<非回环代理已隐藏>";
+                cleanParts.Add(prefix + (host.IndexOf(':') >= 0 ? "[" + host + "]" : host) + portPart);
+            }
+            return cleanParts.Count > 0 ? string.Join(";", cleanParts.ToArray()) : "-";
         }
     }
 }

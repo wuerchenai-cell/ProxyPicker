@@ -65,10 +65,22 @@ namespace ProxyPicker.UI
         readonly List<AppRow> _rows = new List<AppRow>();
         readonly Timer _anim;
         readonly ToolTip _tip = new ToolTip();
-        readonly Font _fName = Theme.Ui(13.5f);
-        readonly Font _fSub = Theme.Ui(11f);
-        readonly Font _fTag = Theme.Ui(10f);
-        readonly Font _fEmpty = Theme.Ui(12.5f);
+        Font _fName = Theme.Ui(13.5f);
+        Font _fSub = Theme.Ui(11f);
+        Font _fTag = Theme.Ui(10f);
+        Font _fEmpty = Theme.Ui(12.5f);
+
+        /// <summary>跨屏 DPI 变化或主题切换时重建字体。</summary>
+        public void RefreshThemeAndFonts()
+        {
+            BackColor = Theme.Bg;
+            _fName?.Dispose(); _fSub?.Dispose(); _fTag?.Dispose(); _fEmpty?.Dispose();
+            _fName = Theme.Ui(13.5f);
+            _fSub = Theme.Ui(11f);
+            _fTag = Theme.Ui(10f);
+            _fEmpty = Theme.Ui(12.5f);
+            Invalidate();
+        }
 
         float _offset;
         float _scrollTarget;
@@ -232,38 +244,60 @@ namespace ProxyPicker.UI
             Theme.Fill(g, Theme.Card, outer, 12f);
             Theme.Stroke(g, Theme.Line, outer, 12f);
 
+            var innerClip = new RectangleF(outer.X + 1f, outer.Y + 1f, outer.Width - 2f, outer.Height - 2f);
             var state = g.Save();
-            g.SetClip(new RectangleF(outer.X + 1, outer.Y + 1, outer.Width - 2, outer.Height - 2));
+            using (var clipPath = Theme.RoundRect(innerClip, 11f))
+            {
+                g.SetClip(clipPath, CombineMode.Intersect);
 
-            float top = RowsTop;
-            for (int i = 0; i < _rows.Count; i++)
-            {
-                float y = top + i * RowH;
-                if (y + RowH < outer.Y - 4) continue;
-                if (y > outer.Bottom + 4) break;
-                DrawRow(g, _rows[i], i, new RectangleF(outer.X + 6, y, outer.Width - 12, RowH));
-            }
-
-            if (_rows.Count == 0)
-            {
-                DrawEmpty(g, outer);
-            }
-            else if (_drag && _drop >= 0)
-            {
-                float y = top + _drop * RowH;
-                using (var pen = new Pen(Theme.Accent, 2f))
+                float top = RowsTop;
+                for (int i = 0; i < _rows.Count; i++)
                 {
-                    pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
-                    g.DrawLine(pen, outer.X + 20, y, outer.Right - 20, y);
+                    float y = top + i * RowH;
+                    if (y + RowH < outer.Y - 4) continue;
+                    if (y > outer.Bottom + 4) break;
+                    DrawRow(g, _rows[i], i, new RectangleF(outer.X + 6, y, outer.Width - 12, RowH));
                 }
-                using (var b = new SolidBrush(Theme.Accent))
+
+                if (_rows.Count == 0)
                 {
-                    g.FillEllipse(b, outer.X + 14, y - 2.5f, 5f, 5f);
-                    g.FillEllipse(b, outer.Right - 19, y - 2.5f, 5f, 5f);
+                    DrawEmpty(g, outer);
+                }
+                else if (_drag && _drop >= 0)
+                {
+                    float y = top + _drop * RowH;
+                    using (var pen = new Pen(Theme.Accent, 2f))
+                    {
+                        pen.StartCap = LineCap.Round; pen.EndCap = LineCap.Round;
+                        g.DrawLine(pen, outer.X + 20, y, outer.Right - 20, y);
+                    }
+                    using (var b = new SolidBrush(Theme.Accent))
+                    {
+                        g.FillEllipse(b, outer.X + 14, y - 2.5f, 5f, 5f);
+                        g.FillEllipse(b, outer.Right - 19, y - 2.5f, 5f, 5f);
+                    }
+                }
+
+                // 滚动边界柔和渐隐，消除小窗口列表底端单行字符与开关被机械腰斩的锯齿感
+                if (_rows.Count > 0 && MaxOffset > 0.5f)
+                {
+                    if (_offset > 1f)
+                    {
+                        var topFade = new RectangleF(innerClip.X, innerClip.Y, innerClip.Width, 10f);
+                        using (var br = new LinearGradientBrush(topFade, Theme.Card, Color.FromArgb(0, Theme.Card), 90f))
+                            g.FillRectangle(br, topFade);
+                    }
+                    if (_offset < MaxOffset - 1f)
+                    {
+                        var botFade = new RectangleF(innerClip.X, innerClip.Bottom - 12f, innerClip.Width, 12.5f);
+                        using (var br = new LinearGradientBrush(botFade, Color.FromArgb(0, Theme.Card), Theme.Card, 90f))
+                            g.FillRectangle(br, botFade);
+                    }
                 }
             }
 
             g.Restore(state);
+            Theme.Stroke(g, Theme.Line, outer, 12f);
 
             if (MaxOffset > 0.5f)
             {

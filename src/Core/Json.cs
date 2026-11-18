@@ -49,6 +49,20 @@ namespace ProxyPicker.Core
             return def;
         }
 
+        /// <summary>安全读取整数键值（兼容 Json.Parse 产生的 double 以及 int/long/字符串形式）。</summary>
+        public static int Int(Dictionary<string, object> o, string key, int def = 0)
+        {
+            if (o == null) return def;
+            object v;
+            if (!o.TryGetValue(key, out v) || v == null) return def;
+            if (v is int) return (int)v;
+            if (v is long) return (int)(long)v;
+            if (v is double) return (int)Math.Round((double)v);
+            int parsed;
+            if (int.TryParse(Convert.ToString(v), out parsed)) return parsed;
+            return def;
+        }
+
         public static Dictionary<string, object> Obj(Dictionary<string, object> o, string key)
         {
             if (o == null) return null;

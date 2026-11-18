@@ -48,6 +48,48 @@ namespace ProxyPicker.UI
             Text(g, s, f, c, r, Wrap);
         }
 
+        /// <summary>过滤 GDI+ 无法渲染的 Emoji/国旗代理对、变体选择符与零宽连接符；保留扩展汉字（如 CJK 扩展 B），并在纯 Emoji 节点名时保留原名不置空。</summary>
+        internal static string CleanEmoji(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return s ?? "";
+            var sb = new System.Text.StringBuilder(s.Length);
+            bool prevSpace = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                if (i + 1 < s.Length && char.IsSurrogatePair(s, i))
+                {
+                    int cp = char.ConvertToUtf32(s, i);
+                    i++;
+                    // 只剔除 Emoji / 象形符号 / 国旗区域指示 / 标签序列，完整保留 U+20000+ 生僻汉字
+                    bool isEmojiBlock = (cp >= 0x1F000 && cp <= 0x1FBFF) || (cp >= 0xE0020 && cp <= 0xE007F);
+                    if (isEmojiBlock) continue;
+                    prevSpace = false;
+                    sb.Append(s[i - 1]);
+                    sb.Append(s[i]);
+                    continue;
+                }
+                char c = s[i];
+                if (c == 0x200D || c == 0x20E3 || (c >= 0xFE00 && c <= 0xFE0F)) continue;
+                if (c == ' ')
+                {
+                    if (sb.Length == 0 || prevSpace) continue;
+                    prevSpace = true;
+                }
+                else
+                {
+                    prevSpace = false;
+                }
+                sb.Append(c);
+            }
+            string cleaned = sb.ToString().Trim();
+            if (cleaned.Length == 0)
+            {
+                string trimmed = s.Trim();
+                if (trimmed.Length > 0) return trimmed;
+            }
+            return cleaned;
+        }
+
         /// <summary>开关：44x24，圆角胶囊 + 带阴影的滑块。</summary>
         public static void Toggle(Graphics g, RectangleF r, float t, bool enabled)
         {

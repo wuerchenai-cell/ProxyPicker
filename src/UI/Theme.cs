@@ -12,7 +12,9 @@ namespace ProxyPicker.UI
     {
         public static bool Dark { get; private set; }
 
-        public static Color Bg, Card, Line, Fg, Dim, Accent, AccentSoft, Ok, Warn, Hover, TrackOff, TrackOn, Btn, BtnHover, FooterBg;
+        public static Color Bg, Card, SubCard, Line, Fg, Dim, Accent, AccentSoft,
+                            Ok, OkSoft, Warn, WarnSoft, Danger, DangerSoft,
+                            Hover, TrackOff, TrackOn, Btn, BtnHover, FooterBg;
 
         public static string Family { get; private set; }
 
@@ -75,38 +77,48 @@ namespace ProxyPicker.UI
             Dark = DetectDark();
             if (Dark)
             {
-                Bg = FromHex("#131519");
-                Card = FromHex("#1B1E23");
-                Line = FromHex("#2A2F36");
-                Fg = FromHex("#E8EAED");
-                Dim = FromHex("#98A1AC");
-                Accent = FromHex("#5B8FF9");
-                AccentSoft = FromHex("#1C2B45");
-                Ok = FromHex("#57C98A");
-                Warn = FromHex("#F0A75A");
-                Hover = FromHex("#22262C");
-                TrackOff = FromHex("#3A4048");
+                Bg = FromHex("#11141A");
+                Card = FromHex("#181C24");
+                SubCard = FromHex("#1F242E");
+                Line = FromHex("#2A303B");
+                Fg = FromHex("#EDF0F5");
+                Dim = FromHex("#949EAE");
+                Accent = FromHex("#4E8DF5");
+                AccentSoft = FromHex("#1A2B48");
+                Ok = FromHex("#4ADE80");
+                OkSoft = Color.FromArgb(36, 74, 222, 128);
+                Warn = FromHex("#F59E0B");
+                WarnSoft = Color.FromArgb(40, 245, 158, 11);
+                Danger = FromHex("#F87171");
+                DangerSoft = Color.FromArgb(44, 248, 113, 113);
+                Hover = FromHex("#212630");
+                TrackOff = FromHex("#3A414E");
                 TrackOn = Accent;
-                Btn = FromHex("#242830");
-                BtnHover = FromHex("#2E333C");
-                FooterBg = FromHex("#1B1E23");
+                Btn = FromHex("#232833");
+                BtnHover = FromHex("#2D3341");
+                FooterBg = FromHex("#181C24");
             }
             else
             {
-                Bg = FromHex("#F4F5F8");
+                Bg = FromHex("#F4F6F9");
                 Card = FromHex("#FFFFFF");
-                Line = FromHex("#E4E7EC");
-                Fg = FromHex("#17191C");
-                Dim = FromHex("#6B7280");
-                Accent = FromHex("#2F6FEB");
-                AccentSoft = FromHex("#E9F0FE");
+                SubCard = FromHex("#F8FAFC");
+                Line = FromHex("#E2E6EE");
+                Fg = FromHex("#151820");
+                Dim = FromHex("#646D7A");
+                Accent = FromHex("#2563EB");
+                AccentSoft = FromHex("#EBF2FE");
                 Ok = FromHex("#15803D");
+                OkSoft = Color.FromArgb(20, 21, 128, 61);
                 Warn = FromHex("#B45309");
-                Hover = FromHex("#F2F4F7");
-                TrackOff = FromHex("#C9CED6");
+                WarnSoft = Color.FromArgb(22, 180, 83, 9);
+                Danger = FromHex("#DC2626");
+                DangerSoft = Color.FromArgb(20, 220, 38, 38);
+                Hover = FromHex("#F1F4F9");
+                TrackOff = FromHex("#CBD2DC");
                 TrackOn = Accent;
-                Btn = FromHex("#F7F8FA");
-                BtnHover = FromHex("#EDEFF3");
+                Btn = FromHex("#F6F8FB");
+                BtnHover = FromHex("#EBEEF4");
                 FooterBg = FromHex("#FFFFFF");
             }
 

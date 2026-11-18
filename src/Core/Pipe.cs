@@ -83,6 +83,8 @@ namespace ProxyPicker.Core
             int wait = (int)Math.Min(Math.Max(1, RemainingMs), int.MaxValue);
             if (!task.Wait(wait))
             {
+                // 超时关闭句柄后，后台写线程几乎必抛 IOException；挂上空异常消费防止 Task 终结时泄漏未观察异常
+                task.ContinueWith(t => { var _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
                 Dispose();
                 throw new TimeoutException("控制管道写入超过总时限（" + wait + " ms）");
             }
@@ -118,31 +120,36 @@ namespace ProxyPicker.Core
         /// <summary>读到对方关闭为止；总时限与响应大小都有上限，超时关句柄打断阻塞的 ReadFile。</summary>
         public byte[] ReadToEnd(int timeoutMs)
         {
-            var ms = new MemoryStream();
             IntPtr h = _h;
             var task = Task.Run(() =>
             {
-                byte[] buf = new byte[65536];
-                while (true)
+                using (var ms = new MemoryStream())
                 {
-                    uint n;
-                    bool ok = ReadFile(h, buf, (uint)buf.Length, out n, IntPtr.Zero);
-                    if (!ok || n == 0) break;
-                    ms.Write(buf, 0, (int)n);
-                    if (ms.Length > MaxResponseBytes)
-                        throw new IOException("控制管道响应超过 16 MiB，已中断");
+                    byte[] buf = new byte[65536];
+                    while (true)
+                    {
+                        uint n;
+                        bool ok = ReadFile(h, buf, (uint)buf.Length, out n, IntPtr.Zero);
+                        if (!ok || n == 0) break;
+                        ms.Write(buf, 0, (int)n);
+                        if (ms.Length > MaxResponseBytes)
+                            throw new IOException("控制管道响应超过 16 MiB，已中断");
+                    }
+                    return ms.ToArray();
                 }
             });
             int wait = (int)Math.Min(Math.Max(1, timeoutMs), Math.Max(1, RemainingMs));
             if (!task.Wait(wait))
             {
+                // 隔离工作线程本地流避免超时后跨线程竞争，并消费关句柄引发的异步异常
+                task.ContinueWith(t => { var _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
                 Dispose();
                 throw new TimeoutException("控制管道响应超时（" + wait + " ms）");
             }
-            task.Wait();   // 把读线程里的大小上限异常抛回调用方
+            byte[] data = task.GetAwaiter().GetResult();
             if (RemainingMs <= 0)
                 throw new TimeoutException("控制管道请求超过总时限（" + _deadlineMs + " ms）");
-            return ms.ToArray();
+            return data;
         }
 
         public void Dispose()

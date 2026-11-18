@@ -234,35 +234,42 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>客户端进程名和目录的对应关系。宁可少认，不能把没开的客户端认成在跑。</summary>
-        static bool IsClientRunning(string dir, HashSet<string> running)
+        internal static bool IsClientRunning(string dir, HashSet<string> running)
         {
             if (running == null || running.Count == 0) return false;
             string d = (dir ?? "").ToLowerInvariant();
             foreach (var name in running)
             {
-                string n = name.ToLowerInvariant();
-                // `*-service.exe` 是常驻服务，不是「梯子开着」的证据；
-                // 否则 Clash Verge 关了界面、只留服务，也会被误判为运行中。
-                if (n.IndexOf("service", StringComparison.Ordinal) >= 0) continue;
+                string n = (name ?? "").ToLowerInvariant();
+                if (n.Length == 0) continue;
+                // `*-service.exe` / `*helperservice*` 是常驻提权服务，不是「梯子开着」的证据；
+                // 否则 Clash Verge / FlClash 关了界面、只留服务，也会被误判为运行中。
+                if (n.IndexOf("service", StringComparison.Ordinal) >= 0 ||
+                    n.IndexOf("helper", StringComparison.Ordinal) >= 0) continue;
                 if (d.IndexOf("clash-verge-rev") >= 0 || d.IndexOf("clash-verge") >= 0)
                 {
-                    if (n == "clash-verge" || n == "verge-mihomo") return true;
+                    if (n == "clash-verge" || n == "clash verge" || n == "verge-mihomo" || n == "verge-mihomo-alpha") return true;
                 }
-                else if (d.IndexOf("mihomo-party") >= 0)
+                else if (d.IndexOf("mihomo-party") >= 0 || d.IndexOf("mihomo party") >= 0)
                 {
-                    if (n.IndexOf("mihomo-party") >= 0) return true;
+                    if (n.IndexOf("mihomo-party") >= 0 || n.IndexOf("mihomo party") >= 0 || n == "party-mihomo") return true;
+                }
+                else if (d.IndexOf("sparkle") >= 0 || d.IndexOf("clash-party") >= 0 || d.IndexOf("clash party") >= 0)
+                {
+                    if (n.IndexOf("sparkle") >= 0 || n.IndexOf("clash-party") >= 0 || n.IndexOf("clash party") >= 0 ||
+                        n == "sparkle-mihomo" || n == "party-mihomo") return true;
                 }
                 else if (d.IndexOf("nyanpasu") >= 0)
                 {
                     if (n.IndexOf("nyanpasu") >= 0) return true;
                 }
-                else if (d.IndexOf("flclash") >= 0 || d.IndexOf("follow.clash") >= 0)
+                else if (d.IndexOf("flclash") >= 0 || d.IndexOf("follow.clash") >= 0 || d.IndexOf("com.follow") >= 0)
                 {
-                    if (n.IndexOf("flclash") >= 0) return true;
+                    if (n.IndexOf("flclash") >= 0 || n.IndexOf("clashcore") >= 0) return true;
                 }
-                else if (d.IndexOf("clash-for-windows") >= 0)
+                else if (d.IndexOf("clash-for-windows") >= 0 || d.IndexOf("clash for windows") >= 0)
                 {
-                    if (n.IndexOf("clash-for-windows") >= 0 || n.IndexOf("clash-win") >= 0) return true;
+                    if (n.IndexOf("clash-for-windows") >= 0 || n.IndexOf("clash for windows") >= 0 || n.IndexOf("clash-win") >= 0) return true;
                 }
                 else
                 {
@@ -358,7 +365,15 @@ namespace ProxyPicker.Core
                 list.Add(Path.Combine(appData, "clash-nyanpasu"));
                 list.Add(Path.Combine(appData, "mihomo-party"));
                 list.Add(Path.Combine(appData, "mihomo-party", "work"));
+                list.Add(Path.Combine(appData, "sparkle"));
+                list.Add(Path.Combine(appData, "sparkle", "work"));
+                list.Add(Path.Combine(appData, "clash-party"));
+                list.Add(Path.Combine(appData, "clash-party", "work"));
+                list.Add(Path.Combine(appData, "com.follow", "flclash"));
+                list.Add(Path.Combine(appData, "com.follow", "flclash", "profiles"));
                 list.Add(Path.Combine(appData, "com.follow.clash"));
+                list.Add(Path.Combine(appData, "com.follow.clash", "profiles"));
+                list.Add(Path.Combine(appData, "flclash"));
                 list.Add(Path.Combine(appData, "io.github.flclash"));
                 list.Add(Path.Combine(appData, "clash-for-windows"));
                 list.Add(Path.Combine(appData, "clash"));
@@ -366,8 +381,15 @@ namespace ProxyPicker.Core
             }
             if (local != null)
             {
+                list.Add(Path.Combine(local, "com.follow", "flclash"));
+                list.Add(Path.Combine(local, "com.follow", "flclash", "profiles"));
+                list.Add(Path.Combine(local, "Programs", "FlClash"));
                 list.Add(Path.Combine(local, "mihomo-party"));
                 list.Add(Path.Combine(local, "Programs", "mihomo-party"));
+                list.Add(Path.Combine(local, "sparkle"));
+                list.Add(Path.Combine(local, "Programs", "sparkle"));
+                list.Add(Path.Combine(local, "clash-party"));
+                list.Add(Path.Combine(local, "Programs", "clash-party"));
                 list.Add(Path.Combine(local, "Programs", "clash-verge"));
                 list.Add(Path.Combine(local, "clash-verge"));
                 list.Add(Path.Combine(local, "clash"));
@@ -393,7 +415,8 @@ namespace ProxyPicker.Core
                     {
                         string name = (p.ProcessName ?? "").ToLowerInvariant();
                         if (name.IndexOf("mihomo") < 0 && name.IndexOf("clash") < 0 &&
-                            name.IndexOf("nyanpasu") < 0 && name.IndexOf("flclash") < 0) continue;
+                            name.IndexOf("nyanpasu") < 0 && name.IndexOf("flclash") < 0 &&
+                            name.IndexOf("sparkle") < 0 && name.IndexOf("party") < 0) continue;
                         string file = null;
                         try { file = p.MainModule != null ? p.MainModule.FileName : null; }
                         catch { }
@@ -429,7 +452,8 @@ namespace ProxyPicker.Core
             {
                 using (var q = new System.Management.ManagementObjectSearcher(
                     "SELECT CommandLine FROM Win32_Process WHERE Name LIKE '%mihomo%' OR Name LIKE '%clash%' " +
-                    "OR Name LIKE '%verge%' OR Name LIKE '%nyanpasu%' OR Name LIKE '%flclash%'"))
+                    "OR Name LIKE '%verge%' OR Name LIKE '%nyanpasu%' OR Name LIKE '%flclash%' " +
+                    "OR Name LIKE '%sparkle%' OR Name LIKE '%party%'"))
                 {
                     foreach (System.Management.ManagementBaseObject mo in q.Get())
                     {
@@ -460,7 +484,7 @@ namespace ProxyPicker.Core
                 }
                 else if (a == "-d" || a == "--directory" || a == "-f" || a == "--config")
                 {
-                    if (i + 1 < args.Count) value = args[i + 1];
+                    if (i + 1 < args.Count) { value = args[i + 1]; i++; }
                 }
                 else if (a.EndsWith(".yaml", StringComparison.OrdinalIgnoreCase) ||
                          a.EndsWith(".yml", StringComparison.OrdinalIgnoreCase))
@@ -483,8 +507,8 @@ namespace ProxyPicker.Core
             }
         }
 
-        /// <summary>按 Windows 的引号规则粗分命令行，够用了：只关心 -d 后面的那个路径。</summary>
-        static List<string> SplitCommandLine(string cmd)
+        /// <summary>按 Windows 的引号规则粗分命令行。</summary>
+        internal static List<string> SplitCommandLine(string cmd)
         {
             var list = new List<string>();
             var sb = new StringBuilder();
@@ -508,7 +532,7 @@ namespace ProxyPicker.Core
             try { return Environment.GetFolderPath(f); } catch { return null; }
         }
 
-        /// <summary>在一个目录里挑最像「运行期配置」的 yaml。</summary>
+        /// <summary>在一个目录里挑最像「运行期配置」的 yaml（多订阅目录按最新修改时间优先）。</summary>
         public static string PickConfig(string dir)
         {
             string[] prefer =
@@ -524,18 +548,40 @@ namespace ProxyPicker.Core
 
             try
             {
-                foreach (var p in Directory.GetFiles(dir, "*.yaml", SearchOption.TopDirectoryOnly))
-                    if (LooksLikeConfig(p)) return p;
-                foreach (var p in Directory.GetFiles(dir, "*.yml", SearchOption.TopDirectoryOnly))
+                var files = new List<string>();
+                files.AddRange(Directory.GetFiles(dir, "*.yaml", SearchOption.TopDirectoryOnly));
+                files.AddRange(Directory.GetFiles(dir, "*.yml", SearchOption.TopDirectoryOnly));
+                files.Sort((a, b) =>
+                {
+                    DateTime ta = DateTime.MinValue, tb = DateTime.MinValue;
+                    try { ta = File.GetLastWriteTimeUtc(a); } catch { }
+                    try { tb = File.GetLastWriteTimeUtc(b); } catch { }
+                    return tb.CompareTo(ta);
+                });
+                foreach (var p in files)
                     if (LooksLikeConfig(p)) return p;
             }
             catch { }
             return null;
         }
 
+        internal static bool HasValidConfigMarkers(string text, out bool hasRules, out bool hasProxy)
+        {
+            string t = (text ?? "").TrimStart('\uFEFF');
+            hasRules = t.IndexOf("\nrules:", StringComparison.Ordinal) >= 0 ||
+                       t.StartsWith("rules:", StringComparison.Ordinal);
+            hasProxy = t.IndexOf("\nproxies:", StringComparison.Ordinal) >= 0 ||
+                       t.IndexOf("\nproxy-groups:", StringComparison.Ordinal) >= 0 ||
+                       t.IndexOf("\nproxy-providers:", StringComparison.Ordinal) >= 0 ||
+                       t.StartsWith("proxies:", StringComparison.Ordinal) ||
+                       t.StartsWith("proxy-groups:", StringComparison.Ordinal) ||
+                       t.StartsWith("proxy-providers:", StringComparison.Ordinal);
+            return hasRules && hasProxy;
+        }
+
         /// <summary>
-        /// 先读前 256 KB 做结构判断；这段里没有 rules: 时继续把剩余部分读完，
-        /// 避免「大量节点写在 rules: 前面」的真配置被整份跳过（评审 R4-8）。上限 8 MiB。
+        /// 分块读完整个配置结构（上限 8 MiB），找到 rules: 与 proxies:/proxy-groups:/proxy-providers: 两类标记即返回 true，
+        /// 避免「rules: 写在 proxies: 前面」或两者跨过首个 256 KB 边界时误判为非配置文件。
         /// </summary>
         public static bool LooksLikeConfig(string path)
         {
@@ -546,20 +592,18 @@ namespace ProxyPicker.Core
                 using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 using (var sr = new StreamReader(fs, Encoding.UTF8))
                 {
+                    const int MaxChars = 8 * 1024 * 1024;
                     char[] buf = new char[256 * 1024];
-                    int n = sr.Read(buf, 0, buf.Length);
-                    var sb = new StringBuilder(new string(buf, 0, n));
-                    while (sb.Length < 8 * 1024 * 1024)
+                    var sb = new StringBuilder();
+                    while (sb.Length < MaxChars)
                     {
-                        string text = sb.ToString();
-                        bool hasRules = text.IndexOf("\nrules:", StringComparison.Ordinal) >= 0 ||
-                                        text.StartsWith("rules:", StringComparison.Ordinal);
-                        bool hasProxy = text.IndexOf("\nproxies:", StringComparison.Ordinal) >= 0 ||
-                                        text.IndexOf("\nproxy-groups:", StringComparison.Ordinal) >= 0;
-                        if (hasRules) return hasProxy;
-                        int more = sr.Read(buf, 0, buf.Length);
-                        if (more <= 0) return false;
-                        sb.Append(buf, 0, more);
+                        int toRead = Math.Min(buf.Length, MaxChars - sb.Length);
+                        int n = sr.Read(buf, 0, toRead);
+                        if (n <= 0) break;
+                        sb.Append(buf, 0, n);
+                        bool hasRules, hasProxy;
+                        if (HasValidConfigMarkers(sb.ToString(), out hasRules, out hasProxy))
+                            return true;
                     }
                     return false;
                 }
@@ -584,13 +628,15 @@ namespace ProxyPicker.Core
             return "";
         }
 
-        static string GuessClient(string dir)
+        internal static string GuessClient(string dir)
         {
             string d = (dir ?? "").ToLowerInvariant();
             if (d.IndexOf("clash-verge-rev") >= 0) return "Clash Verge Rev";
             if (d.IndexOf("nyanpasu") >= 0) return "Clash Nyanpasu";
             if (d.IndexOf("mihomo-party") >= 0) return "Mihomo Party";
-            if (d.IndexOf("follow.clash") >= 0 || d.IndexOf("flclash") >= 0) return "FlClash";
+            if (d.IndexOf("clash-party") >= 0) return "Clash Party";
+            if (d.IndexOf("sparkle") >= 0) return "Sparkle";
+            if (d.IndexOf("com.follow") >= 0 || d.IndexOf("follow.clash") >= 0 || d.IndexOf("flclash") >= 0) return "FlClash";
             if (d.IndexOf("clash-for-windows") >= 0) return "Clash for Windows";
             if (d.IndexOf("clash-verge") >= 0) return "Clash Verge";
             return "mihomo";
@@ -767,28 +813,33 @@ namespace ProxyPicker.Core
                     bool isHead = s.Equals("rules:", StringComparison.Ordinal) ||
                                   (s.StartsWith("rules:", StringComparison.Ordinal) &&
                                    s.Length > 6 && (s[6] == ' ' || s[6] == '\t' || s[6] == '#'));
-                    if (isHead && indent == 0) inRules = true;
+                    if (isHead && indent == 0)
+                    {
+                        string rest = s.Substring("rules:".Length).Trim();
+                        if (rest.StartsWith("[", StringComparison.Ordinal))
+                        {
+                            int close = FindFlowClose(rest);
+                            if (close > 0)
+                            {
+                                string inner = rest.Substring(1, close - 1);
+                                foreach (var item in SplitTopLevel(inner, ','))
+                                {
+                                    string bodyItem = UnquoteYamlScalar(StripYamlComment(item).Trim());
+                                    if (bodyItem.Length > 0)
+                                        AcceptPolicyRuleBody(bodyItem, names, counts, ref matchPolicy);
+                                }
+                            }
+                            break;
+                        }
+                        inRules = true;
+                    }
                     continue;
                 }
                 if (indent == 0 && !s.StartsWith("-", StringComparison.Ordinal) &&
                     !s.StartsWith("#", StringComparison.Ordinal)) break;
                 string body = RuleText(raw);
                 if (body.Length == 0) continue;
-                string[] parts = body.Split(',');
-                if (parts.Length < 2) continue;
-                int pi = parts.Length - 1;
-                if (parts[pi].Trim().Equals("no-resolve", StringComparison.OrdinalIgnoreCase)) pi--;
-                if (pi < 1) continue;
-                string pol = parts[pi].Trim().Trim('\'', '"');
-                bool known = false;
-                foreach (var n in names)
-                    if (n.Equals(pol, StringComparison.OrdinalIgnoreCase)) { known = true; break; }
-                if (!known) continue;
-                if (parts[0].Trim().Equals("MATCH", StringComparison.OrdinalIgnoreCase))
-                    matchPolicy = pol;   // 后面的 MATCH 覆盖前面的，取最后一条
-                int c;
-                counts.TryGetValue(pol, out c);
-                counts[pol] = c + 1;
+                AcceptPolicyRuleBody(body, names, counts, ref matchPolicy);
             }
             if (!string.IsNullOrEmpty(matchPolicy)) return matchPolicy;
             string best = null;
@@ -797,6 +848,26 @@ namespace ProxyPicker.Core
                 if (kv.Value > bestCount) { best = kv.Key; bestCount = kv.Value; }
             // 只出现一次的多半是某条专用规则，不作为默认组。
             return bestCount >= 2 ? best : null;
+        }
+
+        static void AcceptPolicyRuleBody(string body, List<string> names,
+                                         Dictionary<string, int> counts, ref string matchPolicy)
+        {
+            string[] parts = body.Split(',');
+            if (parts.Length < 2) return;
+            int pi = parts.Length - 1;
+            if (parts[pi].Trim().Equals("no-resolve", StringComparison.OrdinalIgnoreCase)) pi--;
+            if (pi < 1) return;
+            string pol = UnquoteYamlScalar(parts[pi].Trim());
+            bool known = false;
+            foreach (var n in names)
+                if (n.Equals(pol, StringComparison.OrdinalIgnoreCase)) { known = true; break; }
+            if (!known) return;
+            if (parts[0].Trim().Equals("MATCH", StringComparison.OrdinalIgnoreCase))
+                matchPolicy = pol;   // 后面的 MATCH 覆盖前面的，取最后一条
+            int c;
+            counts.TryGetValue(pol, out c);
+            counts[pol] = c + 1;
         }
 
         public static List<string> GroupNames(string yaml)
@@ -821,7 +892,7 @@ namespace ProxyPicker.Core
                     bool isHead = s.Equals("proxy-groups:", StringComparison.Ordinal) ||
                                   (s.StartsWith("proxy-groups:", StringComparison.Ordinal) &&
                                    s.Length > 13 && (s[13] == ' ' || s[13] == '\t' || s[13] == '#'));
-                    if (isHead)
+                    if (isHead && indent == 0)
                     {
                         // v1.3.7：流式写法 `proxy-groups: [{name: A, ...}, {...}]` 以前完全认不出，
                         // 整份组名为空 → 停止保存（失败关闭，但合法配置用不了）。
@@ -847,24 +918,75 @@ namespace ProxyPicker.Core
                 if (body.StartsWith("- ", StringComparison.Ordinal)) body = body.Substring(2).Trim();
                 if (body.StartsWith("{", StringComparison.Ordinal))
                 {
-                    // 行内映射写法：- {name: 节点选择, type: select, ...}
-                    int k = body.IndexOf("name:", StringComparison.Ordinal);
-                    if (k >= 0)
-                    {
-                        string v = body.Substring(k + 5).Trim();
-                        int cut = v.IndexOfAny(new[] { ',', '}' });
-                        if (cut >= 0) v = v.Substring(0, cut);
-                        v = StripYamlComment(v).Trim().Trim('\'', '"');
-                        if (v.Length > 0) list.Add(v);
-                    }
+                    // 行内映射写法：- {name: 节点选择, type: select, ...}，需按引号边界解析防止组名里的逗号被截断
+                    string v = ExtractInlineGroupName(body);
+                    if (v.Length > 0 && !list.Contains(v)) list.Add(v);
                 }
                 else if (body.StartsWith("name:", StringComparison.Ordinal))
                 {
-                    string v = StripYamlComment(body.Substring(5)).Trim().Trim('\'', '"');
-                    if (v.Length > 0) list.Add(v);
+                    string v = UnquoteYamlScalar(StripYamlComment(body.Substring(5)).Trim());
+                    if (v.Length > 0 && !list.Contains(v)) list.Add(v);
                 }
             }
             return list;
+        }
+
+        /// <summary>从流式映射 `{name: ..., type: ...}` 中按顶层字段切分提取 name 值，避免引号内逗号/花括号截断。</summary>
+        static string ExtractInlineGroupName(string body)
+        {
+            string s = (body ?? "").Trim();
+            if (s.StartsWith("{", StringComparison.Ordinal))
+            {
+                int close = FindBraceClose(s);
+                s = close > 0 ? s.Substring(1, close - 1) : s.Substring(1);
+            }
+            foreach (var pair in SplitTopLevel(s, ','))
+            {
+                string kv = pair.Trim();
+                int colon = kv.IndexOf(':');
+                if (colon <= 0) continue;
+                string key = UnquoteYamlScalar(kv.Substring(0, colon).Trim());
+                if (!key.Equals("name", StringComparison.Ordinal)) continue;
+                string rawVal = StripYamlComment(kv.Substring(colon + 1)).Trim();
+                return UnquoteYamlScalar(rawVal);
+            }
+            return "";
+        }
+
+        static string UnquoteYamlScalar(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            if (raw.Length >= 2 && raw[0] == '"' && raw[raw.Length - 1] == '"')
+                return raw.Substring(1, raw.Length - 2).Replace("\\\"", "\"").Replace("\\\\", "\\");
+            if (raw.Length >= 2 && raw[0] == '\'' && raw[raw.Length - 1] == '\'')
+                return raw.Substring(1, raw.Length - 2).Replace("''", "'");
+            return raw;
+        }
+
+        static int FindBraceClose(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return -1;
+            char quote = '\0';
+            int depth = 0;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (quote != '\0')
+                {
+                    if (quote == '"' && c == '\\') { i++; continue; }
+                    if (quote == '\'' && c == '\'' && i + 1 < s.Length && s[i + 1] == '\'') { i++; continue; }
+                    if (c == quote) quote = '\0';
+                    continue;
+                }
+                if (c == '"' || c == '\'') { quote = c; continue; }
+                if (c == '{') depth++;
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0) return i;
+                }
+            }
+            return -1;
         }
 
         /// <summary>
@@ -874,19 +996,15 @@ namespace ProxyPicker.Core
         static void ParseFlowGroupNames(string value, List<string> into)
         {
             string s = (value ?? "").Trim();
-            if (s.StartsWith("[", StringComparison.Ordinal)) s = s.Substring(1);
-            int close = s.LastIndexOf(']');
-            if (close >= 0) s = s.Substring(0, close);
+            if (!s.StartsWith("[", StringComparison.Ordinal)) return;
+            int close = FindFlowClose(s);
+            if (close <= 0) return;
+            s = s.Substring(1, close - 1);
             foreach (var item in SplitTopLevel(s, ','))
             {
-                string body = item.Trim().Trim('{', '}', ' ').Trim();
+                string body = item.Trim();
                 if (body.Length == 0) continue;
-                int k = body.IndexOf("name:", StringComparison.Ordinal);
-                if (k < 0) continue;
-                string v = body.Substring(k + 5).Trim();
-                int cut = v.IndexOfAny(new[] { ',', '}' });
-                if (cut >= 0) v = v.Substring(0, cut);
-                v = StripYamlComment(v).Trim().Trim('\'', '"');
+                string v = ExtractInlineGroupName(body);
                 if (v.Length > 0 && !into.Contains(v)) into.Add(v);
             }
         }
@@ -944,6 +1062,7 @@ namespace ProxyPicker.Core
                 if (quote != '\0')
                 {
                     if (quote == '"' && c == '\\') { i++; continue; }
+                    if (quote == '\'' && c == '\'' && i + 1 < s.Length && s[i + 1] == '\'') { i++; continue; }
                     if (c == quote) quote = '\0';
                     continue;
                 }
@@ -1419,6 +1538,44 @@ namespace ProxyPicker.Core
                         insert[i].StartsWith("port:", StringComparison.Ordinal)) { at = i + 1; break; }
             if (at < 0) at = 0;
             insert.Insert(at, want);
+            return string.Join("\n", insert);
+        }
+
+        /// <summary>
+        /// 确保顶层 mode 为 rule；修复分流异常推送全量配置时调用，避免把内核从 global/direct
+        /// 临时改到 rule 后，PUT /configs 又拿磁盘旧 mode 把它盖回去。
+        /// 只动顶格 mode: 行，不碰缩进子节或 rules 内容。
+        /// </summary>
+        internal static string EnsureRuleMode(string yaml)
+        {
+            if (string.IsNullOrEmpty(yaml)) return yaml ?? "";
+            string text = yaml.Replace("\r\n", "\n");
+            string[] lines = text.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string t = lines[i];
+                if (t.Length - t.TrimStart().Length != 0) continue;
+                string trimmed = t.TrimStart();
+                if (!trimmed.StartsWith("mode:", StringComparison.Ordinal)) continue;
+                string v = trimmed.Substring("mode:".Length);
+                int hash = v.IndexOf('#');
+                if (hash >= 0) v = v.Substring(0, hash);
+                v = v.Trim().Trim('\'', '"');
+                if (v.Equals("rule", StringComparison.OrdinalIgnoreCase)) return text;
+                var list = new List<string>(lines);
+                list[i] = "mode: rule";
+                return string.Join("\n", list);
+            }
+            var insert = new List<string>(lines);
+            int at = -1;
+            for (int i = 0; i < insert.Count; i++)
+                if (insert[i].StartsWith("find-process-mode:", StringComparison.Ordinal)) { at = i; break; }
+            if (at < 0)
+                for (int i = 0; i < insert.Count; i++)
+                    if (insert[i].StartsWith("mixed-port:", StringComparison.Ordinal) ||
+                        insert[i].StartsWith("port:", StringComparison.Ordinal)) { at = i + 1; break; }
+            if (at < 0) at = 0;
+            insert.Insert(at, "mode: rule");
             return string.Join("\n", insert);
         }
 
@@ -2345,8 +2502,411 @@ namespace ProxyPicker.Core
             check("v1.3.7 辅助进程继承主软件的手改策略",
                 helper != null && helper.Policy == "DIRECT", helper == null ? "缺 helper" : helper.Policy);
 
+            // 9) v1.4.0 深度审查回归：FindFlowClose 单引号 '' 转义、流式 rules: [...]、引号内逗号组名、缩进 proxy-groups: 隔离
+            check("v1.4.0 FindFlowClose 正确跳过 YAML 单引号 '' 转义里的 ]",
+                FindFlowClose("['a'']', 'b']") == 12, "");
+            string flowYaml = "mode: rule\nproxy-groups: [{name: \"节点, 一\", type: select}, {name: '节点''二', type: url-test}] # [noise]\n" +
+                              "  proxy-groups:\n  - name: 假组\nrules: [\"DOMAIN-SUFFIX,a.com,\\\"节点, 一\\\"\", \"MATCH,节点, 一\"]\n";
+            var gNames = GroupNames(flowYaml);
+            bool groupsOk = gNames.Count == 2 && gNames[0] == "节点, 一" && gNames[1] == "节点'二";
+            check("v1.4.0 GroupNames 支持流式引号含逗号组名与单引号转义，并忽略缩进干扰键",
+                groupsOk, "count=" + gNames.Count);
+            string flowRulesOnlyYaml = "mode: rule\nproxy-groups:\n- name: 组A\n  type: select\nrules: [\"DOMAIN-SUFFIX,a.com,组A\", \"MATCH,组A\"]\n";
+            bool flowReused;
+            check("v1.4.0 PolicyFromRules 支持流式 rules: [...] 解析 MATCH 策略组",
+                FindPolicy(flowRulesOnlyYaml, out flowReused) == "组A", "");
+
+            // 10) v1.4.0 深度接入与修复回归：重复规则首次命中优先、IPv6 行尾注释、secret 含 `$` 还原、出口链深度解析、测速判定
+            var dupRules = new List<Profile.RuleInfo>
+            {
+                new Profile.RuleInfo { Type = "ProcessName", Payload = "chrome.exe", Proxy = "ProxyGroup" },
+                new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" },
+                new Profile.RuleInfo { Type = "ProcessName", Payload = "chrome.exe", Proxy = "DIRECT" }
+            };
+            var expectPol = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            expectPol["chrome.exe"] = "ProxyGroup";
+            var auditDup = Guard.AuditRules(dupRules, new[] { "chrome.exe" }, expectPol);
+            check("v1.4.0 Guard.AuditRules 遵循首次命中优先，不被下方重复规则误判越位或改策略",
+                auditDup.Ok && auditDup.LastWantedIndex == 0 && auditDup.WrongPolicy == 0 &&
+                Guard.Judge(auditDup, 1, false) == null,
+                "lastWanted=" + auditDup.LastWantedIndex + " wrongPol=" + auditDup.WrongPolicy);
+
+            check("v1.4.0 Guard.Ipv6Value 正确解析带行尾 # 注释和引号的值",
+                Guard.Ipv6Value("ipv6: true # enabled\n") == "true" &&
+                Guard.Ipv6Value("ipv6: 'false' # off\n") == "false",
+                "");
+
+            string secYaml = "port: 7890\nsecret: <备份时已移除>\n";
+            string restoredSec = Profile.RestoreSecretLine(secYaml, "ab$1$$&cd");
+            check("v1.4.0 Rollback 恢复含 $ 的控制密钥不被 Regex 展开替换",
+                restoredSec.IndexOf("secret: \"ab$1$$&cd\"", StringComparison.Ordinal) >= 0,
+                restoredSec.Replace("\r", "").Replace("\n", " | "));
+
+            var proxiesMock = new Dictionary<string, object>
+            {
+                { "GLOBAL", new Dictionary<string, object> { { "type", "Selector" }, { "now", "DIRECT" } } },
+                { "主选择", new Dictionary<string, object> { { "type", "Selector" }, { "now", "日本自动" } } },
+                { "日本自动", new Dictionary<string, object> { { "type", "URLTest" }, { "now", "日本 01" } } },
+                { "日本 01", new Dictionary<string, object>
+                    {
+                        { "type", "Shadowsocks" },
+                        { "alive", true },
+                        { "history", new List<object> { new Dictionary<string, object> { { "delay", 48.0 } } } }
+                    }
+                }
+            };
+            var detail = Profile.ResolveOutboundDetail(proxiesMock, "主选择");
+            var rejectDropDetail = Profile.ResolveOutboundDetail(proxiesMock, "reject-drop");
+            check("v1.4.0 ResolveOutboundDetail 解析多级代理链/历史延迟/存活状态及 REJECT-DROP",
+                detail.Outbound == "日本 01" && detail.Chain == "主选择 → 日本自动 → 日本 01" &&
+                detail.HistoryDelayMs == 48 && detail.Alive == true &&
+                rejectDropDetail.Outbound == "REJECT-DROP",
+                "out=" + detail.Outbound + " chain=" + detail.Chain + " ms=" + detail.HistoryDelayMs);
+
+            var delayOk = Profile.ParseDelayResponse(
+                new Mihomo.ApiJsonResult { Ok = true, Status = 200, Data = new Dictionary<string, object> { { "delay", 64.0 } } },
+                "日本 01", "http://www.gstatic.com/generate_204", 5000);
+            var delayTimeout = Profile.ParseDelayResponse(
+                new Mihomo.ApiJsonResult { Ok = false, Status = 504, Error = "Gateway Timeout" },
+                "日本 01", "http://www.gstatic.com/generate_204", 5000);
+            var delayUnreach = Profile.ParseDelayResponse(
+                new Mihomo.ApiJsonResult { Ok = false, Status = 401, Error = "secret 不匹配（HTTP 401）" },
+                "日本 01", "http://www.gstatic.com/generate_204", 5000);
+            check("v1.4.0 ParseDelayResponse 区分节点测速正常/超时与内核通道错误（避免误报警）",
+                delayOk.Ok && delayOk.DelayMs == 64 &&
+                delayTimeout.TimedOut && !delayTimeout.KernelUnreachable &&
+                !delayUnreach.TimedOut && delayUnreach.KernelUnreachable,
+                "");
+
+            // 11) v1.4.0 深度复审与多轮对抗修复回归：EnsureRuleMode / 脱敏链路与 --delay / 顶格 find-process / --delay 白名单
+            string globalCfg = "port: 7890\nmode: global # 手动切偏\nsniffer:\n  mode: direct\nfind-process-mode: always\nrules:\n  - MATCH,DIRECT\n";
+            string fixedModeCfg = EnsureRuleMode(globalCfg);
+            check("v1.4.0 EnsureRuleMode 只把顶格 mode 改回 rule 且保留缩进子节",
+                fixedModeCfg.IndexOf("\nmode: rule\n", StringComparison.Ordinal) >= 0 &&
+                fixedModeCfg.IndexOf("\n  mode: direct\n", StringComparison.Ordinal) >= 0 &&
+                EnsureRuleMode("find-process-mode: always\nrules:\n").StartsWith("mode: rule\nfind-process-mode: always", StringComparison.Ordinal),
+                "");
+
+            string sensitiveDiag = "策略组：主力机场 · 出口：日本东京 01（48ms） · GLOBAL：香港节点\n" +
+                                   "策略组：主力机场 · 出口：DIRECT（已失活） · GLOBAL：香港节点\n" +
+                                   "链路：主力机场 → 日本自动 → 日本东京 01\n" +
+                                   "policy=主力机场\noutbound=日本东京 01\nchain=主力机场 → 日本东京 01\n" +
+                                   "policy=DIRECT\noutbound=DIRECT\nchain=DIRECT\n";
+            string redacted = Redactor.Apply(sensitiveDiag);
+            check("v1.4.0 Redactor 隐藏链路与 --delay 中的节点/组名并保留 DIRECT 与延迟后缀",
+                redacted.IndexOf("主力机场", StringComparison.Ordinal) < 0 &&
+                redacted.IndexOf("日本东京", StringComparison.Ordinal) < 0 &&
+                redacted.IndexOf("香港节点", StringComparison.Ordinal) < 0 &&
+                redacted.IndexOf("（48ms）", StringComparison.Ordinal) >= 0 &&
+                redacted.IndexOf("DIRECT（已失活）", StringComparison.Ordinal) >= 0 &&
+                redacted.IndexOf("outbound=DIRECT", StringComparison.Ordinal) >= 0 &&
+                redacted.IndexOf("chain=<链路已隐藏>", StringComparison.Ordinal) >= 0,
+                redacted.Replace("\r", "").Replace("\n", " | "));
+
+            string nestedFpmYaml = "sub-section:\n  find-process-mode: off\nfind-process-mode: always # keep\n";
+            check("v1.4.0 ParseFindProcessFromYaml 忽略缩进子节，只读顶格 find-process-mode",
+                Settings.ParseFindProcessFromYaml(nestedFpmYaml) == "always",
+                Settings.ParseFindProcessFromYaml(nestedFpmYaml));
+
+            check("v1.5.0 Program.KnownFlags 包含 --delay 与 --nodecheck 只读开关",
+                ProxyPicker.Program.KnownFlags.IndexOf("|--delay|", StringComparison.Ordinal) >= 0 &&
+                ProxyPicker.Program.KnownFlags.IndexOf("|--nodecheck|", StringComparison.Ordinal) >= 0,
+                "");
+
+            // 11) v1.4.0 界面反馈与免点击自动修复纯逻辑回归
+            bool warnRule, warnGlobal, warnDirect, warnSys;
+            string metaRule = ProxyPicker.UI.MainForm.FormatKernelMeta(true, "rule", out warnRule);
+            string metaGlobal = ProxyPicker.UI.MainForm.FormatKernelMeta(true, "global", out warnGlobal);
+            string metaDirect = ProxyPicker.UI.MainForm.FormatKernelMeta(true, "direct", out warnDirect);
+            string metaSys = ProxyPicker.UI.MainForm.FormatKernelMeta(false, "rule", out warnSys);
+            check("v1.4.0 FormatKernelMeta 在 TUN+rule 下显示 TUN · 规则 且偏离标黄",
+                metaRule == "TUN · 规则" && !warnRule &&
+                metaGlobal == "TUN · 全局" && warnGlobal &&
+                metaDirect == "TUN · 直连" && warnDirect &&
+                metaSys == "系统代理 · 规则" && warnSys,
+                metaRule + "|" + metaGlobal + "|" + metaDirect + "|" + metaSys);
+
+            string fittedPill = ProxyPicker.UI.MainForm.FitPillLabel("节点 ", "日本-B(流量)", " · 203ms", 112f, s => s.Length * 7f);
+            string fullPill = ProxyPicker.UI.MainForm.FitPillLabel("节点 ", "日本-B(流量)", " · 203ms", 300f, s => s.Length * 7f);
+            check("v1.4.0 FitPillLabel 截短过长节点名时完整保留「节点 」前缀与「 · 203ms」后缀",
+                fittedPill.StartsWith("节点 ", StringComparison.Ordinal) &&
+                fittedPill.EndsWith(" · 203ms", StringComparison.Ordinal) &&
+                fittedPill.IndexOf('…') >= 0 &&
+                fittedPill.Length * 7f <= 112f &&
+                fullPill == "节点 日本-B(流量) · 203ms",
+                fittedPill);
+
+            bool triggerOk = ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 2, 0, false, false, true, false, false, false, 60, 60);
+            bool blockStreak = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 1, 0, false, false, true, false, false, false, 60, 60);
+            bool blockCap = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 3, 3, false, false, true, false, false, false, 60, 60);
+            bool blockSuspended = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 2, 0, false, true, true, false, false, false, 60, 60);
+            bool blockCooldown = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 2, 1, false, false, true, false, false, false, 20, 60);
+            bool blockPatch = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 2, 0, true, false, true, false, false, false, 60, 60);
+            bool blockIntent = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 2, 0, false, false, false, false, false, false, 60, 60);
+            bool blockNonRule = !ProxyPicker.UI.MainForm.ShouldTriggerAutoMismatch(1, 2, 0, false, false, true, false, false, false, 60, 60, false);
+            check("v1.4.0 ShouldTriggerAutoMismatch 守住连续采样/冷却/上限/暂停/意图与非rule模式门槛",
+                triggerOk && blockStreak && blockCap && blockSuspended && blockCooldown && blockPatch && blockIntent && blockNonRule,
+                "");
+
+            check("v1.5.0 WatchShouldAutoFixConfig 严禁在 global/direct 模式下强行抢回 rule",
+                !ProxyPicker.UI.MainForm.WatchShouldAutoFixConfig("global", "off") &&
+                !ProxyPicker.UI.MainForm.WatchShouldAutoFixConfig("direct", "always") &&
+                ProxyPicker.UI.MainForm.WatchShouldAutoFixConfig("rule", "off") &&
+                !ProxyPicker.UI.MainForm.WatchShouldAutoFixConfig("rule", "always"),
+                "");
+
+            check("v1.5.0 FormatKernelMeta 真实展示 TUN·全局 / TUN·规则 并在偏离时告警",
+                FormatMetaHelper(true, "global") == "TUN · 全局|True" &&
+                FormatMetaHelper(true, "rule") == "TUN · 规则|False" &&
+                FormatMetaHelper(false, "rule") == "系统代理 · 规则|True",
+                FormatMetaHelper(true, "global"));
+
+            string failRed = Redactor.Apply(
+                "当前节点超时（🇯🇵日本-B(流量)），自动切至备选低延迟节点：🇺🇸美国-VIP（88ms · 清理连接 2 条）\n" +
+                "节点测速超时：🇯🇵日本-B(流量) · HTTP 504");
+            check("v1.5.0 Redactor 隐藏 FAILOVER 与 DELAY 节点真名",
+                failRed.IndexOf("日本-B", StringComparison.Ordinal) < 0 &&
+                failRed.IndexOf("美国-VIP", StringComparison.Ordinal) < 0 &&
+                failRed.IndexOf("<节点名已隐藏>", StringComparison.Ordinal) >= 0,
+                failRed);
+
+            var fit150 = ProxyPicker.UI.MainForm.ClampLogicalClientSize(
+                880f, 600f, 1.5f, new System.Drawing.Rectangle(0, 0, 1920, 1040));
+            var fitLow = ProxyPicker.UI.MainForm.ClampLogicalClientSize(
+                880f, 600f, 1.0f, new System.Drawing.Rectangle(0, 0, 1366, 728));
+            var fitMin = ProxyPicker.UI.MainForm.ClampLogicalClientSize(
+                466f, 540f, 1.0f, new System.Drawing.Rectangle(0, 0, 1366, 728));
+            check("v2.1.0 ClampLogicalClientSize 支持默认 880x600 宽屏及回归最初版 466px 最小窄侧栏",
+                fit150.Width == 1320 && fit150.Height == 900 &&
+                fitLow.Width == 880 && fitLow.Height == 600 &&
+                fitMin.Width == 466 && fitMin.Height == 540,
+                fit150 + "|" + fitLow + "|" + fitMin);
+
+            var seg0 = ProxyPicker.UI.MainForm.NavSegmentRect(24f, 48f, 832f, 34f, 0);
+            var seg1 = ProxyPicker.UI.MainForm.NavSegmentRect(24f, 48f, 832f, 34f, 1);
+            var seg2 = ProxyPicker.UI.MainForm.NavSegmentRect(24f, 48f, 832f, 34f, 2);
+            check("v2.1.0 NavSegmentRect 三分页在默认 880 宽窗体下横向等分对齐且互不重叠",
+                Math.Abs(seg0.Width - seg1.Width) < 0.01f &&
+                Math.Abs(seg1.Width - seg2.Width) < 0.01f &&
+                seg0.Right < seg1.X && seg1.Right < seg2.X && seg2.Right <= 856f,
+                seg0 + " | " + seg1 + " | " + seg2);
+
+            string foMsg = ProxyPicker.UI.MainForm.BuildFailoverNotifyText("日本-B", "新加坡-01", 58);
+            string foBlank = ProxyPicker.UI.MainForm.BuildFailoverNotifyText("", "新加坡-01", -1);
+            check("v1.6.0 BuildFailoverNotifyText 清晰生成自动切换通知文案",
+                foMsg == "日本-B 超时 → 已切至 新加坡-01（58ms）" &&
+                foBlank == "原节点 超时 → 已切至 新加坡-01",
+                foMsg + " | " + foBlank);
+
+            check("v2.2.0 多客户端识别支持 FlClash/Sparkle/Clash Party 且服务驻留不误判运行中",
+                GuessClient(@"C:\Users\u\AppData\Roaming\com.follow\flclash\profiles") == "FlClash" &&
+                GuessClient(@"C:\Users\u\AppData\Roaming\sparkle") == "Sparkle" &&
+                GuessClient(@"C:\Users\u\AppData\Roaming\clash-party\work") == "Clash Party" &&
+                IsClientRunning(@"C:\Users\u\AppData\Roaming\com.follow\flclash",
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "FlClashCore" }) &&
+                !IsClientRunning(@"C:\Users\u\AppData\Roaming\com.follow\flclash",
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "FlClashHelperService" }) &&
+                !IsClientRunning(@"C:\Users\u\AppData\Roaming\io.github.clash-verge-rev.clash-verge-rev",
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "clash-verge-service" }),
+                "");
+
+            check("v2.2.0 IsSystemProxyRoutingActive 精准区分未连接与已开启代理",
+                !Profile.IsSystemProxyRoutingActive(false, true, true, "rule") &&
+                !Profile.IsSystemProxyRoutingActive(true, false, false, "rule") &&
+                !Profile.IsSystemProxyRoutingActive(true, true, true, "direct") &&
+                Profile.IsSystemProxyRoutingActive(true, false, true, "rule") &&
+                Profile.IsSystemProxyRoutingActive(true, true, false, "global"),
+                "");
+
+            bool r1, p1, r2, p2;
+            check("v2.2.0 HasValidConfigMarkers 兼容首行 proxies/proxy-providers 与 BOM 头",
+                HasValidConfigMarkers("\uFEFFproxies:\n  - {name: JP}\nrules:\n- MATCH,DIRECT\n", out r1, out p1) &&
+                HasValidConfigMarkers("proxy-providers:\n  sub: {}\nrules:\n- MATCH,DIRECT\n", out r2, out p2),
+                "");
+
+            // v2.2.1 + v2.2.2 + v2.2.3 全宽度断点（含 519/520、577、639/640 临界值）与摘要卡折线图/节点页/体检页矩形边界自检
+            bool layoutOk = true;
+            bool summaryLayoutOk = true;
+            foreach (float tw in new[] { 466f, 519f, 520f, 577f, 639f, 640f, 706f, 880f })
+            {
+                bool sDual;
+                float sDivX, sLeft1R, sLeft2R;
+                System.Drawing.RectangleF sSpark, sMini;
+                ProxyPicker.UI.MainForm.ComputeSummaryLayoutBounds(
+                    tw, out sDual, out sDivX, out sSpark, out sMini, out sLeft1R, out sLeft2R);
+                if (sDual != (tw >= 520f)) summaryLayoutOk = false;
+                if (sSpark.IsEmpty || sSpark.Width < 120f || sSpark.Height < 24f) summaryLayoutOk = false;
+                if (sSpark.Right > tw - 24f - 11f) summaryLayoutOk = false;
+                if (sDual)
+                {
+                    if (sLeft1R >= sDivX || sLeft2R >= sDivX || sDivX >= sSpark.X) summaryLayoutOk = false;
+                    if (!sMini.IsEmpty || sSpark.Width < 180f) summaryLayoutOk = false;
+                }
+                else
+                {
+                    if (sMini.IsEmpty || sMini.Bottom >= sSpark.Y) summaryLayoutOk = false;
+                    if (sLeft1R >= sMini.X || sLeft2R >= sSpark.X) summaryLayoutOk = false;
+                    if (sMini.Right > tw - 24f - 11f || sLeft2R - 38f < 250f) summaryLayoutOk = false;
+                }
+
+                System.Drawing.RectangleF sRect, sortRect;
+                System.Drawing.RectangleF[] tRects;
+                bool twoRow;
+                ProxyPicker.UI.MainForm.ComputeAppsToolbarBounds(tw, out sRect, out tRects, out sortRect, out twoRow);
+                if (twoRow != (tw < 640f)) layoutOk = false;
+                if (twoRow)
+                {
+                    if (sRect.Right >= sortRect.X || sortRect.Right > tw - 24f + 0.1f) layoutOk = false;
+                    if (tRects[0].X < 24f - 0.1f || tRects[3].Right > tw - 24f + 0.1f) layoutOk = false;
+                }
+                else
+                {
+                    if (sRect.Right >= tRects[0].X || tRects[3].Right >= sortRect.X || sortRect.Right > tw - 24f + 0.1f) layoutOk = false;
+                }
+                for (int ti = 0; ti < 3; ti++) if (tRects[ti].Right >= tRects[ti + 1].X) layoutOk = false;
+
+                float pageW = tw - 48f; // DashMargin * 2 = 48
+                bool pCompact = pageW < 640f;
+                bool pWide = pageW >= 690f;
+                System.Drawing.RectangleF qBack, qDet, qRank, qIns, qBat, qTgt, qReg;
+                ProxyPicker.UI.QualityPage.ComputeControlBarLayout(pageW, pCompact, pWide, true, true,
+                    out qBack, out qDet, out qRank, out qIns, out qBat, out qTgt, out qReg);
+                if (!(qBack.Right < qDet.X && qDet.Right < qRank.X && qRank.Right < qIns.X &&
+                      qIns.Right < qBat.X && qBat.Right <= pageW - 9.5f && qTgt.Right < qReg.X && qReg.Right <= pageW - 9.5f))
+                    layoutOk = false;
+
+                System.Drawing.RectangleF nBack, nTc, nBat, nS, nTa, nTca, nSo, nQf, nQr, nQc;
+                ProxyPicker.UI.NodesPage.ComputeLayoutBounds(pageW, true,
+                    out nBack, out nTc, out nBat, out nS, out nTa, out nTca, out nSo, out nQf, out nQr, out nQc);
+                if (!(nTc.Right < nBat.X && nBat.Right <= pageW - 9.5f &&
+                      nS.Right < nTa.X && nTa.Right < nTca.X && nTca.Right < nSo.X &&
+                      nQf.Right < nQr.X && nQr.Right < nQc.X && nQc.Right <= pageW - 9.5f))
+                    layoutOk = false;
+                if (pCompact)
+                {
+                    if (nSo.Right > pageW - 9.5f) layoutOk = false;
+                }
+                else
+                {
+                    if (nSo.Right >= nQf.X) layoutOk = false;
+                }
+            }
+            check("v2.2.1 小窗口与中小尺寸排版无重叠/不折错且过滤节点名 Emoji 方框",
+                layoutOk &&
+                ProxyPicker.UI.Draw.CleanEmoji("🇯🇵 2x专线-日本-4") == "2x专线-日本-4" &&
+                ProxyPicker.UI.Draw.CleanEmoji("♻\uFE0F 自动选择") == "♻ 自动选择",
+                "layoutOk=" + layoutOk);
+
+            check("v2.2.3 摘要卡全宽度(466~880px)均保留实时折线图且左右分区零碰撞",
+                summaryLayoutOk,
+                "summaryLayoutOk=" + summaryLayoutOk);
+
+            // v2.2.2 全量审查修复回归断言
+            check("v2.2.2 CleanEmoji 保留 CJK 扩展汉字且纯 Emoji 节点名不置空",
+                ProxyPicker.UI.Draw.CleanEmoji("𠮷野家-JP") == "𠮷野家-JP" &&
+                ProxyPicker.UI.Draw.CleanEmoji("🇺🇸🔥") == "🇺🇸🔥" &&
+                ProxyPicker.UI.Draw.CleanEmoji("   ") == "",
+                "");
+
+            string spOut;
+            check("v2.2.2 系统代理检测识别 PAC 脚本并拦截无效 ProxyServer",
+                Profile.EvaluateSystemProxyState(false, "", "http://127.0.0.1:7897/proxy.pac", out spOut) &&
+                spOut.StartsWith("PAC: ", StringComparison.Ordinal) &&
+                !Profile.EvaluateSystemProxyState(true, "broken-no-port", "", out spOut) &&
+                Profile.EvaluateSystemProxyState(true, "127.0.0.1:7897", "", out spOut) &&
+                spOut == "127.0.0.1:7897" &&
+                Profile.EvaluateSystemProxyState(true, "http=127.0.0.1:7897;https=127.0.0.1:7897", "", out spOut),
+                "");
+
+            var genericMihomo = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "mihomo", "mihomo-alpha" };
+            check("v2.2.2 通用 mihomo 进程不再同时点亮 Sparkle/Clash Party/Mihomo Party 运行分",
+                !IsClientRunning(@"C:\Users\u\AppData\Roaming\sparkle", genericMihomo) &&
+                !IsClientRunning(@"C:\Users\u\AppData\Roaming\clash-party", genericMihomo) &&
+                !IsClientRunning(@"C:\Users\u\AppData\Roaming\mihomo-party", genericMihomo) &&
+                IsClientRunning(@"C:\Users\u\AppData\Roaming\sparkle",
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Sparkle" }) &&
+                IsClientRunning(@"C:\Users\u\AppData\Roaming\clash-party",
+                    new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Clash Party" }),
+                "");
+
+            string tmpCfg = Path.Combine(Path.GetTempPath(), "pp_cfg_test_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".yaml");
+            bool cfgRuleFirstOk = false;
+            try
+            {
+                using (var sw = new StreamWriter(tmpCfg, false, Encoding.UTF8))
+                {
+                    sw.WriteLine("rules:");
+                    for (int ri = 0; ri < 12000; ri++) sw.WriteLine("- DOMAIN-SUFFIX,example" + ri + ".com,DIRECT");
+                    sw.WriteLine("proxies:");
+                    sw.WriteLine("- {name: JP, type: ss, server: 1.2.3.4, port: 443}");
+                }
+                cfgRuleFirstOk = LooksLikeConfig(tmpCfg);
+            }
+            catch { cfgRuleFirstOk = false; }
+            finally { try { if (File.Exists(tmpCfg)) File.Delete(tmpCfg); } catch { } }
+            check("v2.2.2 LooksLikeConfig 支持 rules: 在前且 proxies: 超过 256KB 的大配置", cfgRuleFirstOk, "");
+
+            check("v2.2.2 AppGroup 屏蔽 nodejs/Python/JDK 等共享运行时安装树整树规则",
+                AppGroup.RootFor(@"C:\Program Files\nodejs\node.exe") == null &&
+                !AppGroup.IsSafeRoot(@"C:\Program Files\nodejs") &&
+                !AppGroup.IsSafeRoot(@"C:\Program Files\Python312") &&
+                !AppGroup.IsSafeRoot(@"C:\Program Files\Java\jdk-21") &&
+                AppGroup.RootFor(@"C:\Program Files\Java\jdk-21\bin\java.exe") == null,
+                "");
+
+            check("v2.2.2 MainForm.IsCatalogReplyStale 检测迟到异步回包与系统代理非回环脱敏",
+                ProxyPicker.UI.MainForm.IsCatalogReplyStale(1, 2, 5, 5) &&
+                ProxyPicker.UI.MainForm.IsCatalogReplyStale(1, 1, 5, 6) &&
+                !ProxyPicker.UI.MainForm.IsCatalogReplyStale(2, 2, 6, 6) &&
+                Redactor.MaskProxyEndpoint("proxy.corp.internal:8080") == "<非回环代理已隐藏>" &&
+                Redactor.MaskProxyEndpoint("127.0.0.1:7897") == "127.0.0.1:7897" &&
+                Redactor.Apply("系统代理开启(proxy.corp.internal:8080)").IndexOf("corp.internal", StringComparison.OrdinalIgnoreCase) < 0,
+                "");
+
+            bool pruneOk = false;
+            try
+            {
+                using (var np = new ProxyPicker.UI.NodesPage())
+                using (var qp = new ProxyPicker.UI.QualityPage())
+                {
+                    var nodeKeep = new NodeManager.ProxyNodeInfo { Name = "JP-01" };
+                    var cat1 = new NodeManager.SwitchableGroupInfo
+                    {
+                        Ok = true,
+                        GroupName = "Proxy"
+                    };
+                    cat1.Nodes.Add(nodeKeep);
+                    cat1.Nodes.Add(new NodeManager.ProxyNodeInfo { Name = "OLD-DEL" });
+                    np.SetCatalog(cat1);
+                    np.CacheQualityReport(new NodeQuality.QualityReport { TargetNode = "JP-01" });
+                    np.CacheQualityReport(new NodeQuality.QualityReport { TargetNode = "OLD-DEL" });
+                    qp.SetCatalog("JP-01", cat1.Nodes);
+                    qp.UpsertBatchReport(new NodeQuality.QualityReport { TargetNode = "JP-01" });
+                    qp.UpsertBatchReport(new NodeQuality.QualityReport { TargetNode = "OLD-DEL" });
+
+                    var cat2 = new NodeManager.SwitchableGroupInfo
+                    {
+                        Ok = true,
+                        GroupName = "Proxy"
+                    };
+                    cat2.Nodes.Add(nodeKeep);
+                    np.SetCatalog(cat2);
+                    qp.SetCatalog("JP-01", cat2.Nodes);
+                    pruneOk = np.DebugRiskCacheCount == 1 && qp.DebugReportCacheCount == 1;
+                }
+            }
+            catch { pruneOk = false; }
+            check("v2.2.2 NodesPage/QualityPage 订阅重载后按新节点目录清理已删节点缓存", pruneOk, "");
+
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();
+        }
+
+        static string FormatMetaHelper(bool tun, string mode)
+        {
+            bool warn;
+            string label = ProxyPicker.UI.MainForm.FormatKernelMeta(tun, mode, out warn);
+            return label + "|" + warn;
         }
 
         static int CountOccurrences(string text, string token)
@@ -2395,7 +2955,7 @@ namespace ProxyPicker.Core
             if (!string.IsNullOrEmpty(env.Warning)) sb.AppendLine("多客户端提醒：" + env.Warning);
             sb.AppendLine("系统：" + Environment.OSVersion.VersionString + " / " + (Environment.Is64BitProcess ? "x64" : "x86"));
             sb.AppendLine("DPI 缩放：" + UI.Theme.S.ToString("0.##"));
-            var pack = Mihomo.Request("GET", "/version", null, 4000);
+            var pack = Mihomo.Request("GET", "/version", null, 4000, env.ConfigPath);
             string ver = "";
             try
             {
@@ -2405,15 +2965,28 @@ namespace ProxyPicker.Core
             catch { }
             sb.AppendLine("内核：" + (pack.Ok ? (ver.Length > 0 ? ver : "已连接") : ("连不上 · " + (pack.Error ?? ("HTTP " + pack.Status)))));
             sb.AppendLine("管道：" + (Mihomo.LastPipeName ?? "未发现"));
-            var st = Profile.ReadKernelState();
-            sb.AppendLine("模式：" + st.Mode + " · TUN " + (st.Tun ? "开" : "关") + " · 规则 " + st.RuleCount + " 条 · " + (st.Applied ? "名单生效" : "名单未生效"));
-            // 这三行是排查「规则模式却显示 DIRECT / 勾了不生效」的关键：
-            // 规则到底写到哪个策略组、这个组当前是什么节点、GLOBAL 又是什么。
+            var st = Profile.ReadKernelState(env.ConfigPath);
+            string sysSrvDisplay = Redactor.MaskProxyEndpoint(st.SystemProxyServer);
+            string proxyWay = !st.ConfigOk ? "未连接内核"
+                : (st.ProxyActive
+                    ? (st.Tun ? "TUN 开启" : ("系统代理开启(" + sysSrvDisplay + ")"))
+                    : ("未开启代理(TUN 关 / 系统代理 " + (st.SystemProxyEnabled ? "开" : "关") + ")"));
+            sb.AppendLine("模式：" + st.Mode + " · 接管：" + proxyWay +
+                          (string.IsNullOrEmpty(st.TunStack) ? "" : " · 栈=" + st.TunStack) +
+                          " · DNS " + (st.DnsEnabled ? "开" : "关") +
+                          " · 规则 " + st.RuleCount + " 条 · " + (st.Applied ? "名单生效" : "名单未生效"));
+            // 这几行是排查「规则模式却显示 DIRECT / 勾了不生效 / 节点断连超时」的关键：
+            // 规则到底写到哪个策略组、整条链路如何逐级指向、实际末级节点与历史延迟如何。
             sb.AppendLine("策略组：" + (st.Policy.Length > 0 ? st.Policy : "未找到") +
                           " · 出口：" + (st.Outbound.Length > 0 ? st.Outbound : "未读取") +
+                          (st.DelayMs >= 0 ? "（" + st.DelayMs + "ms）" : (st.NodeAlive == false ? "（已失活）" : "")) +
                           " · GLOBAL：" + (st.Node.Length > 0 ? st.Node : "未读取"));
+            if (!string.IsNullOrEmpty(st.Chain)) sb.AppendLine("链路：" + st.Chain);
             if (!string.IsNullOrEmpty(st.Error)) sb.AppendLine("状态提示：" + st.Error);
             sb.AppendLine("节点：" + (st.Node.Length > 0 ? st.Node : "未读取"));
+            sb.AppendLine("自动切节点：" + (Settings.AutoFailover ? "开" : "关") +
+                          "（备选池 " + Settings.GetCandidateNodes().Count + " 个 · 期望地区：" +
+                          NodeManager.RegionDisplayName(Settings.DesiredRegion) + "）");
             var cands = Inspect(false);
             if (cands.Count > 0)
             {

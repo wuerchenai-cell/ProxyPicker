@@ -409,7 +409,7 @@ namespace ProxyPicker.Core
                     badLines.Add(lineNo + 1);
                     continue;
                 }
-                string body = s.Substring(1).Trim().Trim('\'', '"');
+                string body = UnquoteYamlListBody(s.Substring(1).Trim());
                 string[] parts = body.Split(',');
                 // 兼容早期/手写的两字段写法；类型不认识 / 名字为空 / 字段过多都算坏行。
                 bool nameRule = (parts.Length == 2 || parts.Length == 3) &&
@@ -433,6 +433,16 @@ namespace ProxyPicker.Core
                 return false;
             }
             return true;
+        }
+
+        static string UnquoteYamlListBody(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return "";
+            if (raw.Length >= 2 && raw[0] == '\'' && raw[raw.Length - 1] == '\'')
+                return raw.Substring(1, raw.Length - 2).Replace("''", "'");
+            if (raw.Length >= 2 && raw[0] == '"' && raw[raw.Length - 1] == '"')
+                return raw.Substring(1, raw.Length - 2).Replace("\\\"", "\"").Replace("\\\\", "\\");
+            return raw;
         }
 
         public static List<Item> Load()
@@ -489,9 +499,9 @@ namespace ProxyPicker.Core
                 sb.Append("payload:\n");
                 foreach (var it in items)
                 {
-                    sb.Append("  - '").Append(it.IsPathRule ? "PROCESS-PATH-REGEX" : "PROCESS-NAME")
-                      .Append(',').Append(it.IsPathRule ? it.PathRegex : it.Exe)
-                      .Append(',').Append(it.Policy).Append("'\n");
+                    string raw = (it.IsPathRule ? "PROCESS-PATH-REGEX" : "PROCESS-NAME") + "," +
+                                 (it.IsPathRule ? it.PathRegex : it.Exe) + "," + it.Policy;
+                    sb.Append("  - '").Append(raw.Replace("'", "''")).Append("'\n");
                 }
 
                 string path = Paths.ListPath;
@@ -717,7 +727,7 @@ namespace ProxyPicker.Core
         /// 只改勾的 = 名单插在最前面，订阅原规则原样保留。
         /// baseline 只是文本来源；规则插入与策略名解析都交给 Discovery 做通用处理。
         /// </summary>
-        public static string BuildPayload(string baselinePath, IList<Item> items)
+        public static string BuildPayload(string baselinePath, IList<Item> items, bool forceRuleMode = false)
         {
             if (string.IsNullOrEmpty(baselinePath) || !File.Exists(baselinePath))
                 throw new FileNotFoundException("没有找到 Clash / mihomo 的配置文件；请先启动客户端");
@@ -734,6 +744,7 @@ namespace ProxyPicker.Core
                     "找不到可用的代理策略组（订阅的 proxy-groups 为空或无法识别）；" +
                     "为免规则指向 GLOBAL/DIRECT，已停止保存。请检查订阅配置里的策略组名称。");
             string payload = Discovery.BuildPayload(text, items ?? new List<Item>(), policy, Settings.PatchOnly);
+            if (forceRuleMode) payload = Discovery.EnsureRuleMode(payload);
 
             // IPv6 归客户端自己管，默认一个字都不碰。
             // Clash Verge 新版把 ipv6 列为「应用设置接管」字段：外部再写它会被丢弃，
@@ -815,7 +826,7 @@ namespace ProxyPicker.Core
         /// 订阅兼容模式同样核对名单文件——它是接管意图的唯一载体（评审 R1）。</summary>
         public static ApplyOutcome Apply(List<Item> items, bool autoRecover = false,
                                          string knownConfigPath = null, long expectedEpoch = -1,
-                                         string expectedIntentSig = null)
+                                         string expectedIntentSig = null, bool forceRuleMode = false)
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
             using (var gate = CreateApplyMutex())
@@ -829,7 +840,7 @@ namespace ProxyPicker.Core
                     busy.Ms = sw.ElapsedMilliseconds;
                     return busy;
                 }
-                try { return ApplyCore(items, sw, autoRecover, knownConfigPath, expectedEpoch, expectedIntentSig); }
+                try { return ApplyCore(items, sw, autoRecover, knownConfigPath, expectedEpoch, expectedIntentSig, forceRuleMode); }
                 finally { try { gate.ReleaseMutex(); } catch { } }
             }
         }
@@ -866,7 +877,7 @@ namespace ProxyPicker.Core
         /// Discovery.SelfTest G2d 也锁同一口径，三处不会漂移。</summary>
         static ApplyOutcome ApplyCore(List<Item> items, System.Diagnostics.Stopwatch sw, bool autoRecover,
                                       string knownConfigPath = null, long expectedEpoch = -1,
-                                      string expectedIntentSig = null)
+                                      string expectedIntentSig = null, bool forceRuleMode = false)
         {
             var result = new ApplyOutcome();
 
@@ -963,7 +974,7 @@ namespace ProxyPicker.Core
             string fpBeforeBuild = ConfigFingerprint(cfg);
             try
             {
-                payload = BuildPayload(cfg, items);
+                payload = BuildPayload(cfg, items, forceRuleMode);
             }
             catch (Exception ex)
             {
@@ -1013,7 +1024,7 @@ namespace ProxyPicker.Core
                 var onlyNames = new List<Item>();
                 foreach (var it in items) if (!it.IsPathRule) onlyNames.Add(it);
                 string fallback;
-                try { fallback = BuildPayload(cfg, onlyNames); }
+                try { fallback = BuildPayload(cfg, onlyNames, forceRuleMode); }
                 catch { fallback = null; }
                 if (fallback != null)
                 {
@@ -1066,11 +1077,12 @@ namespace ProxyPicker.Core
 
             // 回读校验：条数、exe、策略、空名单兜底、内核模式与进程识别开关（评审 R3-5 / R1-7）。
             // 收尾批 P2-1：回读也锁定 cfg，避免 5 秒缓存窗口内读到另一份客户端配置。
-            var rules = ReadRules(cfg);
+            bool rulesOk;
+            var rules = ReadRules(out rulesOk, cfg);
             result.RuleCount = rules.Count;
-            bool good = true;
-            string whyBad = "";
-            if (rules.Count < items.Count) { good = false; whyBad = "内核规则条数不足"; }
+            bool good = rulesOk;
+            string whyBad = rulesOk ? "" : "内核规则回读失败（/rules 不可用或鉴权失败），无法确认规则已生效";
+            if (good && rules.Count < items.Count) { good = false; whyBad = "内核规则条数不足"; }
             if (good)
             {
                 for (int i = 0; i < items.Count; i++)
@@ -1110,8 +1122,8 @@ namespace ProxyPicker.Core
                 }
                 if (matchCount == 0)
                 { good = false; whyBad = "缺少直连兜底 MATCH，未勾选的软件可能被代理"; }
-                else if (matchProxy.Length > 0 && !Profile.IsDirectPolicy(matchProxy))
-                { good = false; whyBad = "兜底 MATCH 的策略是 " + matchProxy + "，不是 DIRECT，白名单承诺不成立"; }
+                else if (!Profile.IsDirectPolicy(matchProxy))
+                { good = false; whyBad = "兜底 MATCH 的策略是 " + (matchProxy.Length > 0 ? matchProxy : "空") + "，不是 DIRECT，白名单承诺不成立"; }
                 else if (items.Count == 0 && firstMatch != 0)
                 { good = false; whyBad = "空名单下缺少段首直连兜底"; }
                 else if (items.Count > 0 && firstMatch < items.Count)
@@ -1119,19 +1131,22 @@ namespace ProxyPicker.Core
             }
             if (good)
             {
-                Dictionary<string, object> conf = null;
-                try { conf = Mihomo.GetJson("/configs", 4000, cfg); }
-                catch { conf = null; }
+                Mihomo.ApiJsonResult confRes = null;
+                try { confRes = Mihomo.FetchJson("/configs", 4000, cfg); }
+                catch { confRes = null; }
                 // v1.3.7：读不到 /configs 时以前直接跳过校验，good 仍为 true。
                 // 内核可能正处在 global 模式或关掉进程识别，规则根本不参与匹配，
                 // 界面却报「已生效」。现在读不到就按「未能确认」处理，不当成通过。
-                if (conf == null)
+                if (confRes == null || !confRes.Ok || confRes.Data == null)
                 {
                     good = false;
-                    whyBad = "读不到内核配置（/configs），无法确认规则模式与进程识别是否生效";
+                    whyBad = "读不到内核配置（/configs）" +
+                             (confRes != null && !string.IsNullOrEmpty(confRes.Error) ? "：" + confRes.Error : "") +
+                             "，无法确认规则模式与进程识别是否生效";
                 }
                 else
                 {
+                    var conf = confRes.Data;
                     string mode = Json.Str(conf, "mode");
                     string fpm = Json.Str(conf, "find-process-mode");
                     // v1.3.8：以前只在「字段非空且不等于 rule」时才判失败，于是返回一个
@@ -1279,10 +1294,9 @@ namespace ProxyPicker.Core
                 string recent = Path.Combine(dir, "recent.yaml");
                 string prev2 = Path.Combine(dir, "recent-2.yaml");
                 string prev3 = Path.Combine(dir, "recent-3.yaml");
-                // 先把新快照写到临时文件，再轮转；任何一步中断都还能保留上一份完整备份。
+                // 先把新快照原子写入暂存文件，再轮转；任何一步中断都还能保留上一份完整备份。
                 string staged = recent + ".new";
-                var utf8 = new UTF8Encoding(false);
-                File.WriteAllText(staged, scrubbed, utf8);
+                WriteTextAtomic(staged, scrubbed);
                 if (File.Exists(prev2)) { File.Copy(prev2, prev3, true); CopyBackupMeta(prev2, prev3); }
                 if (File.Exists(recent)) { File.Copy(recent, prev2, true); CopyBackupMeta(recent, prev2); }
                 // 轮转的最后一跳同样不能「先删旧文件」：掉电会把最近一份备份一起抹掉。
@@ -1304,10 +1318,15 @@ namespace ProxyPicker.Core
             try
             {
                 string from = fromYaml + ".meta", to = toYaml + ".meta";
-                if (File.Exists(from)) File.Copy(from, to, true);
-                else if (File.Exists(to)) File.Delete(to);
+                if (File.Exists(from))
+                    WriteTextAtomic(to, File.ReadAllText(from, new UTF8Encoding(false)));
+                else if (File.Exists(to))
+                    File.Delete(to);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                CrashLog.Write(ex, "轮转备份元数据失败");
+            }
         }
 
         /// <summary>
@@ -1528,8 +1547,7 @@ namespace ProxyPicker.Core
                         message = "备份里的控制密钥已被移除，且当前配置读不到顶层 secret 行；为安全起见已停止还原";
                         return false;
                     }
-                    text = System.Text.RegularExpressions.Regex.Replace(
-                        text, @"(?m)^secret:\s*.*$", "secret: " + Json.Quote(secret));
+                    text = RestoreSecretLine(text, secret);
                 }
                 var push = Mihomo.PushConfig(text, 15000, currentCfg);   // 收尾批 P2-1
                 if (!push.Ok)
@@ -1606,6 +1624,39 @@ namespace ProxyPicker.Core
             if (p.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
                 p.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase)) return ExitKind.Rejected;
             return ExitKind.Proxy;
+        }
+
+        /// <summary>内核运行模式是否处于「rule（规则分流）」；空字符串按 rule 兜底以兼容缺少 mode 字段的旧配置。</summary>
+        internal static bool IsRuleMode(string mode)
+        {
+            string m = (mode ?? "").Trim();
+            return m.Length == 0 || m.Equals("rule", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static string ModeDisplayName(string mode)
+        {
+            string m = (mode ?? "").Trim().ToLowerInvariant();
+            if (m.Length == 0 || m == "rule") return "规则";
+            if (m == "global") return "全局";
+            if (m == "direct") return "直连";
+            return mode.Trim();
+        }
+
+        /// <summary>mihomo 的内置虚拟策略节点（非真实外部代理服务器）。</summary>
+        internal static bool IsBuiltinVirtualPolicy(string name, string type)
+        {
+            string n = (name ?? "").Trim();
+            if (n.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                n.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                n.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase) ||
+                n.Equals("PASS", StringComparison.OrdinalIgnoreCase))
+                return true;
+            string t = (type ?? "").Trim();
+            return t.Equals("Direct", StringComparison.OrdinalIgnoreCase) ||
+                   t.Equals("Reject", StringComparison.OrdinalIgnoreCase) ||
+                   t.Equals("RejectDrop", StringComparison.OrdinalIgnoreCase) ||
+                   t.Equals("Pass", StringComparison.OrdinalIgnoreCase) ||
+                   t.Equals("PassRule", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>mihomo 的策略组类型：这些名字出现在 /proxies 里时，没有 now 也不能当终点。</summary>
@@ -1688,6 +1739,18 @@ namespace ProxyPicker.Core
             return ResolveOutbound(out global);
         }
 
+        /// <summary>解析结果：不只拿最外层组，而是沿代理链追到实际节点与链路元信息。</summary>
+        public sealed class OutboundDetail
+        {
+            public string Global = "";
+            public string Outbound = "";
+            public string Chain = "";
+            public string GroupType = "";
+            public string OutboundType = "";
+            public int HistoryDelayMs = -1;
+            public bool? Alive;
+        }
+
         public static string ResolveOutbound(out string global, string policy = null,
                                              string knownConfigPath = null)
         {
@@ -1696,25 +1759,41 @@ namespace ProxyPicker.Core
             if (obj == null) return "";
             var proxies = Json.Obj(obj, "proxies");
             if (proxies == null) return "";
-            return ResolveIn(proxies, policy, out global);
+            var detail = ResolveOutboundDetail(proxies, policy);
+            global = detail.Global;
+            return detail.Outbound;
         }
 
         /// <summary>在已经取到的 /proxies 上解析出口；校验多条策略时只取一次数据。</summary>
         internal static string ResolveIn(Dictionary<string, object> proxies, string policy, out string global)
         {
-            global = "";
-            if (proxies == null) return "";
+            var detail = ResolveOutboundDetail(proxies, policy);
+            global = detail.Global;
+            return detail.Outbound;
+        }
+
+        /// <summary>深度解析代理出口链：返回实际末级节点、完整选择链路、类型、历史延迟与存活标记。</summary>
+        public static OutboundDetail ResolveOutboundDetail(Dictionary<string, object> proxies, string policy = null)
+        {
+            var detail = new OutboundDetail();
+            if (proxies == null) return detail;
 
             var g = Json.Obj(proxies, "GLOBAL");
-            global = Json.Str(g, "now") ?? "";
+            detail.Global = Json.Str(g, "now") ?? "";
 
             // 跟随「本次规则实际写入的策略组」，而不是一律跟 GLOBAL。
             // GLOBAL 在规则模式下经常停在 DIRECT；以前界面因此显示 DIRECT，
             // 用户以为规则没生效（实机截图：明明订阅组是日本，顶部却写 DIRECT）。
             if (!string.IsNullOrEmpty(policy) &&
                 (policy.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
-                 policy.Equals("REJECT", StringComparison.OrdinalIgnoreCase)))
-                return policy.ToUpperInvariant();
+                 policy.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                 policy.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase)))
+            {
+                detail.Outbound = policy.ToUpperInvariant();
+                detail.Chain = detail.Outbound;
+                detail.OutboundType = detail.Outbound;
+                return detail;
+            }
 
             object raw;
             string name;
@@ -1722,31 +1801,61 @@ namespace ProxyPicker.Core
             {
                 // 指定的策略组不在 /proxies 里：不要退回 GLOBAL 假装有出口，
                 // 让调用方看到空值并提示「策略组不存在」。
-                if (!proxies.ContainsKey(policy)) return "";
+                if (!proxies.ContainsKey(policy)) return detail;
                 name = policy;
             }
             else if (proxies.TryGetValue("PP-FIXED", out raw)) name = "PP-FIXED";
             else name = "GLOBAL";
 
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var chainParts = new List<string>();
             while (!string.IsNullOrEmpty(name) && seen.Add(name))
             {
                 var node = Json.Obj(proxies, name);
                 // 链路指向一个不存在的节点：不能把上一个组名当成终点（以前就是 `break` 后
                 // 返回非空名字，于是「无法证明」被当成「有效代理」）。直接返回空，交给调用方报错。
-                if (node == null) return "";
+                if (node == null) return detail;
+                chainParts.Add(name);
+                string type = Json.Str(node, "type") ?? "";
+                if (detail.GroupType.Length == 0) detail.GroupType = type;
+
                 string now = Json.Str(node, "now");
                 if (string.IsNullOrEmpty(now))
                 {
                     // 没有 now 的可能是真节点，也可能是 LoadBalance 这类没有当前选择的组。
                     // 只有「类型不是策略组」才算终点。
-                    string type = Json.Str(node, "type");
-                    if (IsGroupType(type) || string.IsNullOrEmpty(type)) return "";
-                    return name;
+                    if (IsGroupType(type) || string.IsNullOrEmpty(type)) return detail;
+                    detail.Outbound = name;
+                    detail.OutboundType = type;
+                    detail.Chain = string.Join(" → ", chainParts);
+                    detail.HistoryDelayMs = ExtractLastHistoryDelay(node);
+                    object aliveObj;
+                    if (node.TryGetValue("alive", out aliveObj) && aliveObj is bool)
+                        detail.Alive = (bool)aliveObj;
+                    return detail;
                 }
                 name = now;
             }
-            return "";   // 循环引用 / 超长链路：无法确认终点
+            return detail;   // 循环引用 / 超长链路：无法确认终点
+        }
+
+        internal static int ExtractLastHistoryDelay(Dictionary<string, object> node)
+        {
+            if (node == null) return -1;
+            object rawHist;
+            if (!node.TryGetValue("history", out rawHist)) return -1;
+            var arr = Json.AsArray(rawHist);
+            if (arr == null || arr.Count == 0) return -1;
+            var last = Json.AsObject(arr[arr.Count - 1]);
+            if (last == null) return -1;
+            object d;
+            if (!last.TryGetValue("delay", out d)) return -1;
+            if (d is double)
+            {
+                int ms = (int)Math.Round((double)d);
+                return ms > 0 ? ms : -1;
+            }
+            return -1;
         }
 
         /// <summary>策略组当前链路末端是不是不可用（DIRECT / REJECT / 不存在 / 解析不出）。</summary>
@@ -1758,41 +1867,293 @@ namespace ProxyPicker.Core
             return IsBlockedPolicy(exit);
         }
 
+        /// <summary>节点实时测速结果；严格区分「节点本身超时/不可达」与「Clash 内核本身连不上」。</summary>
+        public sealed class DelayResult
+        {
+            public bool Ok;
+            public bool TimedOut;
+            public bool KernelUnreachable;
+            public int DelayMs = -1;
+            public string Node = "";
+            public string Url = "";
+            public string Error = "";
+            public DateTime TestedAtUtc = DateTime.UtcNow;
+        }
+
+        /// <summary>解析 `/proxies/{node}/delay` 响应，便于单测和真实调用复用同一套判定。</summary>
+        public static DelayResult ParseDelayResponse(Mihomo.ApiJsonResult res, string node, string url, int timeoutMs)
+        {
+            var r = new DelayResult
+            {
+                Node = node ?? "",
+                Url = url ?? "",
+                TestedAtUtc = DateTime.UtcNow
+            };
+            if (res == null)
+            {
+                r.KernelUnreachable = true;
+                r.Error = "内核未返回测速结果";
+                return r;
+            }
+            if (res.Ok && res.Data != null)
+            {
+                object rawDelay;
+                if (res.Data.TryGetValue("delay", out rawDelay) && rawDelay is double)
+                {
+                    int ms = (int)Math.Round((double)rawDelay);
+                    if (ms > 0)
+                    {
+                        r.Ok = true;
+                        r.DelayMs = ms;
+                        return r;
+                    }
+                }
+                string msg = Json.Str(res.Data, "message");
+                r.TimedOut = true;
+                r.Error = !string.IsNullOrEmpty(msg) ? msg : "测速超时（未返回有效延迟）";
+                return r;
+            }
+
+            // 鉴权失败 / 管道或端口身份阻止 / 连不上内核本身 -> 属于内核通道异常，不应误报成「节点超时」
+            string err = res.Error ?? "";
+            if (res.Status == 401 || res.Status == 403 ||
+                err.IndexOf("secret", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                err.IndexOf("不是 mihomo", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                err.IndexOf("阻止", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                err.IndexOf("找不到", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                r.KernelUnreachable = true;
+                r.Error = err.Length > 0 ? err : ("HTTP " + res.Status);
+                return r;
+            }
+
+            if (res.Status == 504 || res.Status == 408 || res.Status == 503 ||
+                res.Status == 502 || res.Status == 500 ||
+                err.IndexOf("超时", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                err.IndexOf("timeout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                err.IndexOf("deadline", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                r.TimedOut = true;
+                r.Error = err.Length > 0 ? err : ("节点测速超时（" + timeoutMs + " ms / HTTP " + res.Status + "）");
+                return r;
+            }
+
+            // HTTP 0 且无超时关键字 -> 通常是内核未监听或连接被拒
+            if (res.Status == 0)
+            {
+                r.KernelUnreachable = true;
+                r.Error = err.Length > 0 ? err : "连接内核控制接口失败";
+                return r;
+            }
+
+            // 其他如 404（节点被切换/删除）也不算超时断线，如实返回错误
+            r.Error = err.Length > 0 ? err : ("测速失败（HTTP " + res.Status + "）");
+            return r;
+        }
+
+        /// <summary>调用 Clash `/proxies/{节点}/delay` 对当前真实代理出口做一次测速。</summary>
+        public static DelayResult MeasureDelay(string node, string testUrl = null, int timeoutMs = 0,
+                                               string knownConfigPath = null)
+        {
+            string url = !string.IsNullOrWhiteSpace(testUrl) ? testUrl.Trim() : Settings.DelayTestUrl;
+            int budget = timeoutMs > 0 ? Math.Max(1000, Math.Min(15000, timeoutMs)) : Settings.DelayTimeoutMs;
+
+            if (string.IsNullOrWhiteSpace(node) || ClassifyExit(node) != ExitKind.Proxy)
+            {
+                return new DelayResult
+                {
+                    Node = node ?? "",
+                    Url = url,
+                    Error = string.IsNullOrWhiteSpace(node)
+                        ? "当前未解析到代理节点"
+                        : ("当前出口是 " + node + "，无需节点测速")
+                };
+            }
+
+            string path = "/proxies/" + Uri.EscapeDataString(node) +
+                          "/delay?timeout=" + budget +
+                          "&url=" + Uri.EscapeDataString(url);
+            var res = Mihomo.FetchJson(path, budget + 2500, knownConfigPath);
+            return ParseDelayResponse(res, node, url, budget);
+        }
+
         public sealed class KernelState
         {
             public string Node = "";        // GLOBAL 的选择
             public string Outbound = "";    // 勾选软件实际走的节点（PP-FIXED 链路末端）
+            public string Chain = "";       // 完整代理选择链（如 节点选择 → 日本自动 → 日本 01）
             public string Mode = "?";
             public string FindProcess = "?";
+            public string Version = "";
+            public string TunStack = "";
+            public bool DnsEnabled;
             public bool Tun;
+            public bool SystemProxyEnabled;
+            public string SystemProxyServer = "";
+            public int MixedPort;
             public bool Applied;
             public int RuleCount;
+            public int DelayMs = -1;        // 内核记录的最近延迟（-1 表示暂无）
+            public bool? NodeAlive;
+            public bool ConfigOk;
+            public bool RulesOk;
             public string Error;
             public string Policy = "";
             public string Client = "";
+
+            /// <summary>
+            /// 当前内核是否真正接管系统流量：
+            /// 内核在线、非纯直连（direct）模式，且至少开启了 TUN 或 Windows 系统代理之一。
+            /// </summary>
+            public bool ProxyActive
+            {
+                get { return IsSystemProxyRoutingActive(ConfigOk, Tun, SystemProxyEnabled, Mode); }
+            }
         }
 
-        public static KernelState ReadKernelState()
+        /// <summary>校验 Windows Registry ProxyServer 字段格式是否合法（支持 host:port 或 scheme=host:port;...）。</summary>
+        internal static bool IsValidProxyServerSpec(string raw)
+        {
+            string t = (raw ?? "").Trim();
+            if (t.Length == 0 || t.IndexOf('\r') >= 0 || t.IndexOf('\n') >= 0) return false;
+            string[] parts = t.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return false;
+            int validCount = 0;
+            foreach (var rawPart in parts)
+            {
+                string item = rawPart.Trim();
+                if (item.Length == 0 || item.IndexOf(' ') >= 0 || item.IndexOf('\t') >= 0) return false;
+                int eq = item.IndexOf('=');
+                string hp = eq >= 0 ? item.Substring(eq + 1).Trim() : item;
+                if (eq >= 0 && eq == 0) return false;
+                int schemeIdx = hp.IndexOf("://", StringComparison.Ordinal);
+                if (schemeIdx >= 0)
+                {
+                    if (schemeIdx == 0) return false;
+                    hp = hp.Substring(schemeIdx + 3);
+                }
+                int slash = hp.IndexOf('/');
+                if (slash >= 0) hp = hp.Substring(0, slash);
+                int at = hp.LastIndexOf('@');
+                if (at >= 0) hp = hp.Substring(at + 1);
+                int colon = hp.LastIndexOf(':');
+                if (colon <= 0 || colon >= hp.Length - 1) return false;
+                string host = hp.Substring(0, colon).Trim('[', ']');
+                int port;
+                if (host.Length == 0 || !int.TryParse(hp.Substring(colon + 1), out port) || port <= 0 || port > 65535)
+                    return false;
+                validCount++;
+            }
+            return validCount > 0;
+        }
+
+        /// <summary>校验 PAC 自动配置脚本 URL 是否为有效 http/https/file 地址。</summary>
+        internal static bool IsValidPacUrl(string raw)
+        {
+            string t = (raw ?? "").Trim();
+            if (t.Length == 0 || t.IndexOf('\r') >= 0 || t.IndexOf('\n') >= 0) return false;
+            Uri u;
+            if (!Uri.TryCreate(t, UriKind.Absolute, out u)) return false;
+            if (u.Scheme == Uri.UriSchemeHttp || u.Scheme == Uri.UriSchemeHttps)
+                return !string.IsNullOrEmpty(u.Host);
+            return u.Scheme == Uri.UriSchemeFile && !string.IsNullOrEmpty(u.LocalPath);
+        }
+
+        /// <summary>综合评估 ProxyEnable / ProxyServer / AutoConfigURL（纯函数便于单测覆盖 PAC 与非法地址）。</summary>
+        internal static bool EvaluateSystemProxyState(bool proxyEnable, string proxyServer, string autoConfigUrl, out string displayEndpoint)
+        {
+            string srv = (proxyServer ?? "").Trim();
+            if (proxyEnable && IsValidProxyServerSpec(srv))
+            {
+                displayEndpoint = srv;
+                return true;
+            }
+            string pac = (autoConfigUrl ?? "").Trim();
+            if (IsValidPacUrl(pac))
+            {
+                displayEndpoint = "PAC: " + pac;
+                return true;
+            }
+            displayEndpoint = "";
+            return false;
+        }
+
+        /// <summary>只读 Windows 当前用户的系统代理开关状态（HKCU Internet Settings，兼容手动代理与 PAC）。</summary>
+        internal static void ReadSystemProxyState(out bool enabled, out string server)
+        {
+            enabled = false;
+            server = "";
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Internet Settings", false))
+                {
+                    if (key == null) return;
+                    object rawEnable = key.GetValue("ProxyEnable");
+                    bool on = false;
+                    if (rawEnable is int) on = ((int)rawEnable) != 0;
+                    else if (rawEnable is long) on = ((long)rawEnable) != 0;
+                    else if (rawEnable != null)
+                    {
+                        int v;
+                        if (int.TryParse(rawEnable.ToString(), out v)) on = v != 0;
+                    }
+                    string srv = Convert.ToString(key.GetValue("ProxyServer")) ?? "";
+                    string pac = Convert.ToString(key.GetValue("AutoConfigURL")) ?? "";
+                    enabled = EvaluateSystemProxyState(on, srv, pac, out server);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>判定代理底座是否真正连接激活（纯函数便于单元测试）。</summary>
+        internal static bool IsSystemProxyRoutingActive(bool configOk, bool tunOn, bool sysProxyOn, string mode)
+        {
+            if (!configOk) return false;
+            string m = (mode ?? "").Trim().ToLowerInvariant();
+            if (m == "direct") return false;
+            return tunOn || sysProxyOn;
+        }
+
+        public static KernelState ReadKernelState(string knownConfigPath = null)
         {
             var st = new KernelState();
+            bool sysOn;
+            string sysSrv;
+            ReadSystemProxyState(out sysOn, out sysSrv);
+            st.SystemProxyEnabled = sysOn;
+            st.SystemProxyServer = sysSrv;
+
             var env = Discovery.Detect();
+            string cfgPath = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : env.ConfigPath;
             st.Client = env.Client;
 
-            var cfg = Mihomo.GetJson("/configs");
-            if (cfg == null)
+            var cfgRes = Mihomo.FetchJson("/configs", 10000, cfgPath);
+            if (!cfgRes.Ok || cfgRes.Data == null)
             {
                 st.Error = env.Ok
-                    ? "读不到内核配置（客户端可能没启动）"
+                    ? ("读不到内核配置：" + (!string.IsNullOrEmpty(cfgRes.Error) ? cfgRes.Error : "客户端可能没启动"))
                     : "没检测到 Clash / mihomo 客户端";
                 return st;
             }
+            st.ConfigOk = true;
+            var cfg = cfgRes.Data;
             st.Mode = Json.Str(cfg, "mode") ?? "?";
             st.FindProcess = Json.Str(cfg, "find-process-mode") ?? "?";
             var tun = Json.Obj(cfg, "tun");
             st.Tun = Json.Bool(tun, "enable", false);
+            st.TunStack = Json.Str(tun, "stack") ?? "";
+            var dns = Json.Obj(cfg, "dns");
+            st.DnsEnabled = Json.Bool(dns, "enable", false);
+            int mp = Json.Int(cfg, "mixed-port", 0);
+            if (mp <= 0) mp = Json.Int(cfg, "port", 0);
+            st.MixedPort = mp;
 
-            string global;
-            st.Policy = PolicyName();
+            var kv = Mihomo.KernelVersion(cfgPath);
+            if (kv != null && !string.IsNullOrEmpty(kv.Version)) st.Version = kv.Version;
+
+            string proxyError = null;
+            st.Policy = PolicyName(cfgPath);
             // 没解析到任何代理组时 FindPolicy 返回空（不再退回 GLOBAL）；GLOBAL 在
             // 规则模式下经常停在 DIRECT，勾选软件也不会走代理。把这句话直接摆到状态里，
             // 别让用户以为「保存成功」就等于分流生效。
@@ -1800,10 +2161,32 @@ namespace ProxyPicker.Core
                 st.Error = "找不到可用的代理策略组（订阅可能没有 proxy-groups）；勾选软件不会走代理";
             else if (st.Policy.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase))
                 st.Error = "策略组只能指向 GLOBAL（规则模式下常为 DIRECT）；勾选软件可能仍然直连";
-            st.Outbound = ResolveOutbound(out global, st.Policy);
-            st.Node = global;
 
-            var rules = ReadRules();
+            var proxiesRes = Mihomo.FetchJson("/proxies", 6000, cfgPath);
+            if (proxiesRes.Ok && proxiesRes.Data != null)
+            {
+                var proxies = Json.Obj(proxiesRes.Data, "proxies");
+                if (proxies != null)
+                {
+                    string activePolicy = st.Mode.Equals("global", StringComparison.OrdinalIgnoreCase) ? "GLOBAL"
+                        : (st.Mode.Equals("direct", StringComparison.OrdinalIgnoreCase) ? "DIRECT" : st.Policy);
+                    var detail = ResolveOutboundDetail(proxies, activePolicy);
+                    st.Node = detail.Global;
+                    st.Outbound = detail.Outbound;
+                    st.Chain = detail.Chain;
+                    st.DelayMs = detail.HistoryDelayMs;
+                    st.NodeAlive = detail.Alive;
+                }
+                else proxyError = "内核 /proxies 缺少 proxies 字段";
+            }
+            else
+            {
+                proxyError = "读不到代理节点列表：" + proxiesRes.Error;
+            }
+
+            bool rulesOk;
+            var rules = ReadRules(out rulesOk, cfgPath);
+            st.RulesOk = rulesOk;
             st.RuleCount = rules.Count;
 
             // 独立审阅第二轮：Applied 必须能证明「本工具的规则确实在内核里」。
@@ -1813,46 +2196,71 @@ namespace ProxyPicker.Core
             // 白名单 + 空名单＝用户明确要全部直连，出口就是 DIRECT，
             // 不能拿订阅策略组的节点来显示（否则界面说日本、实际全直连）。
             if (!Settings.PatchOnly && diskItems.Count == 0 && !LastLoadFailed)
+            {
                 st.Outbound = "DIRECT";
+                st.Chain = "DIRECT";
+                st.DelayMs = -1;
+            }
             // 勾了软件、但规则指向的策略组本身是 DIRECT/REJECT：这是「保存成功但没代理」，
             // 必须在状态卡里说清楚，不能只显示一个「已生效」。
             if (diskItems.Count > 0 && !string.IsNullOrEmpty(st.Outbound) &&
                 IsBlockedPolicy(st.Outbound))
                 st.Error = "策略组 " + st.Policy + " 当前出口是 " + st.Outbound +
                            "；勾选软件不会走代理";
+            else if (st.Error == null && !string.IsNullOrEmpty(proxyError))
+                st.Error = proxyError;
+
+            if (!rulesOk)
+            {
+                if (st.Error == null) st.Error = "读不到内核规则表（/rules），无法确认分流是否生效";
+                return st;
+            }
+
             var mine = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var it in diskItems) if (!string.IsNullOrEmpty(it.Exe)) mine.Add(it.Exe);
+            // v1.4.0：遵循 mihomo 自上而下首次命中优先原则：
+            // 同一条规则若因订阅残留出现在下方，不覆盖前面已经命中的序号；
+            // 且非 DIRECT 的早期 MATCH（如 MATCH,PROXY）同样会阻断后续直连规则，需计入 firstAnyMatch。
+            var seenRuleKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             bool hasOwnRule = false, hasDirectFallback = false;
-            int firstDirectMatch = -1, lastOwnProcess = -1;
+            int firstDirectMatch = -1, firstAnyMatch = -1, lastOwnProcess = -1;
             for (int i = 0; i < rules.Count; i++)
             {
                 var r = rules[i];
                 string type = r.Type ?? "";
+                string payload = r.Payload ?? "";
+                if (!seenRuleKeys.Add(type + "\0" + payload)) continue;
+
                 if (type.StartsWith("Process", StringComparison.OrdinalIgnoreCase) &&
-                    (mine.Contains(r.Payload ?? "") ||
+                    (mine.Contains(payload) ||
                      (r.Proxy ?? "").Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)))
                 { hasOwnRule = true; lastOwnProcess = i; }
                 else if (type.Equals("RuleSet", StringComparison.OrdinalIgnoreCase) &&
-                         (r.Payload ?? "").IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0) hasOwnRule = true;
-                else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase) && IsDirectPolicy(r.Proxy))
-                { hasDirectFallback = true; if (firstDirectMatch < 0) firstDirectMatch = i; }
+                         payload.IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0) hasOwnRule = true;
+                else if (type.Equals("Match", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (firstAnyMatch < 0) firstAnyMatch = i;
+                    if (IsDirectPolicy(r.Proxy))
+                    {
+                        hasDirectFallback = true;
+                        if (firstDirectMatch < 0) firstDirectMatch = i;
+                    }
+                }
             }
             // 空名单＝用户明确要「全部直连」，段首的 DIRECT 兜底本身就是生效证据。
-            bool emptyAllDirect = diskItems.Count == 0 && HasSavedIntent && firstDirectMatch == 0;
-            // 白名单模式还要查位置：兜底 MATCH 必须排在所有自家进程规则之后。
-            // 只看「有 MATCH」不够——客户端、扩展或用户把 MATCH 挪到前面时，
-            // 勾选的软件会落到直连，状态卡却仍显示「名单已生效」（独立审阅第二轮 P2）。
-            // 兼容模式不受这条约束：订阅自带的提前 MATCH 是订阅作者的分流语义。
-            bool positionOk = Settings.PatchOnly || !hasOwnRule || firstDirectMatch < 0 ||
-                              firstDirectMatch > lastOwnProcess;
+            bool emptyAllDirect = diskItems.Count == 0 && HasSavedIntent && firstDirectMatch == 0 && firstAnyMatch == 0;
+            // 白名单模式还要查位置：兜底 MATCH（任意策略）不能排在自家进程规则之前。
+            bool positionOk = Settings.PatchOnly || !hasOwnRule ||
+                              ((firstAnyMatch < 0 || firstAnyMatch > lastOwnProcess) &&
+                               (firstDirectMatch < 0 || firstDirectMatch > lastOwnProcess));
             // v1.3.8：兼容模式不要求 DIRECT 兜底。订阅本身写成 MATCH,节点选择 时，
             // 规则生成、保存校验、看守都认可它，只有这张状态卡还在硬要 hasDirectFallback，
             // 于是「实际已生效、界面说没生效」，用户会反复重存。白名单模式仍然必须有直连兜底。
             bool fallbackOk = Settings.PatchOnly || hasDirectFallback;
             if (rules.Count > 0 && (hasOwnRule || emptyAllDirect) && fallbackOk && positionOk)
                 st.Applied = true;
-            else if (!Settings.PatchOnly && hasOwnRule && hasDirectFallback && !positionOk)
-                st.Error = "直连兜底排在勾选规则前面，勾选的软件会走直连";
+            else if (!Settings.PatchOnly && hasOwnRule && !positionOk)
+                st.Error = "兜底 MATCH 排在勾选规则前面，部分软件不会按名单分流";
             // 兼容模式下名单是空的＝本来就没有要生效的东西，不该提示「请保存一次」。
             if (!st.Applied && Settings.PatchOnly && diskItems.Count == 0) st.Applied = true;
 
@@ -1862,7 +2270,122 @@ namespace ProxyPicker.Core
             return st;
         }
 
-        // ---------------------------------------------------------------- 定向重连
+        // ---------------------------------------------------------------- 分流异常修复与定向重连
+
+        /// <summary>把被切偏的内核运行开关（全局模式 / 关闭进程识别）修回可按软件分流的状态。</summary>
+        public static bool PatchKernelConfigsForRules(string knownConfigPath, out bool changed, out string error)
+        {
+            changed = false;
+            error = "";
+            var cfgRes = Mihomo.FetchJson("/configs", 4000, knownConfigPath);
+            if (!cfgRes.Ok || cfgRes.Data == null)
+            {
+                error = !string.IsNullOrEmpty(cfgRes.Error) ? cfgRes.Error : "读不到内核配置（/configs）";
+                return false;
+            }
+            string mode = Json.Str(cfgRes.Data, "mode") ?? "";
+            string fpm = Json.Str(cfgRes.Data, "find-process-mode") ?? "";
+            bool needMode = !mode.Equals("rule", StringComparison.OrdinalIgnoreCase);
+            bool needFpm = fpm.Equals("off", StringComparison.OrdinalIgnoreCase);
+            if (!needMode && !needFpm) return true;
+
+            if (needFpm) Settings.CaptureFindProcessOriginal(knownConfigPath);
+
+            var parts = new List<string>();
+            if (needMode) parts.Add("\"mode\":\"rule\"");
+            if (needFpm) parts.Add("\"find-process-mode\":\"always\"");
+            string payload = "{" + string.Join(",", parts) + "}";
+            var patch = Mihomo.Request("PATCH", "/configs", payload, 4000, knownConfigPath);
+            if (!patch.Ok)
+            {
+                error = !string.IsNullOrEmpty(patch.Error) ? patch.Error : ("PATCH /configs 失败（HTTP " + patch.Status + "）");
+                return false;
+            }
+            changed = true;
+            return true;
+        }
+
+        /// <summary>还原配置里的顶层 secret 行；使用 MatchEvaluator 回调防止 secret 内含 `$` 时被 Regex 当成反向引用。</summary>
+        internal static string RestoreSecretLine(string text, string secret)
+        {
+            return System.Text.RegularExpressions.Regex.Replace(
+                text ?? "", @"(?m)^secret:\s*.*$", m => "secret: " + Json.Quote(secret ?? ""));
+        }
+
+        /// <summary>仅挑出「分流异常清单里正在走错链路」的连接（代理/直连方向与预期相反），准备精确断开重连。</summary>
+        public static ConnectionSnapshot CaptureWrongRouteConnections(IEnumerable<Traffic.MismatchItem> mismatches,
+                                                                      out int scannedTotal,
+                                                                      string knownConfigPath = null)
+        {
+            scannedTotal = 0;
+            var snap = new ConnectionSnapshot();
+            if (mismatches == null) return snap;
+
+            var connRes = Mihomo.FetchJson("/connections", 8000, knownConfigPath);
+            if (!connRes.Ok || connRes.Data == null)
+            {
+                snap.Error = !string.IsNullOrEmpty(connRes.Error) ? connRes.Error : "读取活动连接失败";
+                return snap;
+            }
+            snap = SelectWrongRouteConnections(connRes.Data, mismatches);
+            scannedTotal = snap.Total;
+            return snap;
+        }
+
+        /// <summary>从 `/connections` JSON 中筛出需要断开重建的错路连接（已过滤 Unknown 与 REJECT）。</summary>
+        internal static ConnectionSnapshot SelectWrongRouteConnections(Dictionary<string, object> connData,
+                                                                         IEnumerable<Traffic.MismatchItem> mismatches)
+        {
+            var snap = new ConnectionSnapshot();
+            var expectedByExe = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            if (mismatches != null)
+            {
+                foreach (var m in mismatches)
+                {
+                    if (m == null) continue;
+                    string exe = Normalize(m.Exe);
+                    if (exe.Length > 0) expectedByExe[exe] = m.Expected;
+                }
+            }
+            if (expectedByExe.Count == 0 || connData == null) return snap;
+
+            object rawConnections;
+            if (!connData.TryGetValue("connections", out rawConnections))
+            {
+                snap.Error = "连接列表格式异常";
+                return snap;
+            }
+            var arr = Json.AsArray(rawConnections);
+            if (arr == null) { snap.Error = "连接列表格式异常"; return snap; }
+            snap.Total = arr.Count;
+
+            foreach (var item in arr)
+            {
+                var d = Json.AsObject(item);
+                var meta = Json.Obj(d, "metadata");
+                string exe = Json.Str(meta, "process") ?? "";
+                if (exe.Length == 0)
+                    exe = Path.GetFileName(Json.Str(meta, "processPath") ?? "");
+                // mihomo 有时在 metadata.process 里省略 .exe 后缀，对齐名单中的标准化键再查预期映射
+                exe = Normalize(exe);
+                bool expected;
+                if (string.IsNullOrEmpty(exe) || !expectedByExe.TryGetValue(exe, out expected)) continue;
+
+                var chain = Traffic.ChainOf(d);
+                if (chain == Traffic.Chain.Unknown || chain == Traffic.Chain.Rejected) continue;
+                bool wrong = (expected && chain == Traffic.Chain.Direct) ||
+                             (!expected && chain == Traffic.Chain.Proxy);
+                if (!wrong) continue;
+
+                string id = Json.Str(d, "id");
+                if (string.IsNullOrEmpty(id)) continue;
+                snap.Ids.Add(id);
+                int n;
+                snap.ByProcess.TryGetValue(exe, out n);
+                snap.ByProcess[exe] = n + 1;
+            }
+            return snap;
+        }
 
         public sealed class ConnectionSnapshot
         {
@@ -1913,6 +2436,7 @@ namespace ProxyPicker.Core
                 string exe = Json.Str(meta, "process");
                 if (string.IsNullOrEmpty(exe))
                     exe = Path.GetFileName(Json.Str(meta, "processPath") ?? "");
+                exe = Normalize(exe);
                 if (string.IsNullOrEmpty(exe) || !wanted.Contains(exe)) continue;
                 string id = Json.Str(d, "id");
                 if (string.IsNullOrEmpty(id)) continue;

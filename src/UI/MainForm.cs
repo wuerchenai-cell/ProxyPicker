@@ -14,16 +14,25 @@ namespace ProxyPicker.UI
 {
     internal sealed class MainForm : Form
     {
-        const float WinW = 466f;
-        const float WinH = 700f;
-        const float TitleH = 54f;
-        const float SummaryTop = 60f;
-        const float SummaryH = 80f;
-        const float SearchTop = 148f;
-        const float SearchH = 38f;
-        const float TabsTop = 194f;
-        const float ListTop = 230f;
-        const float FooterH = 78f;
+        internal const float DefaultWinW = 880f;
+        internal const float DefaultWinH = 600f;
+        internal const float MinWinW = 466f;
+        internal const float MinWinH = 540f;
+        const float EdgeHitPx = 7f;
+        const float TitleH = 46f;
+        const float NavTop = 48f;
+        const float NavH = 34f;
+        const float SummaryTop = 88f;
+        const float SummaryH = 74f;
+        const float SearchTop = 168f;
+        const float SearchH = 34f;
+        const float FooterH = 66f;
+        const float FooterSlimH = 34f;
+
+        bool NarrowShell { get { return LogicalW < 640f; } }
+        bool CompactToolbar { get { return LogicalW < 640f; } }
+        float TabsTop { get { return CompactToolbar ? 208f : 171f; } }
+        float ListTop { get { return CompactToolbar ? 242f : 208f; } }
 
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
@@ -33,10 +42,36 @@ namespace ProxyPicker.UI
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
         const int WM_NCLBUTTONDOWN = 0xA1;
+        const int WM_GETMINMAXINFO = 0x0024;
+        const int WM_NCHITTEST = 0x0084;
         const int HTCAPTION = 2;
+        const int HTCLIENT = 1;
+        const int HTLEFT = 10;
+        const int HTRIGHT = 11;
+        const int HTTOP = 12;
+        const int HTTOPLEFT = 13;
+        const int HTTOPRIGHT = 14;
+        const int HTBOTTOM = 15;
+        const int HTBOTTOMLEFT = 16;
+        const int HTBOTTOMRIGHT = 17;
         const int EM_SETCUEBANNER = 0x1501;
 
+        [StructLayout(LayoutKind.Sequential)]
+        struct POINT { public int X; public int Y; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MINMAXINFO
+        {
+            public POINT ptReserved;
+            public POINT ptMaxSize;
+            public POINT ptMaxPosition;
+            public POINT ptMinTrackSize;
+            public POINT ptMaxTrackSize;
+        }
+
         readonly AppList _list = new AppList();
+        readonly NodesPage _nodesPage = new NodesPage();
+        readonly QualityPage _qualityPage = new QualityPage();
         readonly TextBox _search = new TextBox();
         readonly ToastHost _toasts = new ToastHost();
         // 走势图靠「时间轴推进」而不是「每秒挪一格」，帧率决定连续感：
@@ -53,16 +88,22 @@ namespace ProxyPicker.UI
              _fTab, _fTabActive, _fRate, _fTiny, _fHelp, _fHelpTitle;
         Font _fPill;   // 出口胶囊，懒加载
 
-        enum Btn { None, Save, Direct, Refresh, Close, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch }
+        enum Btn { None, Nav0, Nav1, Nav2, Save, Direct, Refresh, Close, Max, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch, Delay, ModeChip }
         Btn _hover = Btn.None;
+        int _page;          // 一级功能区：0=应用分流 1=节点策略 2=链路体检
+        readonly Stack<int> _pageHistory = new Stack<int>();
         int _tab;
         int _hoverTab = -1;
         bool _busy;
+        bool _restoringSize = true;
+        bool _pendingRefresh;
+        bool _ipv6Busy;
         bool _polling;
         bool _checkingOutbound;
         bool _resourcesDisposed;
         bool _timerRaised;   // 已把系统定时器精度提到 1ms，退出时要还回去
         int _revision;
+        int _catalogSeq;
         readonly Icon _windowIcon;      // 小图标（任务栏按钮 / Alt+Tab）
         readonly Icon _windowIconBig;   // 大图标（Alt+Tab 预览、任务视图）
         readonly Bitmap _titleIcon;
@@ -70,6 +111,9 @@ namespace ProxyPicker.UI
         DateTime _lastFailureAt;
         bool _realExit;
         bool _help;
+        bool _nodesLoadedOnce;
+        NodeQuality.QualityReport _lastQualityReport;
+        RectangleF _modeChipRect;
         bool _modeChanged;   // 在帮助面板里切过分流模式，关闭时提醒去保存
         volatile bool _shuttingDown;   // 退出还原进行中：禁止再起保存任务（v1.3.7）
         bool _compatHintShown; // 「订阅兼容下取消勾选≠直连」只提示一次，不反复弹
@@ -79,9 +123,21 @@ namespace ProxyPicker.UI
         bool _updateBusy;
         bool _updateSessionDone;  // 本次运行已经自动查过一次，别每次打开面板都去问
         string _notifiedVersion;  // 本次运行已为哪个版本弹过提示，避免联网复查重复打扰
-        // 真正推给内核的代理名单（含 helper / 登录窗口 / 本程序自身等派生规则）。
-        // 对账的「预期」必须用它，只用界面勾选会把自己放行的进程报成异常（实机 2026-11-10）。
-        volatile HashSet<string> _effectiveProxy;
+        sealed class EffectiveRules
+        {
+            public readonly HashSet<string> Exes;
+            public readonly List<Regex> PathRegexes;
+
+            public EffectiveRules(HashSet<string> exes, List<Regex> pathRegexes)
+            {
+                Exes = exes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                PathRegexes = pathRegexes ?? new List<Regex>();
+            }
+        }
+
+        // 真正推给内核的代理名单与目录正则（含 helper / 登录窗口 / 本程序自身等派生规则）。
+        // 对账的「预期」必须用它，只用界面勾选或只记主 exe 会把合法子进程报成异常（实机 2026-11-10 / v1.4.0）。
+        volatile EffectiveRules _effective = new EffectiveRules(null, null);
 
         /// <summary>点了「—」之后由托盘那边弹一次气泡，告诉用户窗口去哪了。首次才弹。</summary>
         public Action TrayHint;
@@ -133,7 +189,29 @@ namespace ProxyPicker.UI
         int _coveredProcs;    // 其中在名单里的个数
         int _mismatch;        // 预期出口与实际链路不一致的软件数（白名单模式下才判）
         List<Traffic.MismatchItem> _mismatchItems = new List<Traffic.MismatchItem>();
+        int _mismatchStreak;  // 连续命中分流异常的采样次数（至少 2 秒稳定命中再自动修，避免建链瞬间抖动）
+        int _autoMismatchCount; // 同一异常期间已自动尝试修复次数（最多 3 次防死循环）
+        DateTime _lastAutoMismatchAt = DateTime.MinValue;
         bool _blindToasted;
+
+        // 实时节点延迟与定期测速状态 / 自动故障切换
+        RectangleF _delayRect;
+        RectangleF _mismatchRect;
+        bool _delayTesting;
+        int _delayMs = -1;
+        string _delayNode = "";
+        string _delayError = "";
+        bool _delayTimedOut;
+        DateTime _lastDelayTestAt = DateTime.MinValue;
+        DateTime _lastDelayAlertAt = DateTime.MinValue;
+        bool _delayAlertActive;
+        bool _failoverBusy;
+        bool _nodeActionBusy;
+        bool _batchDelayRunning;
+        volatile bool _batchDelayCancel;
+        bool _batchQualityRunning;
+        volatile bool _batchQualityCancel;
+        DateTime _lastFailoverAt = DateTime.MinValue;
 
         void BuildFonts()
         {
@@ -186,7 +264,10 @@ namespace ProxyPicker.UI
             DoubleBuffered = true;
             BackColor = Theme.Bg;
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(Theme.Px(WinW), Theme.Px(WinH));
+            SetStyle(ControlStyles.ResizeRedraw, true);
+            float initW = Settings.Current.WinW >= MinWinW ? Settings.Current.WinW : DefaultWinW;
+            float initH = Settings.Current.WinH >= MinWinH ? Settings.Current.WinH : DefaultWinH;
+            ClientSize = ClampLogicalClientSize(initW, initH, Theme.S, Screen.FromPoint(Cursor.Position).WorkingArea);
             KeyPreview = true;
             // 无边框窗体的 ShowIcon 默认不可靠：必须在句柄创建后自己发 WM_SETICON，
             // 否则任务栏那一格会是空白图标（用户反馈的「任务栏没有图标」就是这个）。
@@ -222,8 +303,74 @@ namespace ProxyPicker.UI
 
             Controls.Add(_list);
             Controls.Add(_search);
+            _nodesPage.Visible = false;
+            _nodesPage.Overlay = (g, area) => { if (_toasts.Any) _toasts.Render(g, area); };
+            _nodesPage.BackRequested += NavigateBack;
+            _nodesPage.TestCurrentDelayRequested += () => _ = RunDelayTestAsync(true);
+            _nodesPage.ToggleBatchDelayRequested += ToggleBatchDelayScan;
+            _nodesPage.SwitchNodeRequested += node => _ = SwitchNodeFromPanelAsync(node);
+            _nodesPage.ProbeAndOpenQualityRequested += node => InspectSpecificNodeFromPanel(node);
+            _nodesPage.CandidateToggled += (node, on) =>
+            {
+                Settings.SetCandidateNode(node, on);
+                InvalidateNavBar();
+                SetStatus((on ? "已加入备选池：" : "已移出备选池：") + CleanEmoji(node), Theme.Dim);
+            };
+            _nodesPage.CandidateBatchChanged += names =>
+            {
+                Settings.SetCandidateNodes(names);
+                InvalidateNavBar();
+                SetStatus("已更新备选池（" + names.Count + " 个节点）", Theme.Accent);
+            };
+            _nodesPage.AutoFailoverToggled += on =>
+            {
+                Settings.SetAutoFailover(on);
+                int c = Settings.GetCandidateNodes().Count;
+                SetStatus(on
+                    ? (c > 0 ? "已开启：当前节点超时自动切备选池最低延迟节点（切完必通知）" : "已开启自动切换（请勾选至少 1 个备选节点）")
+                    : "已关闭节点超时自动切换", on && c == 0 ? Theme.Warn : Theme.Accent);
+            };
+
+            _qualityPage.Visible = false;
+            _qualityPage.Overlay = (g, area) => { if (_toasts.Any) _toasts.Render(g, area); };
+            _qualityPage.BackRequested += NavigateBack;
+            _qualityPage.InspectRequested += target =>
+                _ = InspectNodeQualityAsync(string.IsNullOrEmpty(target) ? _state.Outbound : target, false);
+            _qualityPage.BatchRiskScanRequested += () => _ = ToggleBatchQualityScanAsync();
+            _qualityPage.DesiredRegionCycled += () =>
+            {
+                string next = Settings.CycleDesiredRegion();
+                string msg = "期望落地地区改为：" + NodeManager.RegionDisplayName(next) + "（重新执行「单节点检测」或「全量节点评估」后按新地区核对）";
+                SetStatus(msg, Theme.Accent);
+                Toast("期望地区已切换", NodeManager.RegionDisplayName(next), Theme.Accent, 2);
+            };
+            _qualityPage.JumpToNodesRequested += () => PushAndSwitchPage(1);
+            _qualityPage.SwitchNodeRequested += node => _ = SwitchNodeFromPanelAsync(node);
+            _qualityPage.ApplyLowRiskPoolRequested += names =>
+            {
+                if (names == null || names.Count == 0)
+                {
+                    Toast("没有符合条件的可用节点", "请先执行「全量节点评估」，或勾选低风控 / 全部就绪节点", Theme.Warn, 1);
+                    return;
+                }
+                Settings.SetCandidateNodes(names);
+                _ = LoadNodesCatalogAsync();
+                InvalidateNavBar();
+                Toast("已更新节点策略备选池", "已纳入 " + names.Count + " 个低风控且主流服务就绪节点", Theme.Ok, 0);
+                SetStatus("已把 " + names.Count + " 个低风控优质节点设为自动切换备选池", Theme.Ok);
+            };
+            _qualityPage.CopyIpRequested += ip =>
+            {
+                try { Clipboard.SetText(ip); } catch { }
+                Toast("已复制出口 IP", ip, Theme.Ok, 0);
+                SetStatus("已复制当前出口 IP：" + ip, Theme.Ok);
+            };
+
+            Controls.Add(_nodesPage);
+            Controls.Add(_qualityPage);
             KeyDown += OnFormKeyDown;
             LayoutChildren();
+            _restoringSize = false;
             SendMessageText(_search.Handle, EM_SETCUEBANNER, new IntPtr(1), "搜索软件名或进程名…");
 
             _clock.Tick += ClockTick;
@@ -273,22 +420,104 @@ namespace ProxyPicker.UI
         /// 窗口被拖到另一块不同 DPI 的显示器时，重建字体与尺寸。
         /// 以前只按启动时的 DPI 算一次，跨屏后自绘文字会模糊、命中矩形会错位。
         /// </summary>
+        internal static Size ClampLogicalClientSize(float logicalW, float logicalH, float scale, Rectangle workingArea)
+        {
+            if (scale < 0.5f) scale = 1f;
+            int pw = Math.Max(420, (int)Math.Round(logicalW * scale));
+            int ph = Math.Max(480, (int)Math.Round(logicalH * scale));
+            if (workingArea.Width > 0 && workingArea.Height > 0)
+            {
+                int maxW = Math.Max(420, workingArea.Width - 16);
+                int maxH = Math.Max(480, workingArea.Height - 8);
+                if (pw > maxW) pw = maxW;
+                if (ph > maxH) ph = maxH;
+            }
+            return new Size(pw, ph);
+        }
+
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == WM_GETMINMAXINFO && !IsDisposed)
+            {
+                try
+                {
+                    var mmi = (MINMAXINFO)Marshal.PtrToStructure(m.LParam, typeof(MINMAXINFO));
+                    var scr = Screen.FromHandle(Handle);
+                    var wa = scr.WorkingArea;
+                    var b = scr.Bounds;
+                    mmi.ptMaxPosition.X = wa.X - b.X;
+                    mmi.ptMaxPosition.Y = wa.Y - b.Y;
+                    mmi.ptMaxSize.X = wa.Width;
+                    mmi.ptMaxSize.Y = wa.Height;
+                    mmi.ptMinTrackSize.X = Math.Min(wa.Width, Math.Max(420, Theme.Px(MinWinW)));
+                    mmi.ptMinTrackSize.Y = Math.Min(wa.Height, Math.Max(420, Theme.Px(MinWinH)));
+                    mmi.ptMaxTrackSize.X = Math.Max(mmi.ptMinTrackSize.X, wa.Width);
+                    mmi.ptMaxTrackSize.Y = Math.Max(mmi.ptMinTrackSize.Y, wa.Height);
+                    Marshal.StructureToPtr(mmi, m.LParam, true);
+                }
+                catch { }
+                m.Result = IntPtr.Zero;
+                return;
+            }
+
             base.WndProc(ref m);
+
+            if (m.Msg == WM_NCHITTEST && !IsDisposed && WindowState != FormWindowState.Maximized && !_help &&
+                (int)m.Result == HTCLIENT)
+            {
+                try
+                {
+                    int raw = unchecked((int)m.LParam.ToInt64());
+                    int sx = (short)(raw & 0xFFFF);
+                    int sy = (short)((raw >> 16) & 0xFFFF);
+                    var pt = PointToClient(new Point(sx, sy));
+                    int hit = Math.Max(6, Theme.Px(EdgeHitPx));
+                    int w = ClientSize.Width, h = ClientSize.Height;
+                    bool left = pt.X <= hit, right = pt.X >= w - hit;
+                    bool top = pt.Y <= hit, bottom = pt.Y >= h - hit;
+                    if (left && top) m.Result = (IntPtr)HTTOPLEFT;
+                    else if (right && top) m.Result = (IntPtr)HTTOPRIGHT;
+                    else if (left && bottom) m.Result = (IntPtr)HTBOTTOMLEFT;
+                    else if (right && bottom) m.Result = (IntPtr)HTBOTTOMRIGHT;
+                    else if (left) m.Result = (IntPtr)HTLEFT;
+                    else if (right) m.Result = (IntPtr)HTRIGHT;
+                    else if (top) m.Result = (IntPtr)HTTOP;
+                    else if (bottom) m.Result = (IntPtr)HTBOTTOM;
+                }
+                catch { }
+                return;
+            }
+
             if (m.Msg != WM_DPICHANGED || IsDisposed) return;
             try
             {
+                float prevW = LogicalW, prevH = LogicalH;
                 int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
                 if (dpi < 72) return;
                 Theme.SetScale(dpi / 96f);
                 BuildFonts();
                 _search.Font = _fInput;
-                ClientSize = new Size(Theme.Px(WinW), Theme.Px(WinH));
+                _list.RefreshThemeAndFonts();
+                _nodesPage.RefreshThemeAndFonts();
+                _qualityPage.RefreshThemeAndFonts();
+                if (WindowState == FormWindowState.Normal)
+                {
+                    ClientSize = ClampLogicalClientSize(prevW, prevH, Theme.S, Screen.FromControl(this).WorkingArea);
+                    Settings.SetWindowSize((int)Math.Round(LogicalW), (int)Math.Round(LogicalH));
+                }
                 LayoutChildren();
                 Invalidate();
             }
             catch { }
+        }
+
+        void ToggleMaximize()
+        {
+            WindowState = WindowState == FormWindowState.Maximized
+                ? FormWindowState.Normal
+                : FormWindowState.Maximized;
+            LayoutChildren();
+            Invalidate();
         }
 
         /// <summary>
@@ -331,9 +560,14 @@ namespace ProxyPicker.UI
                 need = true;
             }
 
-            if (_toasts.Tick((float)dt)) need = true;
+            bool toastTicked = _toasts.Tick((float)dt);
+            if (toastTicked)
+            {
+                InvalidateActiveToastSurface();
+                if (_page == 0 && !_list.Visible) need = true;
+            }
 
-            bool trafficAlive = Visible && !_help && _traffic != null && _traffic.Ok;
+            bool trafficAlive = Visible && !_help && _page == 0 && _traffic != null && _traffic.Ok;
             if (trafficAlive)
             {
                 // 内核数据仍然是一秒一个真实平均值，这里只平滑「显示」，不伪造新采样。
@@ -345,7 +579,7 @@ namespace ProxyPicker.UI
                 summaryNeed = true;
             }
 
-            bool sparkAlive = Visible && !_help && _sparkProxy.Count >= 2;
+            bool sparkAlive = Visible && !_help && _page == 0 && _sparkProxy.Count >= 2;
             if (sparkAlive)
             {
                 // 逻辑时间轴跟真实时间走，但不超过「最后一个样本 + 一个采样周期」：
@@ -366,7 +600,7 @@ namespace ProxyPicker.UI
                 Invalidate(Rectangle.Round(new RectangleF(
                     Theme.Px(r.X) - 3, Theme.Px(r.Y) - 3, Theme.Px(r.Width) + 6, Theme.Px(r.Height) + 6)));
             }
-            else if (!sparkAlive) _clock.Stop();
+            else if (!sparkAlive && !_toasts.Any && !_spinning && _show >= 1f) _clock.Stop();
         }
 
         static double Approach(double value, double target, double seconds, double tau)
@@ -385,9 +619,19 @@ namespace ProxyPicker.UI
 
         public void ShowPanel()
         {
+            bool wasDark = Theme.Dark;
             Theme.Load();
+            if (wasDark != Theme.Dark)
+            {
+                BackColor = Theme.Bg;
+                _search.BackColor = Theme.Card;
+                _search.ForeColor = Theme.Fg;
+                _nodesPage.RefreshThemeAndFonts();
+                _qualityPage.RefreshThemeAndFonts();
+            }
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
-            Show(); BringToFront(); Activate(); _search.Focus();
+            Show(); BringToFront(); Activate();
+            if (_page == 0 && !_help) _search.Focus();
             if (_all.Count == 0 || (DateTime.UtcNow - _lastLoad).TotalSeconds > 20) RefreshAsync();
             else { ShowDirtyStatus(); RebuildVisible(false); }
             _trafficTimer.Start();
@@ -437,6 +681,8 @@ namespace ProxyPicker.UI
         public void BeginShutdown()
         {
             _shuttingDown = true;
+            _batchDelayCancel = true;
+            _batchQualityCancel = true;
             try { Enabled = false; } catch { }
         }
 
@@ -482,11 +728,22 @@ namespace ProxyPicker.UI
                 }
                 ownsBusy = true;
                 BeginBusy();
+                int refreshRev = _revision;
+                string prevClient = _state.Client ?? "";
+                string prevOutbound = _state.Outbound ?? "";
                 _spinUntil = DateTime.UtcNow.AddMilliseconds(650);
                 SetStatus("正在读取软件与内核状态…", Theme.Dim);
                 var pack = await Task.Run(() => LoadPack());
-                if (!UiAlive) return;
+                if (!UiAlive || refreshRev != _revision) return;
                 _state = pack.State;
+                if (!_state.ConfigOk ||
+                    !string.Equals(prevClient, _state.Client ?? "", StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(prevOutbound, _state.Outbound ?? "", StringComparison.OrdinalIgnoreCase))
+                {
+                    ResetDelayBannerState();
+                    _catalogSeq++;
+                    if (!_state.ConfigOk) _nodesPage.SetLoading(false);
+                }
                 _all = pack.Rows;
                 _lastLoad = DateTime.UtcNow;
                 // 让 _all 本身也按当前排序方式排好：否则「界面看到的顺序」和「_all 的顺序」
@@ -494,11 +751,57 @@ namespace ProxyPicker.UI
                 ApplySort(_all, Settings.Current.SortMode);
                 _savedProxy = new HashSet<string>(_all.Where(r => r.Proxy).Select(r => r.Exe), StringComparer.OrdinalIgnoreCase);
                 _list.SavedProxy = _savedProxy;
+                if (_savedProxy.Count > 0)
+                {
+                    var savedSnap = new List<string>(_savedProxy);
+                    var visibleSnap = VisibleExes();
+                    var pathsSnap = PathMap();
+                    var policiesSnap = PolicyMapFromRows();
+                    var effInit = await Task.Run(() => ComposeWithHelpers(savedSnap, visibleSnap, pathsSnap, policiesSnap));
+                    if (!UiAlive) return;
+                    SetEffectiveProxy(effInit);
+                }
+                else
+                {
+                    SetEffectiveProxy(null);
+                }
                 Settings.Current.Tab = _tab;
                 Settings.Save();
                 RebuildVisible(true);
-                SetStatus(_state.Error ?? (_state.Applied ? "名单已生效 · 改动后记得保存" : "名单未生效，请保存一次"),
-                    _state.Error == null && _state.Applied ? Theme.Dim : Theme.Warn);
+                _nodesPage.SetCurrentOutbound(_state.Outbound, _delayMs > 0 ? _delayMs : _state.DelayMs, _delayTimedOut, _state.ProxyActive);
+                _qualityPage.SetCurrentOutbound(_state.Outbound);
+                InvalidateNavBar();
+                if (_page == 1 || _page == 2) _ = LoadNodesCatalogAsync();
+                bool kernelOnline = _state.ConfigOk;
+                bool proxyActive = _state.ProxyActive;
+                bool kernelIsRule = kernelOnline && Profile.IsRuleMode(_state.Mode);
+                if (!kernelOnline)
+                {
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    SetStatus(_state.Error ?? "未检测到运行中的代理内核（当前未连接）", Theme.Warn);
+                }
+                else if (!kernelIsRule)
+                {
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    string clientLabel = !string.IsNullOrEmpty(_state.Client) ? _state.Client : "代理内核";
+                    SetStatus(clientLabel + " 当前为「" + Profile.ModeDisplayName(_state.Mode) + "」模式，按软件分流暂停生效", Theme.Warn);
+                }
+                else if (!proxyActive)
+                {
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    SetStatus(_state.Error ?? "客户端已运行，但 TUN 和系统代理均未开启（当前未连接代理）", Theme.Warn);
+                }
+                else
+                {
+                    SetStatus(_state.Error ?? (_state.Applied ? "名单已生效 · 改动后记得保存" : "名单未生效，请保存一次"),
+                        _state.Error == null && _state.Applied ? Theme.Dim : Theme.Warn);
+                }
                 // 多客户端提醒不能只躺在 --diag 里：装了多个梯子、又没都开着时，
                 // 自动选中的那个如果不对，用户要第一时间知道，而不是等分流不生效再排查。
                 try
@@ -511,10 +814,9 @@ namespace ProxyPicker.UI
                     }
                 }
                 catch { }
-                // 名单不是空的、也没报错，但规则不见了 —— 只可能是客户端自己重新生成了配置
-                // （换订阅、重启 Verge、改设置都会）。这时光提示「请保存一次」没用，
-                // 用户会以为软件坏了或者代理失效了，干脆替他补回去。
-                needRepair = !_state.Applied && _state.Error == null
+                // 名单不是空的、也没报错，但规则不见了 —— 只在内核处于 rule 模式时自动补回；
+                // 若用户明确切在全局/直连模式，绝不偷偷把客户端改回 rule 或触发无效补回报错。
+                needRepair = kernelIsRule && !_state.Applied && _state.Error == null
                              && _savedProxy.Count > 0 && !_autoRepaired;
                 // 名单读取失败时显示最后一份好名单，并禁止自动补回（评审 R6-3）。
                 if (Profile.LastLoadFailed)
@@ -528,6 +830,12 @@ namespace ProxyPicker.UI
             catch (Exception ex) { ReportFailure("读取软件状态", ex); }
             finally { if (ownsBusy) FinishBusy(); }
             if (needRepair && UiAlive) RepairQuietly();
+            if (UiAlive && _state.ConfigOk && _state.ProxyActive && !string.IsNullOrEmpty(_state.Outbound) &&
+                Profile.ClassifyExit(_state.Outbound) == Profile.ExitKind.Proxy &&
+                (DateTime.UtcNow - _lastDelayTestAt).TotalSeconds >= 10)
+            {
+                _ = RunDelayTestAsync(false);
+            }
         }
 
         /// <summary>
@@ -551,7 +859,11 @@ namespace ProxyPicker.UI
 
         void WatchTick()
         {
-            if (!UiAlive || _busy || _watching) return;
+            if (!UiAlive) return;
+            // 定期调用 Clash /proxies/{节点}/delay 测速；即使收进托盘也会按配置间隔持续巡检并在超时时弹窗提醒
+            if (!_busy && !_delayTesting && ShouldRunPeriodicDelayTest())
+                _ = RunDelayTestAsync(false);
+            if (_busy || _watching) return;
             if (++_watchTick % 3 != 0) return;   // 10 秒 × 3 = 30 秒对一次账
             WatchAsync();
         }
@@ -597,32 +909,121 @@ namespace ProxyPicker.UI
                 // 只比主 exe 会得出「已生效」，实际登录请求仍然直连（实测就是登录失败）。
                 var visibleForAudit = VisibleExes();
                 var pathsForAudit = PathMap();
-                var wantedItems = await Task.Run(() => ComposeWithHelpers(exes, visibleForAudit, pathsForAudit));
+                var auditPolicies = PolicyMapFromRows();
+                var wantedItems = await Task.Run(() => ComposeWithHelpers(exes, visibleForAudit, pathsForAudit, auditPolicies));
                 var wantedAll = wantedItems.Select(i => i.IsPathRule ? i.PathRegex : i.Exe).ToList();
-                var auditPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var r in _all)
-                    if (r.Proxy && !string.IsNullOrEmpty(r.Policy)) auditPolicies[r.Exe] = r.Policy;
                 var audit = await Task.Run(() => Guard.Audit(wantedAll, auditPolicies, watchCfg));
                 if (!UiAlive || revision != _revision) return;
+                SetEffectiveProxy(wantedItems);
+
+                bool sysWatchOn = false;
+                string sysWatchSrv = "";
+                Profile.ReadSystemProxyState(out sysWatchOn, out sysWatchSrv);
+                _state.SystemProxyEnabled = sysWatchOn;
+                _state.SystemProxyServer = sysWatchSrv;
+
+                if (!audit.Ok)
+                {
+                    _state.ConfigOk = false;
+                    _state.Tun = false;
+                    _state.Mode = "?";
+                    _state.Outbound = "";
+                    _state.Chain = "";
+                    _state.Applied = false;
+                    _state.DelayMs = -1;
+                    _state.NodeAlive = null;
+                    ResetDelayBannerState();
+                    _catalogSeq++;
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    _state.Error = !string.IsNullOrEmpty(audit.Error) ? audit.Error : "未检测到运行中的代理内核（当前未连接）";
+                    _nodesPage.SetLoading(false);
+                    _nodesPage.SetCurrentOutbound("", -1, false, false);
+                    _qualityPage.SetCurrentOutbound("");
+                    InvalidateNavBar();
+                    Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + SummaryH + 4)));
+                    return;
+                }
+
+                _state.ConfigOk = true;
+                _state.Tun = audit.TunEnabled;
+                if (!string.IsNullOrEmpty(audit.Mode)) _state.Mode = audit.Mode;
+
+                // 后台定期同步最新出口节点（最小化到托盘期间也保证定期测速拿到的是当前选中节点）
+                try
+                {
+                    string pol = !string.IsNullOrEmpty(_state.Policy) ? _state.Policy : Profile.PolicyName(watchCfg);
+                    var detail = await Task.Run(() =>
+                    {
+                        if (!patch && exes.Count == 0 && Profile.IsRuleMode(_state.Mode))
+                            return new Profile.OutboundDetail { Global = "", Outbound = "DIRECT", Chain = "DIRECT", HistoryDelayMs = -1, Alive = null };
+                        string targetPol = _state.Mode.Equals("global", StringComparison.OrdinalIgnoreCase) ? "GLOBAL"
+                            : (_state.Mode.Equals("direct", StringComparison.OrdinalIgnoreCase) ? "DIRECT" : pol);
+                        var obj = Mihomo.GetJson("/proxies", 6000, watchCfg);
+                        var proxies = Json.Obj(obj, "proxies");
+                        return Core.Profile.ResolveOutboundDetail(proxies, targetPol);
+                    });
+                    if (!UiAlive || revision != _revision) return;
+                    if (!string.IsNullOrEmpty(pol)) _state.Policy = pol;
+                    if (!string.IsNullOrEmpty(detail.Outbound))
+                    {
+                        _state.Outbound = detail.Outbound;
+                        _state.Chain = detail.Chain;
+                        _state.NodeAlive = detail.Alive;
+                        _state.DelayMs = detail.HistoryDelayMs > 0 ? detail.HistoryDelayMs : -1;
+                    }
+                    else
+                    {
+                        _state.Outbound = "";
+                        _state.Chain = "";
+                        _state.DelayMs = -1;
+                        _state.NodeAlive = null;
+                    }
+                    _nodesPage.SetCurrentOutbound(_state.Outbound, _delayMs > 0 ? _delayMs : _state.DelayMs, _delayTimedOut, _state.ProxyActive);
+                    _qualityPage.SetCurrentOutbound(_state.Outbound);
+                    InvalidateNavBar();
+                }
+                catch { }
 
                 // 用户刚在帮助面板切了模式但还没点保存，看守不能替他把新模式推下去（评审 R4-2）。
                 if (_modeChanged) return;
                 // 还原时名单文件删除失败：看守已经暂停，不能再按旧名单补回（v1.3.7）。
                 if (Settings.RepairSuspended) return;
 
-                // 全局模式 / 关掉进程识别时规则根本不参与匹配，自动重推没有意义，只提示。
-                if (audit.Ok && !string.IsNullOrEmpty(audit.Mode) &&
-                    !audit.Mode.Equals("rule", StringComparison.OrdinalIgnoreCase))
+                // v1.5.0：如果用户在 Clash 客户端主动切到了全局/直连模式，尊重用户当前模式，
+                // 绝不后台强行 PATCH 回 rule（否则 Clash 显示全局而内核被抢回规则，造成模式打架与控制权争夺）。
+                bool modeDrifted = audit.Ok && !Profile.IsRuleMode(audit.Mode);
+                if (modeDrifted)
                 {
-                    SetStatus("客户端当前是「" + audit.Mode + "」模式，按软件分流不生效；请切回规则模式", Theme.Warn);
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    if (_state.Error == null)
+                        SetStatus("Clash 当前为「" + Profile.ModeDisplayName(audit.Mode) + "」模式，按软件分流暂停中", Theme.Warn);
+                    Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
                     return;
                 }
-                // mihomo：always=强制查进程、strict=按需查（默认，PROCESS 规则正常生效）、off=关闭。
-                // 只有 off 才该放弃补回；以前把 strict 也当成没开，默认 Verge Rev 下规则永远补不回来（F1）。
-                if (audit.Ok && !string.IsNullOrEmpty(audit.FindProcess) &&
-                    audit.FindProcess.Equals("off", StringComparison.OrdinalIgnoreCase))
+
+                // 仅在 rule 模式下如果进程识别被意外关闭（find-process-mode=off），才自动修回 always。
+                if (audit.Ok && WatchShouldAutoFixConfig(audit.Mode, audit.FindProcess))
                 {
-                    SetStatus("客户端关掉了进程识别（find-process-mode=off），按软件分流不生效", Theme.Warn);
+                    var nowUtc = DateTime.UtcNow;
+                    bool canAutoFix = Profile.HasSavedIntent &&
+                                      _repairFails < 3 && _repairNoProgress < 3 && _autoMismatchCount < 3 &&
+                                      (_lastRepairAt == DateTime.MinValue || (nowUtc - _lastRepairAt).TotalSeconds >= 30) &&
+                                      (_lastAutoMismatchAt == DateTime.MinValue || (nowUtc - _lastAutoMismatchAt).TotalSeconds >= 30);
+                    if (canAutoFix)
+                    {
+                        _lastAutoMismatchAt = nowUtc;
+                        _autoMismatchCount++;
+                        AuditLog.Record("WATCH", "进程识别被关闭（find-process-mode=off），触发自动修复");
+                        BeginInvoke(new Action(() => _ = RepairMismatchAsync(true)));
+                    }
+                    else
+                    {
+                        SetStatus("客户端关掉了进程识别（find-process-mode=off），按软件分流不生效", Theme.Warn);
+                    }
                     return;
                 }
 
@@ -671,7 +1072,9 @@ namespace ProxyPicker.UI
 
                 var visible = VisibleExes();
                 var paths = PathMap();
-                var res = await Task.Run(() => Profile.Apply(ComposeWithHelpers(exes, visible, paths), true));
+                var policies = PolicyMapFromRows();
+                var built = ComposeWithHelpers(exes, visible, paths, policies);
+                var res = await Task.Run(() => Profile.Apply(built, true));
                 if (!UiAlive) return;
                 if (!res.Ok)
                 {
@@ -697,6 +1100,7 @@ namespace ProxyPicker.UI
                     throw new InvalidOperationException(res.Message ?? "内核没有确认");
                 }
 
+                SetEffectiveProxy(built);
                 _state.Applied = true;
                 _state.RuleCount = res.RuleCount;
                 UpdateLogContext();
@@ -846,22 +1250,53 @@ namespace ProxyPicker.UI
                 items.Add(new Profile.Item("msedgewebview2.exe", "PP-FIXED") { Derived = true });
             }
 
-            // 「启动自检更新」是本程序自己发的那个 GET。完全接管下没勾的一律落到
-            // MATCH,DIRECT，GitHub 连不上就等于没有这个功能；所以只给本程序放行这一条。
-            // 关掉 settings.json 里的 updateCheck 即不再出网，规则也会自动消失。
-            if (!Settings.PatchOnly && proxy.Count > 0 && Settings.Current.UpdateCheck &&
+            // 「启动自检更新 / 节点风控检测」均依赖本程序访问公网。白名单保存后将自身加入派生代理规则，
+            // 这样无论用户是否关闭自动更新或自动切换，都能直接测本机节点风控。
+            if (!Settings.PatchOnly && proxy.Count > 0 &&
                 !items.Any(i => i.Exe.Equals("proxypicker.exe", StringComparison.OrdinalIgnoreCase)))
             {
                 items.Add(new Profile.Item("proxypicker.exe", "PP-FIXED") { Derived = true });
             }
 
-            // 对账的「预期」必须是真正下发的东西：helper、登录窗口、本程序自身
-            // 都是派生规则，只用界面勾选会把它们报成「没勾选却走代理」。
-            var eff = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var it in items) if (!it.IsPathRule) eff.Add(it.Exe);
-            _effectiveProxy = eff;
-
+            // 返回构造后的规则清单，不直接改 UI 共享状态 _effectiveProxy；
+            // 由调用方确认事务落盘/生效且修订号未过期后通过 SetEffectiveProxy 提交。
             return items;
+        }
+
+        void SetEffectiveProxy(IEnumerable<Profile.Item> items)
+        {
+            var eff = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var rxList = new List<Regex>();
+            if (items != null)
+            {
+                foreach (var it in items)
+                {
+                    if (it == null) continue;
+                    if (it.IsPathRule)
+                    {
+                        string pat = !string.IsNullOrEmpty(it.PathRegex) ? it.PathRegex : it.Exe;
+                        if (string.IsNullOrEmpty(pat)) continue;
+                        try
+                        {
+                            rxList.Add(new Regex(pat, RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(50)));
+                        }
+                        catch { }
+                    }
+                    else if (!string.IsNullOrEmpty(it.Exe))
+                    {
+                        eff.Add(Profile.Normalize(it.Exe));
+                    }
+                }
+            }
+            _effective = new EffectiveRules(eff, rxList);
+        }
+
+        Dictionary<string, string> PolicyMapFromRows()
+        {
+            var policies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in _all)
+                if (r.Proxy && !string.IsNullOrEmpty(r.Policy)) policies[r.Exe] = r.Policy;
+            return policies;
         }
 
         sealed class Pack
@@ -872,6 +1307,9 @@ namespace ProxyPicker.UI
 
         static Pack LoadPack()
         {
+            // 主动刷新列表时顺带重扫客户端并清空通道缓存，保证关掉 A 开 B（如 Verge -> FlClash）能立即切换过去。
+            Discovery.Detect(true);
+            Mihomo.Forget();
             // 老版本名单在客户端目录下；只在 GUI 读列表时迁移一次，只读命令不写盘。
             Paths.MigrateLegacyList();
             var procs = Scanner.Scan();
@@ -998,12 +1436,35 @@ namespace ProxyPicker.UI
             bool ownsBusy = false;
             try
             {
-                if (!UiAlive || _busy || _help || _shuttingDown) return;
+                if (!UiAlive || _busy || _help || _page != 0 || _shuttingDown) return;
                 if (_all.Count == 0)
                 {
                     Toast("还没有可保存的名单", "等列表读出来再试一次", Theme.Warn, 1);
                     return;
                 }
+                string checkCfg = Paths.ClashYaml;
+                string liveMode = await Task.Run(() =>
+                {
+                    var res = Mihomo.FetchJson("/configs", 3000, checkCfg);
+                    return res.Ok && res.Data != null ? (Json.Str(res.Data, "mode") ?? "") : "";
+                });
+                if (!UiAlive || _busy || _shuttingDown) return;
+
+                bool switchBackToRule = false;
+                if (!string.IsNullOrEmpty(liveMode) && !Profile.IsRuleMode(liveMode))
+                {
+                    var ans = MessageBox.Show(this,
+                        "Clash 当前处于「" + Profile.ModeDisplayName(liveMode) + "」模式，按软件分流规则不会生效。\n\n" +
+                        "是否自动将 Clash 切回「规则」模式并应用勾选名单？",
+                        "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (ans != DialogResult.Yes)
+                    {
+                        SetStatus("保持「" + Profile.ModeDisplayName(liveMode) + "」模式，未应用名单", Theme.Warn);
+                        return;
+                    }
+                    switchBackToRule = true;
+                }
+
                 ownsBusy = true;
                 int saveRevision = _revision;
                 long saveEpoch = Profile.IntentEpoch;   // 等锁期间若发生还原，代次会变
@@ -1023,9 +1484,8 @@ namespace ProxyPicker.UI
                     foreach (var exe in now) if (!changed.Contains(exe)) changed.Add(exe);
                 var visible = VisibleExes();
                 var paths = PathMap();
-                var policies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var r in _all)
-                    if (r.Proxy && !string.IsNullOrEmpty(r.Policy)) policies[r.Exe] = r.Policy;
+                var policies = PolicyMapFromRows();
+                List<Profile.Item> builtItems = null;
                 var pack = await Task.Run(() => Profile.WithApplyLock(() =>
                 {
                     var p = new SavePack();
@@ -1033,15 +1493,25 @@ namespace ProxyPicker.UI
                     // 旧连接快照 / payload 生成 / 推送 / 回读 / 删除旧连接共享同一份配置。
                     // v1.3.7：整段都在跨进程锁内，托盘还原无法插到「推送完成、删除连接之前」。
                     string cfg = Paths.ClashYaml;
+                    if (switchBackToRule)
+                    {
+                        bool cp; string ce;
+                        Profile.PatchKernelConfigsForRules(cfg, out cp, out ce);
+                    }
                     p.Snapshot = Profile.CaptureConnections(changed, cfg); // 先快照旧连接，再推新规则
-                    p.Apply = Profile.Apply(ComposeWithHelpers(proxy, visible, paths, policies), false, cfg,
-                                            saveEpoch, saveIntentSig);
+                    builtItems = ComposeWithHelpers(proxy, visible, paths, policies);
+                    p.Apply = Profile.Apply(builtItems, false, cfg,
+                                            saveEpoch, saveIntentSig, switchBackToRule);
                     if (p.Apply.Ok && changed.Count > 0 && p.Snapshot.Error == null)
                         p.Reconnect = Profile.CloseCapturedConnections(p.Snapshot, cfg);
                     return p;
                 }));
+                if (switchBackToRule && pack.Apply.Ok) _state.Mode = "rule";
                 // 等待期间发生了还原 / 退出：内核状态已经被别人改过，不能再拿这次结果覆盖界面。
                 if (!UiAlive || saveRevision != _revision) return;
+
+                if (pack.Apply.Ok || (pack.Apply.Pushed && !pack.Apply.PersistFailed))
+                    SetEffectiveProxy(builtItems);
 
                 // 推送成功就把内存名单对齐（外部评审 F4）：回读校验失败时内核其实已经改了，
                 // 若仍拿旧名单去对账，看守会把用户刚取消勾选的软件又补回来。
@@ -1062,6 +1532,11 @@ namespace ProxyPicker.UI
                               "；重启后会回到原来的模式", Theme.Warn, 2);
                     Settings.ResumeRepair();   // 用户主动保存 = 重新接受自动补回
                     _modeChanged = false;
+                    _mismatch = 0;
+                    _mismatchItems = new List<Traffic.MismatchItem>();
+                    _mismatchStreak = 0;
+                    _autoMismatchCount = 0;
+                    _lastAutoMismatchAt = DateTime.MinValue;
                     foreach (var r in _all)
                     {
                         if (r.Proxy && !r.Known) Settings.Touch(r.Exe);
@@ -1151,6 +1626,7 @@ namespace ProxyPicker.UI
         {
             if (!UiAlive) return;
             if (_help) CloseHelp();
+            if (_page != 0) SwitchPage(0);
             if (_busy) { Toast("正在忙", "等当前操作结束再点「全部设为直连」", Theme.Warn, 1); return; }
             if (_all.Count == 0) { Toast("还没有可保存的名单", "等列表读出来再试一次", Theme.Warn, 1); return; }
             AllDirect();
@@ -1329,7 +1805,7 @@ namespace ProxyPicker.UI
                 Toast("已恢复自动排序", "手动拖出来的顺序已清空", Theme.Accent, 2);
             };
             menu.Items.Add(reset);
-            menu.Show(this, new Point(Theme.Px(388), Theme.Px(TabsTop + 30)));
+            menu.Show(this, new Point(Theme.Px(SortRect.X), Theme.Px(SortRect.Bottom + 4)));
         }
 
         void ShowRowMenu(AppRow row, Point screen)
@@ -1459,18 +1935,32 @@ namespace ProxyPicker.UI
                 if (++_outTick % 10 == 0) CheckOutbound();
                 // 「预期」用真正推给内核的名单（含派生规则），不是界面上勾了几个。
                 // 首次保存前还没有下发记录，才退回界面勾选。
-                var effective = _effectiveProxy;
-                var set = effective != null && effective.Count > 0
-                    ? effective
-                    : new HashSet<string>(_all.Where(r => r.Proxy).Select(r => r.Exe), StringComparer.OrdinalIgnoreCase);
-                // 只有「代理白名单」模式下预期出口才明确：订阅兼容里未勾选的软件
-                // 按订阅规则走代理是合法的，判成异常反而会一直误报。
-                var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly));
+                var effective = _effective;
+                var set = effective != null &&
+                          (effective.Exes.Count > 0 || effective.PathRegexes.Count > 0 || Profile.HasSavedIntent)
+                    ? effective.Exes
+                    : new HashSet<string>(_all.Where(r => r.Proxy).Select(r => Profile.Normalize(r.Exe)), StringComparer.OrdinalIgnoreCase);
+                var pathRegexes = effective != null && effective.PathRegexes.Count > 0 ? effective.PathRegexes : null;
+                // 只有「代理白名单 + 内核处于 rule 模式」下预期出口才明确：
+                // 全局模式下所有流量走 GLOBAL，订阅兼容里未勾选走订阅规则，均不能判成分流异常。
+                bool wasTrafficOk = _traffic != null && _traffic.Ok;
+                bool isRule = _state.ConfigOk && Profile.IsRuleMode(_state.Mode);
+                var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly && isRule, pathRegexes));
                 if (!UiAlive || !Visible) return;
                 _traffic = s;
                 if (s.Ok) ApplyCoverage(s);
+                else
+                {
+                    // 内核断线后立刻把旧网速归零，防止界面停留在大数字上假装还在跑流量
+                    _rateProxyDown = _rateProxyUp = _rateDirectDown = _rateDirectUp = 0;
+                    if (wasTrafficOk)
+                    {
+                        Mihomo.Forget();
+                        CheckOutbound();
+                    }
+                }
                 Wake();   // 曲线是每帧推进的，采样到点后要把时钟叫醒（失败也要，否则转圈会僵住）
-                if (s.Ok && s.Seconds > 0)
+                if (s.Ok && (s.Seconds > 0 || _sparkProxy.Count == 0))
                 {
                     long now = _watch.ElapsedMilliseconds;
                     long gap = _sparkStamp == 0 ? 0 : now - _sparkStamp;
@@ -1508,13 +1998,62 @@ namespace ProxyPicker.UI
         /// （微信、游戏、Antigravity 这类 Electron 应用的 Node 侧）流量根本进不了内核，
         /// 名单写进去也是空的。以前界面照样显示"运行中"，等于替用户撒谎。
         /// </summary>
+        /// <summary>
+        /// 后台对账配置纠偏门槛：仅在「规则（rule）」模式下、且进程识别被关闭（off）时才由后台自动修复。
+        /// 全局（global）或直连（direct）模式属于用户在客户端的主动选择，后台严禁擅自强改回 rule。
+        /// </summary>
+        internal static bool WatchShouldAutoFixConfig(string mode, string findProcess)
+        {
+            if (!Profile.IsRuleMode(mode)) return false;
+            return !string.IsNullOrEmpty(findProcess) &&
+                   findProcess.Trim().Equals("off", StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static bool ShouldTriggerAutoMismatch(
+            int mismatchCount, int mismatchStreak, int autoCount,
+            bool patchOnly, bool repairSuspended, bool hasSavedIntent,
+            bool modeChanged, bool busy, bool shuttingDown,
+            double secondsSinceLastAuto, double secondsSinceLastWatchRepair,
+            bool isRuleMode = true)
+        {
+            if (!isRuleMode) return false;
+            if (mismatchCount <= 0 || mismatchStreak < 2) return false;
+            if (autoCount >= 3) return false;
+            if (patchOnly || repairSuspended || !hasSavedIntent) return false;
+            if (modeChanged || busy || shuttingDown) return false;
+            if (secondsSinceLastAuto < 45 || secondsSinceLastWatchRepair < 15) return false;
+            return true;
+        }
+
         void ApplyCoverage(Traffic.Sample s)
         {
             var now = DateTime.UtcNow;
             foreach (var kv in s.Seen) _seenAt[kv.Key] = now;
             _visibleProcs = s.Seen.Count;
-            _mismatch = s.Mismatch;
-            _mismatchItems = s.Mismatches ?? new List<Traffic.MismatchItem>();
+            bool isRule = Profile.IsRuleMode(_state.Mode);
+            _mismatch = isRule ? s.Mismatch : 0;
+            _mismatchItems = isRule ? (s.Mismatches ?? new List<Traffic.MismatchItem>()) : new List<Traffic.MismatchItem>();
+
+            if (!isRule || s.Mismatch <= 0)
+            {
+                _mismatchStreak = 0;
+                _autoMismatchCount = 0;
+            }
+            else
+            {
+                _mismatchStreak++;
+                double secAuto = _lastAutoMismatchAt == DateTime.MinValue ? 999 : (now - _lastAutoMismatchAt).TotalSeconds;
+                double secWatch = _lastRepairAt == DateTime.MinValue ? 999 : (now - _lastRepairAt).TotalSeconds;
+                if (ShouldTriggerAutoMismatch(
+                        s.Mismatch, _mismatchStreak, _autoMismatchCount,
+                        Settings.PatchOnly, Settings.RepairSuspended, Profile.HasSavedIntent,
+                        _modeChanged, _busy, _shuttingDown, secAuto, secWatch, isRule))
+                {
+                    _lastAutoMismatchAt = now;
+                    _autoMismatchCount++;
+                    BeginInvoke(new Action(() => _ = RepairMismatchAsync(true)));
+                }
+            }
 
             int covered = 0;
             foreach (var r in _all)
@@ -1523,7 +2062,7 @@ namespace ProxyPicker.UI
 
             // 观察期不足 90 秒不下"看不见"的结论：软件可能只是还没发请求
             bool judged = (now - _startedAt).TotalSeconds >= 90;
-            bool canBeBlind = !_state.Tun;   // 只有系统代理底座才可能真的漏掉进程
+            bool canBeBlind = _state.ConfigOk && !_state.Tun && _state.SystemProxyEnabled;   // 只有已开系统代理底座才可能漏掉进程
 
             bool changed = false;
             foreach (var r in _all)
@@ -1542,12 +2081,13 @@ namespace ProxyPicker.UI
 
             if (!_blindToasted && canBeBlind && judged)
             {
+                int portHint = _state.MixedPort > 0 ? _state.MixedPort : 7897;
                 foreach (var r in _all)
                 {
                     if (!r.Proxy || r.Coverage != 2) continue;
                     _blindToasted = true;
                     Toast("有软件勾了却没生效",
-                        "它不读系统代理，流量没进内核 —— 切 TUN，或在它自己的设置里填 127.0.0.1:7897",
+                        "它不读系统代理，流量没进内核 —— 切 TUN，或在它自己的设置里填 127.0.0.1:" + portHint,
                         Theme.Warn, 3);
                     break;
                 }
@@ -1559,26 +2099,1210 @@ namespace ProxyPicker.UI
             bool ownsCheck = false;
             try
             {
-                if (!UiAlive || _busy || _checkingOutbound) return;
+                if (!UiAlive || _busy || _checkingOutbound || _nodeActionBusy) return;
                 ownsCheck = true;
                 _checkingOutbound = true;
                 int revision = _revision;
-                // v1.3.7：周期刷新必须跟「本次规则实际写入的策略组」。
-                // 以前调无参重载 → 没有 policy → 退回 GLOBAL，规则模式下 GLOBAL 常是 DIRECT，
-                // 保存后十秒顶部又变回 DIRECT：v1.3.5 只修了初始读取，这里漏了。
-                string policy = _state.Policy;
-                string globalDummy = "";
-                string now = await Task.Run(() => Core.Profile.ResolveOutbound(out globalDummy, policy));
-                if (!UiAlive || _busy || revision != _revision || string.IsNullOrEmpty(now)) return;
+                var snap = await Task.Run(() =>
+                {
+                    bool sysOn;
+                    string sysSrv;
+                    Profile.ReadSystemProxyState(out sysOn, out sysSrv);
+
+                    var env = Discovery.Detect();
+                    string cfg = env.ConfigPath ?? "";
+                    string client = env.Client ?? "";
+                    var cfgRes = Mihomo.FetchJson("/configs", 4000, cfg);
+                    if (!cfgRes.Ok || cfgRes.Data == null)
+                    {
+                        // 可能刚刚关闭旧客户端、开启了新客户端（例如 Verge -> FlClash）：重新探测一次并清通道缓存
+                        Mihomo.Forget();
+                        var reEnv = Discovery.Detect(true);
+                        if (!string.IsNullOrEmpty(reEnv.ConfigPath))
+                        {
+                            cfg = reEnv.ConfigPath;
+                            client = reEnv.Client ?? "";
+                            cfgRes = Mihomo.FetchJson("/configs", 4000, cfg);
+                            env = reEnv;
+                        }
+                    }
+
+                    string policy = Profile.PolicyName(cfg);
+                    string mode = "?";
+                    bool tun = false;
+                    string stack = "";
+                    string fpm = "?";
+                    int mixedPort = 0;
+                    bool cfgOk = cfgRes.Ok && cfgRes.Data != null;
+                    if (!cfgOk)
+                    {
+                        return new
+                        {
+                            CfgOk = false,
+                            HasCfg = env.Ok,
+                            Client = client,
+                            Policy = policy,
+                            Mode = mode,
+                            Tun = false,
+                            Stack = "",
+                            Fpm = "?",
+                            MixedPort = 0,
+                            SysOn = sysOn,
+                            SysSrv = sysSrv,
+                            Err = !string.IsNullOrEmpty(cfgRes.Error) ? cfgRes.Error : "客户端可能未启动",
+                            Detail = new Profile.OutboundDetail()
+                        };
+                    }
+
+                    mode = Json.Str(cfgRes.Data, "mode") ?? "?";
+                    var tunObj = Json.Obj(cfgRes.Data, "tun");
+                    if (tunObj != null)
+                    {
+                        tun = Json.Bool(tunObj, "enable", false);
+                        stack = Json.Str(tunObj, "stack") ?? "";
+                    }
+                    fpm = Json.Str(cfgRes.Data, "find-process-mode") ?? "?";
+                    mixedPort = Json.Int(cfgRes.Data, "mixed-port", 0);
+                    if (mixedPort <= 0) mixedPort = Json.Int(cfgRes.Data, "port", 0);
+
+                    if (!Settings.PatchOnly && _savedProxy.Count == 0 && Profile.HasSavedIntent && Profile.IsRuleMode(mode))
+                    {
+                        return new
+                        {
+                            CfgOk = true,
+                            HasCfg = env.Ok,
+                            Client = client,
+                            Policy = policy,
+                            Mode = mode,
+                            Tun = tun,
+                            Stack = stack,
+                            Fpm = fpm,
+                            MixedPort = mixedPort,
+                            SysOn = sysOn,
+                            SysSrv = sysSrv,
+                            Err = "",
+                            Detail = new Profile.OutboundDetail { Outbound = "DIRECT", Chain = "DIRECT", HistoryDelayMs = -1 }
+                        };
+                    }
+
+                    string activePolicy = mode.Equals("global", StringComparison.OrdinalIgnoreCase) ? "GLOBAL"
+                        : (mode.Equals("direct", StringComparison.OrdinalIgnoreCase) ? "DIRECT" : policy);
+                    var obj = Mihomo.GetJson("/proxies", 6000, cfg);
+                    var proxies = Json.Obj(obj, "proxies");
+                    var detail = Core.Profile.ResolveOutboundDetail(proxies, activePolicy);
+                    return new
+                    {
+                        CfgOk = true,
+                        HasCfg = env.Ok,
+                        Client = client,
+                        Policy = policy,
+                        Mode = mode,
+                        Tun = tun,
+                        Stack = stack,
+                        Fpm = fpm,
+                        MixedPort = mixedPort,
+                        SysOn = sysOn,
+                        SysSrv = sysSrv,
+                        Err = "",
+                        Detail = detail
+                    };
+                });
+                if (!UiAlive || _busy || revision != _revision) return;
+
+                string oldClient = _state.Client ?? "";
+                _state.SystemProxyEnabled = snap.SysOn;
+                _state.SystemProxyServer = snap.SysSrv;
+                if (!string.IsNullOrEmpty(snap.Client)) _state.Client = snap.Client;
+                if (!string.Equals(oldClient, _state.Client ?? "", StringComparison.OrdinalIgnoreCase))
+                    _catalogSeq++;
+
+                if (!snap.CfgOk)
+                {
+                    bool wasOnline = _state.ConfigOk;
+                    _state.ConfigOk = false;
+                    _state.Tun = false;
+                    _state.Mode = "?";
+                    _state.FindProcess = "?";
+                    _state.Outbound = "";
+                    _state.Chain = "";
+                    _state.Applied = false;
+                    _state.DelayMs = -1;
+                    _state.NodeAlive = null;
+                    ResetDelayBannerState();
+                    _catalogSeq++;
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    _state.Error = snap.HasCfg
+                        ? ("读不到内核配置：" + snap.Err + "（当前未连接）")
+                        : "未检测到运行中的代理客户端（当前未连接）";
+                    _nodesPage.SetLoading(false);
+                    _nodesPage.SetCurrentOutbound("", -1, false, false);
+                    _qualityPage.SetCurrentOutbound("");
+                    if (wasOnline) SetStatus(_state.Error, Theme.Warn);
+                    InvalidateNavBar();
+                    Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + SummaryH + 4)));
+                    return;
+                }
+
+                bool wasOffline = !_state.ConfigOk;
+                _state.ConfigOk = true;
+                _state.MixedPort = snap.MixedPort;
+                if (wasOffline)
+                {
+                    _state.Error = null;
+                    if (_page == 0)
+                    {
+                        if (!Profile.IsRuleMode(snap.Mode))
+                            SetStatus("已连上内核 · 当前为「" + Profile.ModeDisplayName(snap.Mode) + "」模式，按软件分流暂停", Theme.Warn);
+                        else if (!_state.ProxyActive && !snap.Tun && !snap.SysOn)
+                            SetStatus("客户端已连上内核，但 TUN 和系统代理均未开启（当前未接管流量）", Theme.Warn);
+                        else
+                            SetStatus(_state.Applied ? "已连上代理内核 · 名单生效中" : "已连上代理内核 · 点保存并生效后开启分流", Theme.Dim);
+                    }
+                }
+
+                bool modeChangedNow = !string.Equals(_state.Mode, snap.Mode, StringComparison.OrdinalIgnoreCase);
+                _state.Mode = snap.Mode;
+                _state.Tun = snap.Tun;
+                _state.TunStack = snap.Stack;
+                _state.FindProcess = snap.Fpm;
+                if (modeChangedNow && !Profile.IsRuleMode(_state.Mode))
+                {
+                    _mismatch = 0;
+                    _mismatchItems.Clear();
+                    _mismatchStreak = 0;
+                    SetStatus("Clash 已切换到「" + Profile.ModeDisplayName(_state.Mode) + "」模式，按软件分流暂停中", Theme.Warn);
+                }
+                else if (modeChangedNow && Profile.IsRuleMode(_state.Mode) && _state.Error == null)
+                {
+                    SetStatus(_state.ProxyActive
+                        ? (_state.Applied ? "已切回规则模式 · 名单生效中" : "已切回规则模式")
+                        : "已切回规则模式，但 TUN 与系统代理均未开启", _state.ProxyActive ? Theme.Dim : Theme.Warn);
+                }
+
+                if (string.IsNullOrEmpty(snap.Detail.Outbound))
+                {
+                    _state.Outbound = "";
+                    _state.Chain = "";
+                    _state.DelayMs = -1;
+                    _state.NodeAlive = null;
+                    _delayMs = -1;
+                    _nodesPage.SetCurrentOutbound("", -1, false, false);
+                    _qualityPage.SetCurrentOutbound("");
+                    InvalidateNavBar();
+                    Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
+                    return;
+                }
+                if (!string.IsNullOrEmpty(snap.Policy)) _state.Policy = snap.Policy;
                 string prev = _state.Outbound;
-                if (now == prev) return;
-                _state.Outbound = now;
-                Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
+                _state.Chain = snap.Detail.Chain;
+                _state.NodeAlive = snap.Detail.Alive;
+                _state.DelayMs = snap.Detail.HistoryDelayMs > 0 ? snap.Detail.HistoryDelayMs : -1;
+                if (snap.Detail.Outbound == prev)
+                {
+                    _nodesPage.SetCurrentOutbound(_state.Outbound, _state.DelayMs, _delayTimedOut, _state.ProxyActive);
+                    _qualityPage.SetCurrentOutbound(_state.Outbound);
+                    InvalidateNavBar();
+                    Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + SummaryH + 4)));
+                    return;
+                }
+                _state.Outbound = snap.Detail.Outbound;
+                _delayMs = -1;
+                _delayTimedOut = false;
+                _delayAlertActive = false;
+                _delayNode = snap.Detail.Outbound;
+                _nodesPage.SetCurrentOutbound(_state.Outbound, _state.DelayMs, false, _state.ProxyActive);
+                _qualityPage.SetCurrentOutbound(_state.Outbound);
+                InvalidateNavBar();
+                Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + SummaryH + 4)));
                 if (!string.IsNullOrEmpty(prev))
-                    Toast("出口已切到 " + CleanEmoji(now), "勾选的软件新连接直接走这个节点", Theme.Accent, 2);
+                    Toast("节点已切到 " + CleanEmoji(snap.Detail.Outbound), "流量将由这个节点发出", Theme.Accent, 2);
+                if (_state.ProxyActive && Core.Profile.ClassifyExit(snap.Detail.Outbound) == Core.Profile.ExitKind.Proxy)
+                    _ = RunDelayTestAsync(false);
             }
-            catch (Exception ex) { ReportFailure("读取代理出口", ex); }
+            catch (Exception ex) { ReportFailure("读取代理节点", ex); }
             finally { if (ownsCheck) _checkingOutbound = false; }
+        }
+
+        bool ShouldRunPeriodicDelayTest()
+        {
+            int interval = Settings.DelayCheckSeconds;
+            if (interval <= 0) return false;
+            if (!_state.ConfigOk || !_state.ProxyActive) return false;
+            if (!Visible && !Profile.HasSavedIntent && !Settings.AutoFailover) return false;
+            string node = _state.Outbound;
+            if (string.IsNullOrEmpty(node) || Profile.ClassifyExit(node) != Profile.ExitKind.Proxy) return false;
+            return (DateTime.UtcNow - _lastDelayTestAt).TotalSeconds >= interval;
+        }
+
+        /// <summary>托盘菜单与摘要胶囊共用的主动测速入口。</summary>
+        public void TestDelayPublic()
+        {
+            if (!UiAlive) return;
+            if (InvokeRequired) { try { BeginInvoke(new Action(TestDelayPublic)); } catch { } return; }
+            _ = RunDelayTestAsync(true);
+        }
+
+        async Task RunDelayTestAsync(bool manual)
+        {
+            if (!UiAlive || _delayTesting || _nodeActionBusy) return;
+            string node = _state.Outbound;
+            if (string.IsNullOrEmpty(node) || Profile.ClassifyExit(node) != Profile.ExitKind.Proxy)
+            {
+                if (manual)
+                {
+                    string reason = string.IsNullOrEmpty(node) ? "当前未识别到代理节点" : ("当前节点为 " + node + "，无需测速");
+                    Toast("暂无法测速", reason, Theme.Warn, 1);
+                    SetStatus(reason, Theme.Warn);
+                }
+                return;
+            }
+
+            _delayTesting = true;
+            _delayNode = node;
+            _lastDelayTestAt = DateTime.UtcNow;
+            if (manual) SetStatus("正在通过 Clash 测试「" + CleanEmoji(node) + "」延迟…", Theme.Dim);
+            Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
+
+            bool triggeredFailover = false;
+            try
+            {
+                var res = await Task.Run(() => Profile.MeasureDelay(node));
+                if (!UiAlive) return;
+                // 若测速期间用户已经切到了别的节点，不拿旧结果覆盖新节点状态
+                if (!string.Equals(node, _state.Outbound, StringComparison.OrdinalIgnoreCase)) return;
+
+                if (res.KernelUnreachable)
+                {
+                    _delayError = res.Error;
+                    if (manual)
+                    {
+                        Toast("读不到测速结果", res.Error, Theme.Warn, 1);
+                        SetStatus("Clash 控制接口暂时不可达：" + res.Error, Theme.Warn);
+                    }
+                    return;
+                }
+
+                if (res.Ok)
+                {
+                    bool wasTimeout = _delayAlertActive;
+                    _delayMs = res.DelayMs;
+                    _delayTimedOut = false;
+                    _delayError = "";
+                    _delayAlertActive = false;
+                    _state.DelayMs = res.DelayMs;
+                    _state.NodeAlive = true;
+                    _nodesPage.UpdateSingleNodeDelay(node, res.DelayMs, true, "");
+                    InvalidateNavBar();
+
+                    if (wasTimeout)
+                    {
+                        AuditLog.Record("DELAY", "节点已恢复可用：" + node + " · " + res.DelayMs + " ms");
+                        SetStatus("节点「" + CleanEmoji(node) + "」已恢复（" + res.DelayMs + " ms）", Theme.Ok);
+                        Toast("节点测速已恢复", CleanEmoji(node) + " · " + res.DelayMs + " ms", Theme.Ok, 2);
+                        if (!Visible && TrayBalloon != null)
+                            TrayBalloon("节点已恢复：" + CleanEmoji(node), "实时测速 " + res.DelayMs + " ms");
+                    }
+                    else if (manual)
+                    {
+                        SetStatus("当前节点「" + CleanEmoji(node) + "」延迟 " + res.DelayMs + " ms", Theme.Ok);
+                        Toast("测速正常", CleanEmoji(node) + " · " + res.DelayMs + " ms", Theme.Accent, 2);
+                    }
+                    return;
+                }
+
+                // 节点测速超时或不可达
+                _delayMs = -1;
+                _delayTimedOut = res.TimedOut;
+                _delayError = res.Error ?? "节点测速失败";
+                if (res.TimedOut)
+                {
+                    _state.DelayMs = -1;
+                    _state.NodeAlive = false;
+                    _nodesPage.UpdateSingleNodeDelay(node, -2, false, _delayError);
+                    InvalidateNavBar();
+
+                    // 开启「超时自动切换」且满足冷却时，自动从备选池找延迟最低的可用节点切过去
+                    bool cooldownOk = _lastFailoverAt == DateTime.MinValue ||
+                                      (DateTime.UtcNow - _lastFailoverAt).TotalSeconds >= (manual ? 15 : 30);
+                    if (Settings.AutoFailover && !_failoverBusy && !_nodeActionBusy && cooldownOk)
+                    {
+                        triggeredFailover = true;
+                        _ = TryAutoFailoverAsync(node);
+                    }
+                    else
+                    {
+                        bool shouldAlert = manual || !_delayAlertActive ||
+                                           (DateTime.UtcNow - _lastDelayAlertAt).TotalSeconds >= 120;
+                        if (shouldAlert)
+                        {
+                            _delayAlertActive = true;
+                            _lastDelayAlertAt = DateTime.UtcNow;
+                            AuditLog.Record("DELAY", "节点测速超时：" + node + " · " + _delayError);
+                            SetStatus("节点「" + CleanEmoji(node) + "」测速超时，请到「2. 节点切换」切换或开启自动切换", Theme.Warn);
+                            Toast("节点测速超时", CleanEmoji(node) + " · " + _delayError + "，可在「2. 节点切换」换备用节点", Theme.Warn, 2);
+                            if (TrayBalloon != null)
+                                TrayBalloon("节点测速超时：" + CleanEmoji(node),
+                                    _delayError + "\n打开「2. 节点切换」换备用节点或勾选超时自动切换");
+                        }
+                    }
+                }
+                else
+                {
+                    if (manual)
+                    {
+                        SetStatus("测速未通过：" + _delayError, Theme.Warn);
+                        Toast("测速未通过", CleanEmoji(node) + " · " + _delayError, Theme.Warn, 1);
+                    }
+                    // 节点可能已在 Clash 中被删除/切换导致 404：顺手刷新一次出口信息
+                    try { BeginInvoke(new Action(CheckOutbound)); } catch { }
+                }
+            }
+            catch (Exception ex) { ReportFailure("节点测速", ex); }
+            finally
+            {
+                _delayTesting = false;
+                if (UiAlive && !triggeredFailover)
+                {
+                    InvalidateNavBar();
+                    if (_page == 0) Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- 页面切换 / 节点切换 / 风控体检 / 自动故障转移
+
+        internal static string BuildFailoverNotifyText(string cleanOldNode, string cleanNewNode, int delayMs)
+        {
+            string oldPart = string.IsNullOrWhiteSpace(cleanOldNode) ? "原节点" : cleanOldNode.Trim();
+            string newPart = string.IsNullOrWhiteSpace(cleanNewNode) ? "新节点" : cleanNewNode.Trim();
+            return oldPart + " 超时 → 已切至 " + newPart + (delayMs > 0 ? ("（" + delayMs + "ms）") : "");
+        }
+
+        static string PageDisplayName(int page)
+        {
+            if (page == 0) return "应用分流";
+            if (page == 1) return "节点策略";
+            if (page == 2) return "链路体检";
+            return "上一页";
+        }
+
+        void SyncBackLabels()
+        {
+            string backText = _pageHistory.Count > 0 ? ("← 返回" + PageDisplayName(_pageHistory.Peek())) : "";
+            _nodesPage.SetBackLabel(_page == 1 ? backText : "");
+            _qualityPage.SetBackLabel(_page == 2 ? backText : "");
+        }
+
+        void PushAndSwitchPage(int targetPage)
+        {
+            if (!UiAlive || targetPage < 0 || targetPage > 2) return;
+            if (_page != targetPage && (_pageHistory.Count == 0 || _pageHistory.Peek() != _page))
+                _pageHistory.Push(_page);
+            SwitchPage(targetPage, false);
+        }
+
+        void NavigateBack()
+        {
+            if (!UiAlive) return;
+            if (_pageHistory.Count > 0)
+            {
+                int prev = _pageHistory.Pop();
+                SwitchPage(prev, false);
+                return;
+            }
+            if (_page != 0) SwitchPage(0, true);
+        }
+
+        public void SwitchPagePublic(int page)
+        {
+            if (!UiAlive) return;
+            if (InvokeRequired) { try { BeginInvoke(new Action(() => SwitchPagePublic(page))); } catch { } return; }
+            SwitchPage(page, true);
+        }
+
+        void SwitchPage(int page, bool clearHistory = true)
+        {
+            if (!UiAlive) return;
+            if (page < 0 || page > 2) page = 0;
+            if (clearHistory) _pageHistory.Clear();
+            if (_help) _help = false;
+            _page = page;
+            SyncBackLabels();
+            ApplyPageVisibility();
+            if (page == 0)
+            {
+                SetStatus(_state.Error ?? (_state.Applied ? "名单已生效 · 改动后记得保存" : "名单未生效，请保存一次"),
+                    _state.Error == null && _state.Applied ? Theme.Dim : Theme.Warn);
+            }
+            else if (page == 1 || page == 2)
+            {
+                _nodesPage.SetCurrentOutbound(_state.Outbound, _delayMs, _delayTimedOut, _state.ProxyActive);
+                _qualityPage.SetCurrentOutbound(_state.Outbound);
+                if (!_nodesLoadedOnce || page == 1) _ = LoadNodesCatalogAsync();
+            }
+            Invalidate();
+        }
+
+        void ApplyPageVisibility()
+        {
+            _list.Visible = !_help && _page == 0;
+            _search.Visible = !_help && _page == 0;
+            _nodesPage.Visible = !_help && _page == 1;
+            _qualityPage.Visible = !_help && _page == 2;
+            if (_page == 1) _nodesPage.BringToFront();
+            else if (_page == 2) _qualityPage.BringToFront();
+            LayoutChildren();
+        }
+
+        internal static bool IsCatalogReplyStale(int startRev, int curRev, int startSeq, int curSeq)
+        {
+            return startRev != curRev || startSeq != curSeq;
+        }
+
+        void ResetDelayBannerState()
+        {
+            _delayMs = -1;
+            _delayTimedOut = false;
+            _delayAlertActive = false;
+            _delayNode = "";
+        }
+
+        async Task LoadNodesCatalogAsync()
+        {
+            try
+            {
+                if (!UiAlive) return;
+                int startRev = _revision;
+                int startSeq = ++_catalogSeq;
+                _nodesPage.SetLoading(true);
+                string cfg = Paths.ClashYaml;
+                var catalog = await Task.Run(() => NodeManager.LoadCatalog(cfg));
+                if (!UiAlive || IsCatalogReplyStale(startRev, _revision, startSeq, _catalogSeq)) return;
+                string nowCfg = Paths.ClashYaml;
+                if (!string.IsNullOrEmpty(cfg) && !string.IsNullOrEmpty(nowCfg) &&
+                    !string.Equals(cfg, nowCfg, StringComparison.OrdinalIgnoreCase))
+                {
+                    _nodesPage.SetLoading(false);
+                    return;
+                }
+                _nodesLoadedOnce = true;
+                _nodesPage.SetCatalog(catalog);
+                bool sysOn;
+                string sysSrv;
+                Profile.ReadSystemProxyState(out sysOn, out sysSrv);
+                _state.SystemProxyEnabled = sysOn;
+                _state.SystemProxyServer = sysSrv;
+                if (catalog != null && catalog.Ok)
+                {
+                    _state.ConfigOk = true;
+                    _state.Mode = catalog.KernelMode;
+                    bool emptyWhitelist = !Settings.PatchOnly && _savedProxy.Count == 0 && Profile.HasSavedIntent && Profile.IsRuleMode(_state.Mode);
+                    string showOutbound = emptyWhitelist ? "DIRECT" : (!string.IsNullOrEmpty(catalog.CurrentOutbound) ? catalog.CurrentOutbound : "");
+                    _state.Outbound = showOutbound;
+                    _nodesPage.SetCurrentOutbound(showOutbound, _delayMs > 0 ? _delayMs : _state.DelayMs, _delayTimedOut, _state.ProxyActive);
+                    _qualityPage.SetCatalog(showOutbound, _nodesPage.SnapshotConcreteNodes());
+                }
+                else
+                {
+                    _state.ConfigOk = false;
+                    _state.Tun = false;
+                    _state.Outbound = "";
+                    _state.DelayMs = -1;
+                    _nodesPage.SetCurrentOutbound("", -1, false, false);
+                    _qualityPage.SetCatalog("", _nodesPage.SnapshotConcreteNodes());
+                }
+                InvalidateNavBar();
+                if (_page == 0) Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + SummaryH + 4)));
+            }
+            catch (Exception ex) { ReportFailure("读取节点列表", ex); }
+        }
+
+        async Task InspectNodeQualityAsync(string nodeName, bool switchBeforeAndKeep)
+        {
+            if (!UiAlive || _nodeActionBusy || _batchQualityRunning || string.IsNullOrWhiteSpace(nodeName)) return;
+            _nodeActionBusy = true;
+            _batchDelayCancel = true;
+            if (_page != 2) PushAndSwitchPage(2);
+            try
+            {
+                string cfg = Paths.ClashYaml;
+                bool probingCurrent = string.Equals(nodeName, _state.Outbound, StringComparison.OrdinalIgnoreCase);
+                bool preferSidecar = !switchBeforeAndKeep && !probingCurrent;
+
+                _qualityPage.SetSelectedTarget(nodeName);
+                _qualityPage.SetTesting(true, nodeName);
+                _nodesPage.SetInspectingNode(nodeName);
+
+                if (preferSidecar)
+                {
+                    SetStatus("正在独立隔离引擎中检测「" + CleanEmoji(nodeName) + "」（不影响当前上网）…", Theme.Dim);
+                    string sidecarErr = "";
+                    NodeQuality.QualityReport sidecarRep = null;
+                    await Task.Run(() =>
+                    {
+                        using (var sidecar = ProbeSidecar.TryStart(cfg, out sidecarErr))
+                        {
+                            if (sidecar == null) return;
+                            if (!sidecar.SwitchGlobalNode(nodeName))
+                            {
+                                sidecarErr = "旁路引擎未能切换到节点：" + nodeName;
+                                return;
+                            }
+                            System.Threading.Thread.Sleep(150);
+                            sidecarRep = NodeQuality.RunQualityProbe(nodeName, Settings.DesiredRegion, false, cfg, sidecar);
+                        }
+                    });
+                    if (!UiAlive) return;
+
+                    if (sidecarRep != null)
+                    {
+                        ApplyCompletedQualityReport(nodeName, sidecarRep, false);
+                        return;
+                    }
+
+                    // 极少数场景（如未检测到内核可执行文件）无法起旁路引擎，降级弹窗确认
+                    _nodesPage.SetInspectingNode("");
+                    _qualityPage.SetTesting(false, "");
+                    var fallbackAns = MessageBox.Show(this,
+                        "未能启动零干扰旁路探测引擎（" + (string.IsNullOrEmpty(sidecarErr) ? "未知原因" : sidecarErr) + "）。\n\n" +
+                        "• 点「是(Y)」：改用主客户端临时切换探测（约 3–5 秒，测完自动恢复原节点）\n" +
+                        "• 点「否(N)」：直接切换到该节点并执行检测（留在新节点）\n" +
+                        "• 点「取消」：取消本次检测",
+                        "旁路探测不可用 · 选择回退方式", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                    if (fallbackAns == DialogResult.Cancel) return;
+                    switchBeforeAndKeep = fallbackAns == DialogResult.No;
+                    _qualityPage.SetTesting(true, nodeName);
+                    _nodesPage.SetInspectingNode(nodeName);
+                }
+
+                var plan = await Task.Run(() => NodeManager.InspectProbeRouting(nodeName, cfg));
+                if (!UiAlive) return;
+
+                bool useTempGlobal = false;
+                if (plan.Ok && plan.NeedsTempGlobal)
+                {
+                    var ask = MessageBox.Show(this,
+                        "检测到当前分流未覆盖本检测工具（可能尚未保存白名单，或当前为「订阅兼容」/目标节点不在默认主组），直接测试可能命中本地直连或别的组。\n\n" +
+                        "是否允许检测期间在 Clash 内存中临时切为「全局模式」（绝不改动磁盘配置文件，测完约 3–5 秒立刻自动切回原模式和原节点）？",
+                        "使用临时隔离通道检测", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                    if (ask == DialogResult.Cancel)
+                    {
+                        _nodesPage.SetInspectingNode("");
+                        _qualityPage.SetTesting(false, "");
+                        return;
+                    }
+                    useTempGlobal = ask == DialogResult.Yes;
+                }
+
+                bool switching = useTempGlobal || !string.Equals(nodeName, _state.Outbound, StringComparison.OrdinalIgnoreCase);
+                SetStatus(switching
+                    ? ("正在切换至「" + CleanEmoji(nodeName) + "」执行链路评估…")
+                    : ("正在检测「" + CleanEmoji(nodeName) + "」出口 IP、风控分值与主流服务可用性…"), Theme.Dim);
+
+                bool directRiskHint = !useTempGlobal && !Settings.PatchOnly && (_savedProxy.Count == 0 || !_effective.Exes.Contains("proxypicker.exe"));
+
+                var result = await Task.Run(() =>
+                {
+                    var cat = NodeManager.LoadCatalog(cfg);
+                    string origSelection = cat.CurrentSelection;
+                    string origOutbound = cat.CurrentOutbound;
+                    string origGlobal = plan.OriginalGlobalSelection;
+                    string origMode = string.IsNullOrEmpty(plan.OriginalMode) ? "rule" : plan.OriginalMode;
+                    string group = useTempGlobal ? "GLOBAL" : (!string.IsNullOrEmpty(plan.TargetSwitchGroup) ? plan.TargetSwitchGroup : cat.GroupName);
+                    bool switched = false;
+                    bool switchedMode = false;
+
+                    if ((switching || useTempGlobal) && (string.IsNullOrEmpty(group) || (!useTempGlobal && !cat.Ok)))
+                        return new { Ok = false, Err = string.IsNullOrEmpty(cat.Error) ? "未找到可切换策略组" : cat.Error, Report = (NodeQuality.QualityReport)null };
+
+                    try
+                    {
+                        if (useTempGlobal && !string.Equals(origMode, "global", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (NodeManager.SetKernelModeTemp("global", cfg))
+                            {
+                                switchedMode = true;
+                                System.Threading.Thread.Sleep(150);
+                            }
+                        }
+
+                        if (switching)
+                        {
+                            var sw = NodeManager.SwitchProxyNode(group, nodeName, switchBeforeAndKeep, origOutbound, cfg);
+                            if (!sw.Ok)
+                                return new { Ok = false, Err = sw.Message, Report = (NodeQuality.QualityReport)null };
+                            switched = true;
+                            System.Threading.Thread.Sleep(240);
+                        }
+
+                        var rep = NodeQuality.RunQualityProbe(nodeName, Settings.DesiredRegion, directRiskHint, cfg);
+                        return new { Ok = true, Err = "", Report = rep };
+                    }
+                    finally
+                    {
+                        if (switched && !switchBeforeAndKeep)
+                        {
+                            if (useTempGlobal && !string.IsNullOrEmpty(origGlobal))
+                                NodeManager.SwitchProxyNode("GLOBAL", origGlobal, false, "", cfg);
+                            if (!useTempGlobal && !string.IsNullOrEmpty(origSelection))
+                                NodeManager.SwitchProxyNode(cat.GroupName, origSelection, false, "", cfg);
+                        }
+                        if (switchedMode)
+                            NodeManager.SetKernelModeTemp(origMode, cfg);
+                    }
+                });
+
+                if (!UiAlive) return;
+                _nodesPage.SetInspectingNode("");
+                if (!result.Ok)
+                {
+                    _qualityPage.SetTesting(false, "");
+                    SetStatus("节点链路检测未完成：" + result.Err, Theme.Warn);
+                    Toast("链路检测未完成", result.Err, Theme.Warn, 1);
+                    return;
+                }
+
+                ApplyCompletedQualityReport(nodeName, result.Report, switchBeforeAndKeep);
+            }
+            catch (Exception ex)
+            {
+                _nodesPage.SetInspectingNode("");
+                _qualityPage.SetTesting(false, "");
+                ReportFailure("检测节点链路质量", ex);
+            }
+            finally
+            {
+                _nodeActionBusy = false;
+                if (UiAlive) _ = LoadNodesCatalogAsync();
+            }
+        }
+
+        void ApplyCompletedQualityReport(string nodeName, NodeQuality.QualityReport repOut, bool switchBeforeAndKeep)
+        {
+            _nodesPage.SetInspectingNode("");
+            _lastQualityReport = repOut;
+            _qualityPage.SetReport(repOut);
+            _nodesPage.CacheQualityReport(repOut);
+
+            if (switchBeforeAndKeep)
+            {
+                _state.Outbound = nodeName;
+                _delayNode = nodeName;
+                _delayMs = repOut.Net.AvgMs;
+                _state.DelayMs = repOut.Net.AvgMs;
+                _delayTimedOut = repOut.Net.Sent > 0 && repOut.Net.Received == 0;
+                _nodesPage.SetCurrentOutbound(nodeName, repOut.Net.AvgMs, _delayTimedOut, _state.ProxyActive);
+                _qualityPage.SetCurrentOutbound(nodeName);
+            }
+            else if (repOut.Net.AvgMs > 0)
+            {
+                _nodesPage.UpdateSingleNodeDelay(nodeName, repOut.Net.AvgMs, true, "");
+            }
+
+            AuditLog.Record("QUALITY",
+                "单节点链路检测：region=" + (repOut.CountryCode.Length > 0 ? repOut.CountryCode : "?") +
+                " risk=" + repOut.RiskScore + " services=" + repOut.MainstreamReadyCount + "/4" +
+                " avg=" + repOut.Net.AvgMs + "ms loss=" + repOut.Net.LossPercent + "%" +
+                (repOut.IsSidecarIsolated ? " isolated=true" : "") +
+                (repOut.DirectIpv6Leak ? " ipv6Leak=true" : "") +
+                (repOut.RoutedDirect ? " direct=true" : ""));
+
+            Color statusCol = repOut.Level == NodeQuality.RiskLevel.Low ? Theme.Ok : Theme.Warn;
+            SetStatus(CleanEmoji(nodeName) + "：" + repOut.VerdictTitle, statusCol);
+            Toast("链路检测完成", repOut.VerdictTitle, repOut.Level == NodeQuality.RiskLevel.Low ? Theme.Ok : Theme.Warn,
+                repOut.Level == NodeQuality.RiskLevel.Low ? 0 : 1);
+            InvalidateNavBar();
+        }
+
+        /// <summary>全量节点评估：优先独立旁路引擎零干扰评估全部可用节点，同 IP 复用防限流。</summary>
+        async Task ToggleBatchQualityScanAsync()
+        {
+            if (_batchQualityRunning)
+            {
+                _batchQualityCancel = true;
+                SetStatus("正在停止全量节点评估并清理资源…", Theme.Dim);
+                return;
+            }
+            if (_nodeActionBusy) { Toast("当前有节点操作在进行", "请稍候再启动全量节点评估", Theme.Warn, 1); return; }
+
+            string cfg = Paths.ClashYaml;
+            _nodeActionBusy = true;
+            _batchDelayCancel = true;
+            try
+            {
+                var cat = await Task.Run(() => NodeManager.LoadCatalog(cfg));
+                if (!UiAlive) return;
+                if (!cat.Ok || cat.Nodes.Count == 0)
+                {
+                    Toast("未能读取节点目录", string.IsNullOrEmpty(cat.Error) ? "请确认 Clash 客户端已启动" : cat.Error, Theme.Warn, 1);
+                    return;
+                }
+
+                var concrete = cat.Nodes
+                    .Where(n => !n.IsGroup && !ProbeSidecar.IsInformationalNodeName(n.Name))
+                    .ToList();
+                if (concrete.Count == 0)
+                {
+                    Toast("当前策略组没有可用节点", "请检查 Clash 策略组配置或订阅状态", Theme.Warn, 1);
+                    return;
+                }
+
+                string previewErr = "";
+                bool canSidecar = await Task.Run(() => ProbeSidecar.CanPrepareSidecar(cfg, out previewErr));
+                if (!UiAlive) return;
+
+                NodeManager.ProbeRoutingPlan plan = null;
+                if (!canSidecar)
+                {
+                    plan = await Task.Run(() => NodeManager.InspectProbeRouting("", cfg));
+                    if (!UiAlive) return;
+                }
+
+                string tip = canSidecar
+                    ? ("将启动独立隔离探测引擎，对共 " + concrete.Count + " 个节点执行全量链路评估（出口 IP、风控分值、Google / Gemini / OpenAI / Claude 可用性）：\n\n" +
+                       "• 零干扰隔离：通过独立本地旁路端口出站，全程不切换当前节点，不影响正在使用的网页、下载或会话；\n" +
+                       "• 智能加速：并发预筛连通节点后逐个评测，同一落地 IP 自动复用风险档案防限流；\n" +
+                       "• 随时可控：评估期间随时点「停止评估」即时中止。\n\n" +
+                       "确认启动全量节点评估吗？")
+                    : ("未能准备独立旁路引擎（" + previewErr + "），将改用主客户端临时切换模式评估共 " + concrete.Count + " 个节点：\n\n" +
+                       "• 预筛连通节点并跳过超时节点；\n" +
+                       "• 评估期间逐一短暂切换主节点（完成后自动恢复原节点与原模式）；\n\n" +
+                       "确认开始全量节点评估吗？");
+                if (MessageBox.Show(this, tip, "全量节点评估", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                    return;
+
+                _batchQualityRunning = true;
+                _batchQualityCancel = false;
+                if (_page != 2) PushAndSwitchPage(2);
+                _qualityPage.SetBatchScanning(true, 0, concrete.Count, "正在初始化隔离探测引擎…");
+                SetStatus("正在准备全量评估（" + concrete.Count + " 个节点）…", Theme.Dim);
+
+                ProbeSidecar.SidecarSession sidecar = null;
+                string sidecarStartErr = "";
+                if (canSidecar)
+                {
+                    sidecar = await Task.Run(() => ProbeSidecar.TryStart(cfg, out sidecarStartErr));
+                    if (!UiAlive) { if (sidecar != null) sidecar.Dispose(); return; }
+                    if (sidecar == null)
+                    {
+                        var fallback = MessageBox.Show(this,
+                            "独立隔离探测引擎未能启动（" + sidecarStartErr + "）。\n\n" +
+                            "是否改为主客户端临时切换模式继续评估（测完自动恢复原节点与模式）？",
+                            "旁路引擎启动失败", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                        if (fallback != DialogResult.Yes)
+                        {
+                            _qualityPage.SetBatchScanning(false, 0, 0, "");
+                            SetStatus("已取消全量节点评估", Theme.Dim);
+                            return;
+                        }
+                        plan = await Task.Run(() => NodeManager.InspectProbeRouting("", cfg));
+                        if (!UiAlive) return;
+                    }
+                }
+
+                using (sidecar)
+                {
+                    bool isolated = sidecar != null;
+                    _qualityPage.SetBatchScanning(true, 0, concrete.Count,
+                        isolated ? "旁路并发预筛连通性…" : "正在预筛连通节点…");
+                    SetStatus(isolated
+                        ? ("旁路并发预筛 " + concrete.Count + " 个节点连通性（当前网络零影响）…")
+                        : ("正在预筛 " + concrete.Count + " 个节点连通性（跳过超时节点）…"), Theme.Dim);
+
+                    if (isolated)
+                    {
+                        int preDone = 0;
+                        await Task.Run(() =>
+                        {
+                            System.Threading.Tasks.Parallel.ForEach(
+                                concrete,
+                                new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 6 },
+                                n =>
+                                {
+                                    if (_batchQualityCancel || !UiAlive || _shuttingDown) return;
+                                    string err;
+                                    int ms = sidecar.MeasureDelay(n.Name, 2200, out err);
+                                    n.LiveDelayMs = ms;
+                                    n.Alive = ms > 0;
+                                    n.LastError = ms > 0 ? "" : err;
+                                    int cur = System.Threading.Interlocked.Increment(ref preDone);
+                                    if (!UiAlive) return;
+                                    try
+                                    {
+                                        BeginInvoke(new Action(() =>
+                                        {
+                                            if (!UiAlive) return;
+                                            _nodesPage.UpdateSingleNodeDelay(n.Name, ms, ms > 0, n.LastError);
+                                            _qualityPage.SetBatchScanning(true, cur, concrete.Count, "预筛 " + n.Name);
+                                        }));
+                                    }
+                                    catch { }
+                                });
+                        });
+                    }
+                    else
+                    {
+                        await Task.Run(() =>
+                        {
+                            NodeManager.BatchMeasureNodes(concrete, 2200,
+                                () => _batchQualityCancel || !UiAlive || _shuttingDown,
+                                n =>
+                                {
+                                    if (!UiAlive) return;
+                                    try { BeginInvoke(new Action(() => { if (UiAlive) _nodesPage.UpdateSingleNodeDelay(n.Name, n.LiveDelayMs, n.Alive, n.LastError); })); }
+                                    catch { }
+                                }, cfg);
+                        });
+                    }
+
+                    if (!UiAlive || _batchQualityCancel)
+                    {
+                        _qualityPage.SetBatchScanning(false, 0, 0, "");
+                        SetStatus("已停止全量节点评估", Theme.Dim);
+                        return;
+                    }
+
+                    var aliveTargets = concrete.Where(n => n.LiveDelayMs > 0).OrderBy(n => n.LiveDelayMs).ToList();
+                    if (aliveTargets.Count == 0)
+                    {
+                        _qualityPage.SetBatchScanning(false, 0, 0, "");
+                        Toast("未检测到可用节点", "所有节点延迟探测均超时，请检查订阅或本地网络", Theme.Warn, 2);
+                        SetStatus("全量预筛未发现连通节点", Theme.Warn);
+                        return;
+                    }
+
+                    int total = aliveTargets.Count;
+                    int done = 0;
+                    int ready4 = 0;
+                    int aiReady = 0;
+                    bool useTempGlobal = !isolated && plan != null && plan.Ok && plan.NeedsTempGlobal;
+                    bool directRiskHint = !isolated && !useTempGlobal && !Settings.PatchOnly &&
+                                          (_savedProxy.Count == 0 || !_effective.Exes.Contains("proxypicker.exe"));
+
+                    _qualityPage.SetBatchScanning(true, 0, total,
+                        (isolated ? "零干扰评估 " : "准备评估 ") + total + " 个可用节点…");
+                    SetStatus((isolated ? "已筛选 " : "筛选出 ") + total + " 个连通节点，正在" +
+                        (isolated ? "零干扰旁路通道" : "临时通道") + "评估 IP、风控与主流服务…", Theme.Dim);
+
+                    await Task.Run(() =>
+                    {
+                        string origMode = plan != null && !string.IsNullOrEmpty(plan.OriginalMode) ? plan.OriginalMode : "rule";
+                        string origSelection = cat.CurrentSelection;
+                        string origGlobal = plan != null ? plan.OriginalGlobalSelection : "";
+                        string group = useTempGlobal
+                            ? "GLOBAL"
+                            : (plan != null && !string.IsNullOrEmpty(plan.TargetSwitchGroup) ? plan.TargetSwitchGroup : cat.GroupName);
+                        bool switchedMode = false;
+                        var ipCache = new NodeQuality.BatchIpCache();
+
+                        try
+                        {
+                            if (!isolated && useTempGlobal && !string.Equals(origMode, "global", StringComparison.OrdinalIgnoreCase))
+                            {
+                                if (NodeManager.SetKernelModeTemp("global", cfg))
+                                {
+                                    switchedMode = true;
+                                    System.Threading.Thread.Sleep(160);
+                                }
+                            }
+
+                            foreach (var n in aliveTargets)
+                            {
+                                if (_batchQualityCancel || !UiAlive || _shuttingDown) break;
+                                if (UiAlive)
+                                {
+                                    try { BeginInvoke(new Action(() => { if (UiAlive) _qualityPage.SetBatchScanning(true, done, total, n.Name); })); }
+                                    catch { }
+                                }
+
+                                bool swOk = isolated
+                                    ? sidecar.SwitchGlobalNode(n.Name)
+                                    : NodeManager.SwitchProxyNode(group, n.Name, false, "", cfg).Ok;
+                                if (swOk)
+                                {
+                                    System.Threading.Thread.Sleep(isolated ? 140 : 220);
+                                    var rep = NodeQuality.RunFastQualityProbe(
+                                        n.Name, Settings.DesiredRegion, directRiskHint, n.LiveDelayMs, ipCache, cfg, sidecar);
+                                    if (!rep.RoutedDirect)
+                                    {
+                                        if (rep.MainstreamReadyCount == 4) ready4++;
+                                        if (rep.GoogleAiUsable) aiReady++;
+                                    }
+                                    done++;
+
+                                    if (UiAlive)
+                                    {
+                                        try
+                                        {
+                                            BeginInvoke(new Action(() =>
+                                            {
+                                                if (!UiAlive) return;
+                                                _qualityPage.UpsertBatchReport(rep);
+                                                _nodesPage.CacheQualityReport(rep);
+                                                _qualityPage.SetBatchScanning(true, done, total, n.Name);
+                                            }));
+                                        }
+                                        catch { }
+                                    }
+                                }
+                                else
+                                {
+                                    done++;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            if (!isolated)
+                            {
+                                if (useTempGlobal && !string.IsNullOrEmpty(origGlobal))
+                                    NodeManager.SwitchProxyNode("GLOBAL", origGlobal, false, "", cfg);
+                                if (!string.IsNullOrEmpty(cat.GroupName) && !string.IsNullOrEmpty(origSelection))
+                                    NodeManager.SwitchProxyNode(cat.GroupName, origSelection, false, "", cfg);
+                                if (switchedMode)
+                                    NodeManager.SetKernelModeTemp(origMode, cfg);
+                            }
+                        }
+                    });
+
+                    if (!UiAlive) return;
+                    _qualityPage.SetBatchScanning(false, done, total, "");
+                    AuditLog.Record("QUALITY_BATCH",
+                        "全量节点评估完成：isolated=" + isolated + " done=" + done + "/" + total +
+                        " full4=" + ready4 + " geminiReady=" + aiReady);
+                    string summary = _batchQualityCancel
+                        ? ("已停止全量评估（完成 " + done + "/" + total + " · 四项全通 " + ready4 + " 个）")
+                        : ("全量评估完成：共评估 " + done + " 个可用节点 · 四项主流服务全通 " + ready4 + " 个");
+                    SetStatus(summary, ready4 > 0 || aiReady > 0 ? Theme.Ok : Theme.Warn);
+                    Toast("全量节点评估完成",
+                        "已测 " + done + " 个节点 · 四项服务全通 " + ready4 + " 个，可一键纳入备选池",
+                        ready4 > 0 || aiReady > 0 ? Theme.Ok : Theme.Warn,
+                        ready4 > 0 || aiReady > 0 ? 0 : 1);
+                }
+            }
+            catch (Exception ex)
+            {
+                _qualityPage.SetBatchScanning(false, 0, 0, "");
+                ReportFailure("全量评估节点链路质量", ex);
+            }
+            finally
+            {
+                _batchQualityRunning = false;
+                _nodeActionBusy = false;
+                if (UiAlive) _ = LoadNodesCatalogAsync();
+            }
+        }
+
+        void InspectSpecificNodeFromPanel(string nodeName)
+        {
+            if (!UiAlive || _nodeActionBusy || string.IsNullOrWhiteSpace(nodeName)) return;
+            PushAndSwitchPage(2);
+            _ = InspectNodeQualityAsync(nodeName, false);
+        }
+
+        async void ToggleBatchDelayScan()
+        {
+            if (_batchDelayRunning)
+            {
+                _batchDelayCancel = true;
+                SetStatus("正在停止批量测速…", Theme.Dim);
+                return;
+            }
+            if (_nodeActionBusy) return;
+            var targets = _nodesPage.SnapshotConcreteNodes();
+            if (targets.Count == 0) { Toast("没有可测速节点", "请先刷新或确认策略组有节点", Theme.Warn, 1); return; }
+
+            _batchDelayRunning = true;
+            _batchDelayCancel = false;
+            int total = targets.Count;
+            int done = 0;
+            _nodesPage.SetBatchTesting(true, 0, total);
+            SetStatus("正在批量测速 " + total + " 个节点（按延迟排队，可随时点停测）…", Theme.Dim);
+            string cfg = Paths.ClashYaml;
+
+            try
+            {
+                await Task.Run(() =>
+                {
+                    NodeManager.BatchMeasureNodes(
+                        targets, 2500,
+                        () => _batchDelayCancel || !UiAlive || _shuttingDown,
+                        n =>
+                        {
+                            done++;
+                            if (!UiAlive) return;
+                            try
+                            {
+                                BeginInvoke(new Action(() =>
+                                {
+                                    if (!UiAlive) return;
+                                    _nodesPage.UpdateSingleNodeDelay(n.Name, n.LiveDelayMs, n.Alive, n.LastError);
+                                    _nodesPage.SetBatchTesting(true, done, total);
+                                }));
+                            }
+                            catch { }
+                        }, cfg);
+                });
+            }
+            catch (Exception ex) { ReportFailure("批量测速", ex); }
+            finally
+            {
+                _batchDelayRunning = false;
+                if (UiAlive)
+                {
+                    _nodesPage.SetBatchTesting(false, done, total);
+                    SetStatus(_batchDelayCancel
+                        ? ("已停止批量测速（完成 " + done + "/" + total + " 个）")
+                        : ("批量测速完成（共 " + done + " 个节点）"), Theme.Ok);
+                    Toast("全测延迟完成", "已测 " + done + "/" + total + " 个节点，可在列表左侧勾选加入备选池", Theme.Ok, 0);
+                }
+            }
+        }
+
+        async Task SwitchNodeFromPanelAsync(string nodeName)
+        {
+            if (!UiAlive || _nodeActionBusy || string.IsNullOrWhiteSpace(nodeName)) return;
+            _nodeActionBusy = true;
+            _batchDelayCancel = true;
+            string oldOut = _state.Outbound;
+            SetStatus("正在切换节点到「" + CleanEmoji(nodeName) + "」并清理旧连接…", Theme.Dim);
+            try
+            {
+                string cfg = Paths.ClashYaml;
+                var outcome = await Task.Run(() =>
+                {
+                    var cat = NodeManager.LoadCatalog(cfg);
+                    if (!cat.Ok || string.IsNullOrEmpty(cat.GroupName))
+                        return new NodeManager.SwitchOutcome { Ok = false, Message = string.IsNullOrEmpty(cat.Error) ? "未找到可切换策略组" : cat.Error };
+                    return NodeManager.SwitchProxyNode(cat.GroupName, nodeName, true, oldOut, cfg);
+                });
+                if (!UiAlive) return;
+                if (!outcome.Ok)
+                {
+                    SetStatus("切换失败：" + outcome.Message, Theme.Warn);
+                    Toast("切换节点失败", outcome.Message, Theme.Warn, 1);
+                    return;
+                }
+                _state.Outbound = outcome.NewOutbound;
+                _delayNode = outcome.NewOutbound;
+                _delayMs = -1;
+                _delayTimedOut = false;
+                _delayAlertActive = false;
+                _nodesPage.SetCurrentOutbound(outcome.NewOutbound, -1, false);
+                _qualityPage.SetCurrentOutbound(outcome.NewOutbound);
+                InvalidateNavBar();
+                AuditLog.Record("SWITCH", "手动切换节点（清理旧连接 " + outcome.ClosedConnections + " 条）");
+                SetStatus("已切到「" + CleanEmoji(outcome.NewOutbound) + "」" +
+                          (outcome.ClosedConnections > 0 ? " · 已断开 " + outcome.ClosedConnections + " 条旧连接" : ""),
+                          Theme.Ok);
+                Toast("已切换节点", CleanEmoji(outcome.NewOutbound) +
+                      (outcome.ClosedConnections > 0 ? " · 已断开 " + outcome.ClosedConnections + " 条旧连接" : ""), Theme.Ok, 2);
+            }
+            catch (Exception ex) { ReportFailure("切换节点", ex); }
+            finally
+            {
+                _nodeActionBusy = false;
+                if (UiAlive)
+                {
+                    await LoadNodesCatalogAsync();
+                    _ = RunDelayTestAsync(false);
+                }
+            }
+        }
+
+        async Task TryAutoFailoverAsync(string timedOutNode)
+        {
+            if (!UiAlive || _failoverBusy || _nodeActionBusy || _shuttingDown) return;
+            _failoverBusy = true;
+            _lastFailoverAt = DateTime.UtcNow;
+            string timeTag = DateTime.Now.ToString("HH:mm:ss");
+            try
+            {
+                string cfg = Paths.ClashYaml;
+                var candidateNames = Settings.CandidateSet();
+                if (candidateNames.Count == 0)
+                {
+                    const string emptyMsg = "当前节点超时，但备选节点池为空（请到「2. 节点切换」勾选常用节点）";
+                    AuditLog.Record("FAILOVER", "当前节点超时，但备选节点池为空，无法自动切换");
+                    _nodesPage.SetLastFailoverSummary("最近提醒 " + timeTag + "：备选节点池为空，未能自动切换");
+                    SetStatus(emptyMsg, Theme.Warn);
+                    Toast("备选节点池为空", "请到「2. 节点切换」勾选几个常用节点加入备选池", Theme.Warn, 2);
+                    if (TrayBalloon != null) TrayBalloon("ProxyPicker 自动切换提醒", emptyMsg);
+                    return;
+                }
+
+                SetStatus("「" + CleanEmoji(timedOutNode) + "」超时，正在测速备选池寻找最低延迟节点…", Theme.Warn);
+                var result = await Task.Run(() =>
+                {
+                    var cat = NodeManager.LoadCatalog(cfg);
+                    if (!cat.Ok || string.IsNullOrEmpty(cat.GroupName))
+                        return new { HasPool = true, Best = (NodeManager.ProxyNodeInfo)null, Sw = (NodeManager.SwitchOutcome)null, Tested = 0, Err = cat.Error };
+
+                    var pool = cat.Nodes
+                        .Where(n => !n.IsGroup && n.IsCandidate && !string.Equals(n.Name, timedOutNode, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                    if (pool.Count == 0)
+                        return new { HasPool = false, Best = (NodeManager.ProxyNodeInfo)null, Sw = (NodeManager.SwitchOutcome)null, Tested = 0, Err = "备选池里除当前超时节点外无其他节点" };
+
+                    NodeManager.BatchMeasureNodes(pool, Math.Min(Settings.DelayTimeoutMs, 2500),
+                        () => _shuttingDown || !UiAlive, null, cfg);
+                    var best = NodeManager.PickBestFailoverCandidate(pool, timedOutNode, Settings.DesiredRegion);
+                    if (best == null)
+                        return new { HasPool = true, Best = (NodeManager.ProxyNodeInfo)null, Sw = (NodeManager.SwitchOutcome)null, Tested = pool.Count, Err = "备选池内 " + pool.Count + " 个节点均超时" };
+
+                    var sw = NodeManager.SwitchProxyNode(cat.GroupName, best.Name, true, timedOutNode, cfg);
+                    return new { HasPool = true, Best = best, Sw = sw, Tested = pool.Count, Err = sw.Ok ? "" : sw.Message };
+                });
+
+                if (!UiAlive) return;
+                if (result.Best != null && result.Sw != null && result.Sw.Ok)
+                {
+                    _state.Outbound = result.Sw.NewOutbound;
+                    _delayNode = result.Sw.NewOutbound;
+                    _delayMs = result.Best.LiveDelayMs;
+                    _delayTimedOut = false;
+                    _delayAlertActive = false;
+                    _state.DelayMs = result.Best.LiveDelayMs;
+                    _state.NodeAlive = true;
+                    _lastDelayTestAt = DateTime.UtcNow;
+
+                    AuditLog.Record("FAILOVER",
+                        "当前节点超时（" + timedOutNode + "），自动切至备选低延迟节点：" +
+                        result.Sw.NewOutbound + "（" + result.Best.LiveDelayMs + "ms · 清理连接 " + result.Sw.ClosedConnections + " 条）");
+                    string msg = BuildFailoverNotifyText(CleanEmoji(timedOutNode), CleanEmoji(result.Sw.NewOutbound), result.Best.LiveDelayMs);
+                    _nodesPage.SetCurrentOutbound(result.Sw.NewOutbound, result.Best.LiveDelayMs, false, _state.ProxyActive);
+                    _nodesPage.SetLastFailoverSummary("最近自动切换 " + timeTag + "：" + msg);
+                    _qualityPage.SetCurrentOutbound(result.Sw.NewOutbound);
+                    SetStatus(msg, Theme.Ok);
+                    Toast("已自动切换节点", msg, Theme.Ok, 2);
+                    // 无论窗口在后台还是打开着，都主动弹系统托盘气泡通知用户，以免错过（用户要求）
+                    if (TrayBalloon != null)
+                        TrayBalloon("ProxyPicker 已自动切换节点", msg +
+                            (result.Sw.ClosedConnections > 0 ? ("\n已断开 " + result.Sw.ClosedConnections + " 条旧连接") : "\n已切换为备选低延迟节点"));
+                    if (_nodesLoadedOnce) _ = LoadNodesCatalogAsync();
+                }
+                else
+                {
+                    AuditLog.Record("FAILOVER", "自动切换未成功：" + result.Err);
+                    _nodesPage.SetLastFailoverSummary("最近切换未成功 " + timeTag + "：" + result.Err);
+                    SetStatus("节点超时 · " + result.Err, Theme.Warn);
+                    Toast("备选节点均不可用", result.Err, Theme.Warn, 2);
+                    if (TrayBalloon != null)
+                        TrayBalloon("节点超时且备选不可用", result.Err);
+                }
+            }
+            catch (Exception ex) { ReportFailure("自动切换备用节点", ex); }
+            finally
+            {
+                _failoverBusy = false;
+                if (UiAlive)
+                {
+                    InvalidateNavBar();
+                    if (_page == 0) Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
+                }
+            }
         }
 
         // ---------------------------------------------------------------- 异常与忙碌状态
@@ -1610,6 +3334,11 @@ namespace ProxyPicker.UI
                 _search.Enabled = true;
                 if (_spinUntil < DateTime.UtcNow) _spinUntil = DateTime.UtcNow.AddMilliseconds(260);
                 Wake(); Invalidate();
+                if (_pendingRefresh)
+                {
+                    _pendingRefresh = false;
+                    BeginInvoke(new Action(RefreshAsync));
+                }
             }
             catch (Exception ex) { ReportFailure("恢复界面", ex); }
         }
@@ -1660,53 +3389,259 @@ namespace ProxyPicker.UI
             _status = text ?? ""; _statusColor = color; Invalidate();
         }
 
+        void InvalidateActiveToastSurface()
+        {
+            if (!UiAlive) return;
+            if (_page == 0) _list.Invalidate();
+            else if (_page == 1) _nodesPage.Invalidate();
+            else _qualityPage.Invalidate();
+        }
+
+        void InvalidateNavBar()
+        {
+            if (UiAlive) Invalidate(new Rectangle(0, Theme.Px(NavTop - 2), Width, Theme.Px(NavH + 4)));
+        }
+
         void Toast(string title, string sub, Color accent, int kind)
         {
             _toasts.Show(title, sub, accent, kind);
             Wake();
-            _list.Invalidate();
+            InvalidateActiveToastSurface();
         }
 
         // ---------------------------------------------------------------- 布局
 
-        RectangleF SummaryRect { get { return new RectangleF(18, SummaryTop, WinW - 36, SummaryH); } }
+        float LogicalW { get { return ClientSize.Width > 0 ? ClientSize.Width / Theme.S : DefaultWinW; } }
+        float LogicalH { get { return ClientSize.Height > 0 ? ClientSize.Height / Theme.S : DefaultWinH; } }
+        /// <summary>计算摘要卡在不同窗口逻辑宽度下的对称双栏 / 极窄紧凑折线图无碰撞布局。</summary>
+        internal static void ComputeSummaryLayoutBounds(
+            float logicalW,
+            out bool dualColumn,
+            out float divX,
+            out RectangleF sparkRect,
+            out RectangleF miniRatePillRect,
+            out float leftRow1Right,
+            out float leftRow2Right)
+        {
+            float cardRight = logicalW - 24f;
+            dualColumn = logicalW >= 520f;
+            if (dualColumn)
+            {
+                float rightW = logicalW < 640f
+                    ? Math.Max(196f, Math.Min(230f, logicalW * 0.37f))
+                    : Math.Max(226f, Math.Min(340f, logicalW * 0.36f));
+                divX = cardRight - rightW - 14f;
+                float rx = divX + 12f;
+                float rw = Math.Max(180f, cardRight - 14f - rx);
+                sparkRect = new RectangleF(rx, SummaryTop + 42f, rw, 24f);
+                miniRatePillRect = RectangleF.Empty;
+                leftRow1Right = divX - 10f;
+                leftRow2Right = divX - 10f;
+            }
+            else
+            {
+                divX = 0f;
+                const float miniW = 122f;
+                float rx = cardRight - 12f - miniW;
+                miniRatePillRect = new RectangleF(rx, SummaryTop + 8f, miniW, 20f);
+                sparkRect = new RectangleF(rx, SummaryTop + 34f, miniW, 29f);
+                leftRow1Right = rx - 8f;
+                leftRow2Right = rx - 8f;
+            }
+        }
 
-        /// <summary>摘要卡第二行。有分流异常时整行可点击，打开完整明细。</summary>
-        RectangleF MismatchRect { get { return new RectangleF(32, SummaryTop + 33, 205, 16); } }
+        float SummaryDivX
+        {
+            get
+            {
+                bool dual;
+                float divX, l1, l2;
+                RectangleF spark, mini;
+                ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
+                return divX;
+            }
+        }
+
+        RectangleF NavBarRect { get { return new RectangleF(24, NavTop, LogicalW - 48, NavH); } }
+
+        internal static RectangleF NavSegmentRect(float navX, float navY, float navW, float navH, int idx)
+        {
+            const float pad = 3f;
+            const float gap = 4f;
+            float itemW = (navW - pad * 2f - gap * 2f) / 3f;
+            return new RectangleF(navX + pad + idx * (itemW + gap), navY + pad, itemW, navH - pad * 2f);
+        }
+
+        RectangleF NavSegRect(int idx)
+        {
+            var r = NavBarRect;
+            return NavSegmentRect(r.X, r.Y, r.Width, r.Height, idx);
+        }
+
+        RectangleF SummaryRect { get { return new RectangleF(24, SummaryTop, LogicalW - 48, SummaryH); } }
+
+        /// <summary>摘要卡右侧第一行提示。有分流异常时整块可点击，打开完整明细。</summary>
+        RectangleF MismatchRect
+        {
+            get
+            {
+                if (!_mismatchRect.IsEmpty) return _mismatchRect;
+                bool dual;
+                float divX, l1, l2;
+                RectangleF spark, mini;
+                ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
+                float x = LogicalW < 660f ? 176f : 206f;
+                float w = Math.Max(0f, l1 - x);
+                return new RectangleF(x, SummaryTop + 13, w, 18);
+            }
+        }
         RectangleF SparkRect
         {
             get
             {
-                float rx = 244, rw = WinW - 18 - 12 - rx;
-                return new RectangleF(rx, SummaryTop + 45, rw, 26);
+                bool dual;
+                float divX, l1, l2;
+                RectangleF spark, mini;
+                ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
+                return spark;
             }
         }
-        RectangleF SearchRect { get { return new RectangleF(18, SearchTop, WinW - 36, SearchH); } }
-        RectangleF SaveRect { get { return new RectangleF(WinW - 18 - 122, WinH - 45, 122, 32); } }
-        RectangleF DirectRect { get { return new RectangleF(WinW - 18 - 122 - 8 - 84, WinH - 45, 84, 32); } }
-        RectangleF CloseRect { get { return new RectangleF(WinW - 42, 13, 26, 26); } }
-        RectangleF MinRect { get { return new RectangleF(WinW - 76, 13, 26, 26); } }
-        RectangleF RefreshRect { get { return new RectangleF(WinW - 110, 13, 26, 26); } }
-        RectangleF HelpRect { get { return new RectangleF(WinW - 144, 13, 26, 26); } }
-        RectangleF SortRect { get { return new RectangleF(WinW - 78, TabsTop, 60, 28); } }
-        RectangleF HintRect { get { return new RectangleF(18, WinH - 42, 200, 24); } }
-        RectangleF TabRect(int i) { return new RectangleF(18 + i * 92, TabsTop, 88, 28); }
 
-        RectangleF HelpCard { get { return new RectangleF(24, 72, WinW - 48, 532); } }
-        RectangleF HelpCloseRect { get { return new RectangleF(WinW - 24 - 34, 84, 24, 24); } }
-        RectangleF HelpDiagRect { get { return new RectangleF(44, HelpCard.Bottom - 52, 94, 32); } }
-        RectangleF HelpUnhideRect { get { return new RectangleF(142, HelpCard.Bottom - 52, 94, 32); } }
-        RectangleF HelpModeRect { get { return new RectangleF(240, HelpCard.Bottom - 52, 104, 32); } }
-        RectangleF HelpIpv6Rect { get { return new RectangleF(348, HelpCard.Bottom - 52, 86, 32); } }
-        // 版本号挂在面板右上角、客户端名字下面一行：那一列本来就只放「谁在管分流」，放版本最自然
-        RectangleF HelpUpdateRect { get { return new RectangleF(242, 108, 158, 15); } }
+        /// <summary>计算第 1 页工具栏（搜索框、4 枚筛选标签、排序按钮）在不同窗口宽度下的无碰撞布局矩形。</summary>
+        internal static void ComputeAppsToolbarBounds(
+            float logicalW,
+            out RectangleF searchRect,
+            out RectangleF[] tabRects,
+            out RectangleF sortRect,
+            out bool twoRow)
+        {
+            twoRow = logicalW < 640f;
+            float tabsTop = twoRow ? 208f : 171f;
+
+            float sortY = twoRow ? SearchTop + 3f : tabsTop;
+            sortRect = new RectangleF(logicalW - 24f - 76f, sortY, 76f, 28f);
+
+            float searchW = twoRow
+                ? Math.Max(160f, logicalW - 48f - 84f)
+                : Math.Min(300f, Math.Max(148f, logicalW - 446f));
+            searchRect = new RectangleF(24f, SearchTop, searchW, SearchH);
+
+            float startX = twoRow ? 24f : (searchRect.Right + 10f);
+            float rightBound = twoRow ? (logicalW - 24f) : (sortRect.X - 8f);
+            float avail = Math.Max(220f, rightBound - startX);
+            float gap = twoRow ? 6f : 4f;
+            float tabW = twoRow
+                ? ((avail - gap * 3f) / 4f)
+                : Math.Min(94f, Math.Max(54f, (avail - gap * 3f) / 4f));
+
+            tabRects = new RectangleF[4];
+            for (int i = 0; i < 4; i++)
+                tabRects[i] = new RectangleF(startX + i * (tabW + gap), tabsTop, tabW, 28f);
+        }
+
+        RectangleF SearchRect
+        {
+            get
+            {
+                RectangleF s, sort;
+                RectangleF[] tabs;
+                bool twoRow;
+                ComputeAppsToolbarBounds(LogicalW, out s, out tabs, out sort, out twoRow);
+                return s;
+            }
+        }
+        RectangleF SaveRect
+        {
+            get
+            {
+                float w = NarrowShell ? 112f : 126f;
+                return new RectangleF(LogicalW - 24 - w, LogicalH - 42, w, 30);
+            }
+        }
+        RectangleF DirectRect
+        {
+            get
+            {
+                float w = NarrowShell ? 76f : 88f;
+                return new RectangleF(SaveRect.X - 8f - w, LogicalH - 42, w, 30);
+            }
+        }
+        RectangleF CloseRect { get { return new RectangleF(LogicalW - 50, 10, 26, 26); } }
+        RectangleF MaxRect { get { return new RectangleF(LogicalW - 82, 10, 26, 26); } }
+        RectangleF MinRect { get { return new RectangleF(LogicalW - 114, 10, 26, 26); } }
+        RectangleF RefreshRect { get { return new RectangleF(LogicalW - 146, 10, 26, 26); } }
+        RectangleF HelpRect { get { return new RectangleF(LogicalW - 178, 10, 26, 26); } }
+        RectangleF SortRect
+        {
+            get
+            {
+                RectangleF s, sort;
+                RectangleF[] tabs;
+                bool twoRow;
+                ComputeAppsToolbarBounds(LogicalW, out s, out tabs, out sort, out twoRow);
+                return sort;
+            }
+        }
+        RectangleF HintRect { get { return new RectangleF(24, LogicalH - 36, Math.Max(120f, DirectRect.X - 32f), 22); } }
+        RectangleF TabRect(int i)
+        {
+            RectangleF s, sort;
+            RectangleF[] tabs;
+            bool twoRow;
+            ComputeAppsToolbarBounds(LogicalW, out s, out tabs, out sort, out twoRow);
+            return (i >= 0 && i < 4) ? tabs[i] : RectangleF.Empty;
+        }
+
+        RectangleF HelpCard
+        {
+            get
+            {
+                float hw = Math.Min(760f, LogicalW - 36f);
+                float hh = Math.Min(500f, LogicalH - 48f);
+                return new RectangleF((LogicalW - hw) / 2f, (LogicalH - hh) / 2f, hw, hh);
+            }
+        }
+        RectangleF HelpCloseRect { get { return new RectangleF(HelpCard.Right - 34, HelpCard.Y + 12, 24, 24); } }
+        RectangleF HelpFooterBtnRect(int idx)
+        {
+            var card = HelpCard;
+            float gap = 8f;
+            if (LogicalW < 580f)
+            {
+                float colW = (card.Width - 40f - gap) / 2f;
+                int c = idx % 2;
+                int r = idx / 2;
+                return new RectangleF(card.X + 20f + c * (colW + gap), card.Bottom - 78f + r * 35f, colW, 29f);
+            }
+            float avail = card.Width - 40f - gap * 3f;
+            float w0 = avail * 0.19f, w1 = avail * 0.19f, w2 = avail * 0.34f, w3 = avail - w0 - w1 - w2;
+            float[] ws = { w0, w1, w2, w3 };
+            float x = card.X + 20f;
+            for (int k = 0; k < idx; k++) x += ws[k] + gap;
+            return new RectangleF(x, card.Bottom - 46f, ws[idx], 30f);
+        }
+        RectangleF HelpDiagRect { get { return HelpFooterBtnRect(0); } }
+        RectangleF HelpUnhideRect { get { return HelpFooterBtnRect(1); } }
+        RectangleF HelpModeRect { get { return HelpFooterBtnRect(2); } }
+        RectangleF HelpIpv6Rect { get { return HelpFooterBtnRect(3); } }
+        // 版本号挂在帮助卡片右上角、客户端名字下面一行，不会与标题按钮重合
+        RectangleF HelpUpdateRect { get { return new RectangleF(HelpCard.Right - 226, HelpCard.Y + 34, 184, 16); } }
 
         void LayoutChildren()
         {
-            int top = Theme.Px(ListTop);
-            _list.SetBounds(0, top, ClientSize.Width, Math.Max(0, ClientSize.Height - top - Theme.Px(FooterH)));
-            _search.SetBounds(Theme.Px(54), Theme.Px(SearchTop + 10),
-                Math.Max(0, ClientSize.Width - Theme.Px(72)), Theme.Px(20));
+            int listTopPx = Theme.Px(ListTop);
+            _list.SetBounds(Theme.Px(16), listTopPx, Math.Max(0, ClientSize.Width - Theme.Px(32)),
+                Math.Max(0, ClientSize.Height - listTopPx - Theme.Px(FooterH)));
+
+            var sr = SearchRect;
+            _search.SetBounds(Theme.Px(sr.X + 32f), Theme.Px(sr.Y + 8f),
+                Math.Max(60, Theme.Px(sr.Width - 42f)), Theme.Px(18));
+
+            int subTopPx = Theme.Px(SummaryTop);
+            int subH = Math.Max(0, ClientSize.Height - subTopPx - Theme.Px(FooterSlimH));
+            int subW = Math.Max(0, ClientSize.Width - Theme.Px(48));
+            _nodesPage.SetBounds(Theme.Px(24), subTopPx, subW, subH);
+            _qualityPage.SetBounds(Theme.Px(24), subTopPx, subW, subH);
         }
 
         // ---------------------------------------------------------------- 绘制
@@ -1714,31 +3649,66 @@ namespace ProxyPicker.UI
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
+            float lw = LogicalW, lh = LogicalH;
             Draw.Hint(g); g.Clear(Theme.Bg); g.ScaleTransform(Theme.S, Theme.S);
-            Theme.Fill(g, Theme.Bg, new RectangleF(0, 0, WinW, WinH), 0f);
+            Theme.Fill(g, Theme.Bg, new RectangleF(0, 0, lw, lh), 0f);
 
             using (var b = new LinearGradientBrush(
-                new RectangleF(0, 0, WinW, TitleH + 6),
+                new RectangleF(0, 0, lw, TitleH + 6),
                 Theme.Dark ? Theme.FromHex("#1A1E25") : Theme.FromHex("#FFFFFF"), Theme.Bg, 90f))
-                g.FillRectangle(b, 0, 0, WinW, TitleH + 6);
+                g.FillRectangle(b, 0, 0, lw, TitleH + 6);
 
-            if (_titleIcon != null) g.DrawImage(_titleIcon, 18f, 14f, 24f, 24f);
-            Draw.Text(g, "ProxyPicker", _fTitle, Theme.Fg, new RectangleF(50, 10, 220, 23));
-            Draw.Text(g, Subtitle(), _fSub, Theme.Dim, new RectangleF(50, 32, 290, 17));
+            if (_titleIcon != null) g.DrawImage(_titleIcon, 24f, 11f, 24f, 24f);
+            float titleAvail = Math.Max(140f, HelpRect.X - 64f);
+            Draw.Text(g, "ProxyPicker", _fTitle, Theme.Fg, new RectangleF(56, 7, titleAvail, 22));
+            Draw.Text(g, Subtitle(), _fSub, Theme.Dim, new RectangleF(56, 27, titleAvail, 16));
 
             DrawChromeButton(g, HelpRect, Btn.Help, "?");
             DrawRefresh(g);
             DrawMin(g);
+            DrawMax(g);
             DrawClose(g);
+
+            DrawNavBar(g);
+
+            if (_spinning)
+            {
+                // 顶部一条流动细光，表示「在干活」
+                float w = 90f;
+                float x = (_spin / 360f) * (lw + w) - w;
+                using (var b = new LinearGradientBrush(new RectangleF(x, TitleH - 2, w, 2),
+                    Color.FromArgb(0, Theme.Accent), Theme.Accent, 0f))
+                {
+                    b.WrapMode = WrapMode.TileFlipXY;
+                    g.FillRectangle(b, x, TitleH - 2, w, 2);
+                }
+            }
+
+            if (_page == 1 || _page == 2)
+            {
+                using (var pen = new Pen(Theme.Line)) g.DrawLine(pen, 0, lh - FooterSlimH, lw, lh - FooterSlimH);
+                float tipW = NarrowShell ? Math.Min(178f, lw * 0.42f) : Math.Min(300f, lw * 0.44f);
+                float statusW = Math.Max(120f, lw - 48f - tipW - 10f);
+                Draw.Text(g, _status, _fHint, _statusColor == Color.Empty ? Theme.Dim : _statusColor,
+                    new RectangleF(24, lh - 26, statusW, 19));
+                string pageTip = NarrowShell
+                    ? "Esc 返回 · Ctrl+1/2/3"
+                    : (_page == 1 ? "备选池与策略即时生效 · Esc 返回 · Ctrl+1/2/3" : "旁路隔离引擎 · Esc 返回上一视图 · Ctrl+1/2/3");
+                Draw.Text(g, pageTip, _fTiny, Theme.Dim,
+                    new RectangleF(lw - 24 - tipW, lh - 25, tipW, 18), Draw.Right);
+                if (_help) DrawHelp(g);
+                return;
+            }
 
             DrawSummary(g);
 
-            // 搜索框：聚焦时描边变蓝，给一个很轻的「这里在等你输入」信号
-            Theme.Fill(g, Theme.Card, SearchRect, 9f);
+            // 搜索框：流式响应宽度
+            var sr = SearchRect;
+            Theme.Fill(g, Theme.Card, sr, 9f);
             bool focus = _search.Focused;
             Theme.Stroke(g, focus ? Theme.Accent : (Theme.Dark ? Theme.Line : Theme.FromHex("#DCE0E6")),
-                SearchRect, 9f, focus ? 1.4f : 1f);
-            Magnifier(g, SearchRect.X + 20, SearchRect.Y + SearchH / 2f, 5f, focus ? Theme.Accent : Theme.Dim);
+                sr, 9f, focus ? 1.4f : 1f);
+            Magnifier(g, sr.X + 18, sr.Y + SearchH / 2f, 4.8f, focus ? Theme.Accent : Theme.Dim);
 
             for (int i = 0; i < 4; i++)
             {
@@ -1751,22 +3721,9 @@ namespace ProxyPicker.UI
 
             DrawSortButton(g);
 
-            if (_spinning)
-            {
-                // 顶部一条流动细光，表示「在干活」
-                float w = 90f;
-                float x = (_spin / 360f) * (WinW + w) - w;
-                using (var b = new LinearGradientBrush(new RectangleF(x, TitleH - 2, w, 2),
-                    Color.FromArgb(0, Theme.Accent), Theme.Accent, 0f))
-                {
-                    b.WrapMode = WrapMode.TileFlipXY;
-                    g.FillRectangle(b, x, TitleH - 2, w, 2);
-                }
-            }
-
-            using (var pen = new Pen(Theme.Line)) g.DrawLine(pen, 0, WinH - FooterH, WinW, WinH - FooterH);
+            using (var pen = new Pen(Theme.Line)) g.DrawLine(pen, 0, lh - FooterH, lw, lh - FooterH);
             Draw.Text(g, _status, _fHint, _statusColor == Color.Empty ? Theme.Dim : _statusColor,
-                new RectangleF(18, WinH - 72, WinW - 36, 20));
+                new RectangleF(24, lh - 61, lw - 48, 18));
             Draw.Text(g, ClientTag(), _fTiny, Theme.Dim, HintRect);
 
             DrawSaveButton(g);
@@ -1774,114 +3731,362 @@ namespace ProxyPicker.UI
             if (_help) DrawHelp(g);
         }
 
+        void DrawNavBar(Graphics g)
+        {
+            var bar = NavBarRect;
+            Color track = Theme.Dark ? Theme.FromHex("#1A1F26") : Theme.FromHex("#ECEFF4");
+            Theme.Fill(g, track, bar, 11f);
+            Theme.Stroke(g, Theme.Line, bar, 11f);
+
+            bool compactNav = LogicalW < 580f;
+            int selApps = _all.Count(r => r.Proxy);
+            string tag0 = compactNav
+                ? (selApps > 0 ? ("1. 分流 · " + selApps) : "1. 分流")
+                : (selApps > 0 ? ("1. 应用分流 · " + selApps + " 已选") : "1. 应用分流");
+
+            string delayInfo = "";
+            bool delayWarn = false;
+            if (!_state.ConfigOk)
+            {
+                delayInfo = compactNav ? " · 未连" : " · 未连接";
+            }
+            else if (!_state.ProxyActive)
+            {
+                delayInfo = compactNav ? " · 未开代理" : " · 代理未开";
+            }
+            else
+            {
+                delayWarn = _delayTimedOut || (_state.NodeAlive == false && _delayMs <= 0);
+                if (delayWarn) delayInfo = " · 超时";
+                else if (_delayMs > 0) delayInfo = " · " + _delayMs + "ms";
+                else if (_state.DelayMs > 0) delayInfo = " · " + _state.DelayMs + "ms";
+            }
+            string tag1 = (compactNav ? "2. 节点" : "2. 节点策略") + delayInfo;
+
+            string tag2 = compactNav ? "3. 体检" : "3. 链路体检";
+            bool hasRep = _lastQualityReport != null;
+            Color repDot = Color.Empty;
+            if (hasRep)
+            {
+                if (_lastQualityReport.RoutedDirect || _lastQualityReport.Level == NodeQuality.RiskLevel.High)
+                {
+                    if (!compactNav) tag2 += " · 高风险";
+                    repDot = Theme.Danger;
+                }
+                else if (_lastQualityReport.Level == NodeQuality.RiskLevel.Medium || !_lastQualityReport.RegionMatched)
+                {
+                    if (!compactNav) tag2 += " · 注意";
+                    repDot = Theme.Warn;
+                }
+                else
+                {
+                    tag2 += compactNav
+                        ? (" · " + _lastQualityReport.MainstreamReadyCount + "/4")
+                        : (" · 就绪 " + _lastQualityReport.MainstreamReadyCount + "/4");
+                    repDot = Theme.Ok;
+                }
+            }
+
+            string[] labels = { tag0, tag1, tag2 };
+            Btn[] btns = { Btn.Nav0, Btn.Nav1, Btn.Nav2 };
+
+            for (int i = 0; i < 3; i++)
+            {
+                var seg = NavSegRect(i);
+                bool active = _page == i;
+                bool hover = _hover == btns[i];
+                if (active)
+                {
+                    Draw.Shadow(g, seg, 8f, Theme.Dark ? 36 : 16);
+                    Theme.Fill(g, Theme.Card, seg, 8f);
+                    Theme.Stroke(g, Theme.AccentSoft, seg, 8f);
+                }
+                else if (hover)
+                {
+                    Theme.Fill(g, Theme.Hover, seg, 8f);
+                }
+
+                Color fg = active ? Theme.Accent : Theme.Dim;
+                if (i == 1 && delayWarn && !active) fg = Theme.Warn;
+                Draw.Text(g, labels[i], active ? _fTabActive : _fTab, fg, seg, Draw.Center);
+
+                if ((i == 1 && delayWarn) || (i == 2 && !repDot.IsEmpty))
+                {
+                    Color dotCol = i == 1 ? Theme.Warn : repDot;
+                    using (var br = new SolidBrush(dotCol))
+                        g.FillEllipse(br, seg.Right - 14f, seg.Y + 6f, 6f, 6f);
+                }
+            }
+        }
+
         string Subtitle()
         {
             // 有新版本时先说这件事：平时那句「谁在管分流」在帮助面板里随时能看
             if (_update != null && _update.Ok && _update.Newer)
                 return "有新版本 v" + _update.Latest + " · 点右上角「?」";
-            // _state 已在后台 RefreshAsync 里填好；绘制函数不能再做进程/磁盘探测，
-            // 否则 30fps 下每一次曲线重绘都在重复扫描客户端。
+            // _state 已在后台 RefreshAsync / CheckOutbound / WatchAsync 里填好
+            if (!_state.ConfigOk)
+                return !string.IsNullOrEmpty(_state.Client)
+                    ? (_state.Client + " · 未连接（内核未启动）")
+                    : "未检测到运行中的代理客户端";
+            if (!_state.ProxyActive)
+                return (!string.IsNullOrEmpty(_state.Client) ? _state.Client : "代理内核") +
+                    (NarrowShell ? " · 代理未开启（TUN/系统关）" : " · 代理未开启（TUN 与系统代理均关）");
             if (!string.IsNullOrEmpty(_state.Client)) return _state.Client + " · 按软件分流";
-            if (!string.IsNullOrEmpty(_state.Error)) return "还没找到 Clash / mihomo";
             return "只让需要的软件走代理";
         }
 
         string ClientTag()
         {
+            if (NarrowShell)
+            {
+                if (!string.IsNullOrEmpty(_state.Client)) return _state.Client + " · 保存即生效";
+                return "保存后无需重启浏览器";
+            }
             if (!string.IsNullOrEmpty(_state.Client)) return _state.Client + " · 保存后无需重启浏览器";
             return "保存后无需重启浏览器";
+        }
+
+        /// <summary>生成摘要卡左下角内核底座与模式状态（例如「TUN · 规则」）。</summary>
+        internal static string FormatKernelMeta(bool tun, string mode, out bool isWarn)
+        {
+            string m = (mode ?? "").Trim().ToLowerInvariant();
+            string modeLabel;
+            bool modeWarn = false;
+            if (m.Length == 0 || m == "rule") modeLabel = "规则";
+            else if (m == "global") { modeLabel = "全局"; modeWarn = true; }
+            else if (m == "direct") { modeLabel = "直连"; modeWarn = true; }
+            else { modeLabel = mode.Trim(); modeWarn = true; }
+
+            isWarn = !tun || modeWarn;
+            return (tun ? "TUN · " : "系统代理 · ") + modeLabel;
+        }
+
+        /// <summary>按实际像素宽度裁剪节点名称，保证前缀（「节点 」）与延迟后缀（「 · 203ms」）不被截断。</summary>
+        internal static string FitPillLabel(string prefix, string nodeName, string suffix,
+            float maxTextWidth, Func<string, float> measureWidth)
+        {
+            prefix = prefix ?? "";
+            nodeName = nodeName ?? "";
+            suffix = suffix ?? "";
+            string full = prefix + nodeName + suffix;
+            if (measureWidth == null || measureWidth(full) <= maxTextWidth) return full;
+
+            for (int keep = nodeName.Length - 1; keep >= 1; keep--)
+            {
+                string candidate = prefix + nodeName.Substring(0, keep) + "…" + suffix;
+                if (measureWidth(candidate) <= maxTextWidth) return candidate;
+            }
+            return prefix + "…" + suffix;
+        }
+
+        void DrawRateRow(Graphics g, float rx, float rw, float y, string label, bool ok,
+            double down, double up, Color valColor)
+        {
+            bool tight = rw < 210f;
+            float labelW = tight ? (label.IndexOf('≈') >= 0 ? 31f : 27f) : 34f;
+            float rateX = rx + labelW, rateW = rw - labelW;
+            float downW = tight ? rateW * 0.50f : 86f, upW = rateW - downW;
+            Draw.Text(g, label, _fTiny, Theme.Dim, new RectangleF(rx, y + 1, labelW, 15));
+            if (!ok)
+            {
+                Draw.Text(g, "—", _fRate, valColor, new RectangleF(rateX, y, rateW, 16), Draw.Right);
+                return;
+            }
+            string dPrefix = tight ? "↓" : "↓ ";
+            string uPrefix = tight ? "↑" : "↑ ";
+            Draw.Text(g, dPrefix + Traffic.Speed(down), _fRate, valColor, new RectangleF(rateX, y, downW, 16), Draw.Right);
+            Draw.Text(g, uPrefix + Traffic.Speed(up), _fRate, valColor, new RectangleF(rateX + downW, y, upW, 16), Draw.Right);
         }
 
         void DrawSummary(Graphics g)
         {
             var card = SummaryRect;
+            float lw = LogicalW;
+            bool compactCopy = lw < 660f;
+            bool dualColumn;
+            float divX, leftRow1Right, leftRow2Right;
+            RectangleF sparkRect, miniRatePillRect;
+            ComputeSummaryLayoutBounds(lw, out dualColumn, out divX, out sparkRect, out miniRatePillRect, out leftRow1Right, out leftRow2Right);
+
             Draw.Shadow(g, card, 10f, Theme.Dark ? 60 : 22);
             Theme.Fill(g, Theme.Card, card, 10f);
             Theme.Stroke(g, Theme.Line, card, 10f);
 
             int selected = _all.Count(r => r.Proxy);
-            // 订阅兼容模式下，取消勾选≠直连：只是不再强制走代理，流量仍按订阅规则走。
-            // 以前两种情况都写「N 个软件走代理」，用户会以为关掉开关就该直连（实机反馈）。
-            string countText = selected + (Settings.PatchOnly ? " 个软件强制走代理" : " 个软件走代理");
+            string countText = selected + (Settings.PatchOnly ? " 个软件强制代理" : " 个软件走代理");
+            float countMeasured = g.MeasureString(countText, _fSummary).Width;
+            float countBoxW = Math.Min(compactCopy ? 154f : 168f, (float)Math.Ceiling(countMeasured) + 4f);
             Draw.Text(g, countText, _fSummary, selected > 0 ? Theme.Accent : Theme.Fg,
-                new RectangleF(32, SummaryTop + 7, 240, 24));
-            // 第二行顺便报出「内核这一轮看得到几个进程」。
-            // 这个数字是本工具存在感的唯一实证：TUN 下它≈全部在跑的软件，
-            // 系统代理下会明显变小 —— 变小就意味着有软件我们管不到。
-            string rest = Settings.PatchOnly ? "取消勾选≠直连 · 按订阅规则" : "其余软件全部直连";
-            // 预期出口与实测链路不一致时，优先把这句话摆出来：
-            // 「勾了却没生效」比「现在有几个进程可见」重要得多。
-            if (_mismatch > 0)
-            {
-                // 异常一多，把名字往这一行里塞必然显示不全（用户实机反馈）。
-                // 改成「数量 + 可点击入口」：完整清单在 ShowMismatchDialog 里逐条列出，
-                // 帮助面板和「复制诊断」也都能拿到全量，不再用「… 等」糊过去。
-                rest = "分流异常 " + _mismatch + " 个 · 点这里看全部";
-            }
-            else if (_visibleProcs > 0) rest += " · 可见 " + _visibleProcs + " 个";
-            Draw.Text(g, rest, _fSmall, _mismatch > 0 ? Theme.Warn : Theme.Dim, MismatchRect);
+                new RectangleF(38, SummaryTop + 9, countBoxW, 24));
 
-            // 第三行：左边内核状态，右边用胶囊直接摆出「勾选软件实际走哪个节点」。
-            //
-            // 为什么单独立一格：PP-FIXED 指向主选择组后，真正生效的是这条链路末端，
-            // 而 GLOBAL 的选择可能完全不是同一个节点。以前只显示 GLOBAL，
-            // 用户会以为「我明明换了节点」，界面却纹丝不动 —— 看起来就像贴图。
-            // 底座直接写「TUN + 当前模式」：以前无论哪种模式都写「全部接管」，
-            // 订阅兼容下会让人误以为所有流量都由本工具控制（实机反馈）。
-            string meta = _state.Tun
-                ? (Settings.PatchOnly ? "TUN · 订阅兼容" : "TUN · 白名单接管")
-                : "系统代理 · 部分失效";
-            Color metaColor = _state.Tun ? Theme.Dim : Theme.Warn;
-            // 策略组没解析出来、或策略组不在 /proxies 里时，不要退回显示 GLOBAL 的节点：
-            // 那会让人以为「有出口」。直接写「未找到」，配合状态栏的错误提示。
-            string outb = _state.Outbound;
-            if (string.IsNullOrEmpty(_state.Policy) || string.IsNullOrEmpty(outb))
-                outb = "未找到";
-            if (string.IsNullOrEmpty(outb))
+            string rest = Settings.PatchOnly ? "按订阅规则" : "其余直连";
+            bool modeKnown = _state.ConfigOk && !string.IsNullOrEmpty(_state.Mode) && _state.Mode != "?";
+            bool nonRuleMode = modeKnown && !Profile.IsRuleMode(_state.Mode);
+            bool notProxyActive = _state.ConfigOk && !nonRuleMode && !_state.ProxyActive;
+            if (!_state.ConfigOk)
+                rest = compactCopy ? "未连内核" : "未连接到代理内核";
+            else if (!modeKnown)
+                rest = compactCopy ? "读取中…" : "内核状态读取中…";
+            else if (nonRuleMode)
+                rest = compactCopy ? (Profile.ModeDisplayName(_state.Mode) + " · 暂停") : (Profile.ModeDisplayName(_state.Mode) + "模式 · 暂停规则");
+            else if (notProxyActive)
+                rest = compactCopy ? "TUN/系统均关" : "客户端未开代理（TUN/系统均关）";
+            else if (_mismatch > 0)
+                rest = "异常 " + _mismatch + (_autoMismatchCount >= 3 ? " · 点修复" : " · 修复中");
+            else if (!compactCopy)
+                rest = (Settings.PatchOnly ? "取消勾选≠直连 · 按订阅规则" : "其余软件全部直连") +
+                       (_visibleProcs > 0 ? (" · 可见 " + _visibleProcs + " 个") : "");
+            float restX = 38f + countBoxW + 8f;
+            _mismatchRect = new RectangleF(restX, SummaryTop + 13f, Math.Max(0f, leftRow1Right - restX), 18f);
+            Draw.Text(g, rest, _fSmall, (!_state.ConfigOk || nonRuleMode || notProxyActive || _mismatch > 0) ? Theme.Warn : Theme.Dim, _mismatchRect);
+
+            if (!dualColumn)
             {
-                Draw.Text(g, meta, _fTiny, metaColor, new RectangleF(32, SummaryTop + 54, 200, 16));
+                bool rateOkMini = _state.ConfigOk && _traffic != null && _traffic.Ok;
+                string rateStr = !_state.ConfigOk
+                    ? "内核未连接"
+                    : (!_state.ProxyActive && !rateOkMini
+                        ? "代理未开启"
+                        : (rateOkMini ? ("↓" + Traffic.Speed(_rateProxyDown) + "  ↑" + Traffic.Speed(_rateProxyUp)) : "流量读取中"));
+                Theme.Fill(g, Theme.SubCard, miniRatePillRect, 7f);
+                Draw.Text(g, rateStr, _fTiny, rateOkMini ? Theme.Accent : Theme.Dim, miniRatePillRect, Draw.Center);
+            }
+
+            // 第二行左侧：分流底座+模式胶囊 + 当前节点快捷胶囊
+            var fp = _fPill ?? (_fPill = Theme.Ui(9.5f));
+            bool metaWarn;
+            string kernelMeta = FormatKernelMeta(_state.Tun, _state.Mode, out metaWarn);
+            string splitLabel = Settings.PatchOnly ? "订阅兼容" : "白名单";
+            string chipText;
+            bool chipWarn;
+            if (!_state.ConfigOk)
+            {
+                chipText = "未连接 · " + splitLabel + " ▾";
+                chipWarn = true;
+            }
+            else if (!_state.ProxyActive)
+            {
+                chipText = (string.Equals(_state.Mode, "direct", StringComparison.OrdinalIgnoreCase) ? "直连暂停 · " : "未开代理 · ") + splitLabel + " ▾";
+                chipWarn = true;
             }
             else
             {
-                Draw.Text(g, meta, _fTiny, metaColor, new RectangleF(32, SummaryTop + 54, 110, 16));
+                chipText = (_state.Tun ? "TUN · " : "系统代理 · ") + splitLabel + (metaWarn ? " !" : "") + " ▾";
+                chipWarn = metaWarn;
+            }
+            float chipW = Math.Min(lw < 580f ? 142f : 156f, Math.Max(78f, g.MeasureString(chipText, fp).Width + 14f));
+            var chipRect = new RectangleF(38, SummaryTop + 42, chipW, 21);
+            _modeChipRect = chipRect;
+            Color chipBg = chipWarn
+                ? Theme.WarnSoft
+                : (_hover == Btn.ModeChip ? Theme.Hover : Theme.SubCard);
+            Theme.Fill(g, chipBg, chipRect, 10f);
+            Draw.Text(g, chipText, fp, chipWarn ? Theme.Warn : Theme.Dim, chipRect, Draw.Center);
 
-                // 这个值跟随本次规则实际写入的策略组（见 Profile.ResolveOutbound），
-                // 不再固定跟 GLOBAL —— GLOBAL 在规则模式下经常停在 DIRECT，
-                // 会让用户以为规则没生效（实机截图：订阅组是日本，界面却写 DIRECT）。
-                string label = "出口 " + CleanEmoji(outb);
-                var fp = _fPill ?? (_fPill = Theme.Ui(9.5f));
-                float bw = Math.Min(g.MeasureString(label, fp).Width + 18f, 134f);
-                var pill = new RectangleF(242 - bw, SummaryTop + 52, bw, 20);
-                Theme.Fill(g, Theme.AccentSoft, pill, 10f);
-                Draw.Text(g, label, fp, Theme.Accent, pill, Draw.Center);
+            string outb = _state.Outbound;
+            bool hasOut = _state.ConfigOk && !string.IsNullOrEmpty(_state.Policy) && !string.IsNullOrEmpty(outb);
+            float pillStart = chipRect.Right + 8f;
+            float maxPillW = Math.Max(48f, leftRow2Right - pillStart);
+            if (!_state.ConfigOk)
+            {
+                string offTxt = FitPillLabel("", "未连接 · 点此看节点", "", maxPillW - 14f, s => g.MeasureString(s, fp).Width);
+                float bw = Math.Min(maxPillW, g.MeasureString(offTxt, fp).Width + 14f);
+                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                _delayRect = pill;
+                Theme.Fill(g, _hover == Btn.Delay ? Theme.Hover : Theme.Btn, pill, 10f);
+                Draw.Text(g, offTxt, fp, Theme.Dim, pill, Draw.Center);
+            }
+            else if (!hasOut)
+            {
+                string noOut = "节点 未找到 · 去设置 →";
+                float bw = Math.Min(maxPillW, g.MeasureString(noOut, fp).Width + 14f);
+                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                _delayRect = pill;
+                Theme.Fill(g, _hover == Btn.Delay ? Theme.Hover : Theme.Btn, pill, 10f);
+                Draw.Text(g, noOut, fp, Theme.Dim, pill, Draw.Center);
+            }
+            else if (!_state.ProxyActive)
+            {
+                string cleanOut = CleanEmoji(outb);
+                string standby = FitPillLabel("待连接：", cleanOut, " →", maxPillW - 14f, s => g.MeasureString(s, fp).Width);
+                float bw = Math.Min(maxPillW, g.MeasureString(standby, fp).Width + 14f);
+                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                _delayRect = pill;
+                Theme.Fill(g, _hover == Btn.Delay ? Theme.Hover : Theme.SubCard, pill, 10f);
+                Draw.Text(g, standby, fp, Theme.Dim, pill, Draw.Center);
+            }
+            else
+            {
+                string suffix = "";
+                bool isWarn = _delayTimedOut || (_state.NodeAlive == false && _delayMs <= 0);
+                if (Profile.ClassifyExit(outb) == Profile.ExitKind.Proxy)
+                {
+                    if (_delayTesting && string.Equals(_delayNode, outb, StringComparison.OrdinalIgnoreCase))
+                        suffix = " · 测速中";
+                    else if (_delayTimedOut && string.Equals(_delayNode, outb, StringComparison.OrdinalIgnoreCase))
+                        suffix = " · 超时";
+                    else if (_delayMs > 0 && string.Equals(_delayNode, outb, StringComparison.OrdinalIgnoreCase))
+                        suffix = " · " + _delayMs + "ms";
+                    else if (_state.DelayMs > 0)
+                        suffix = " · " + _state.DelayMs + "ms";
+                }
+                suffix += " →";
+
+                string cleanOut = CleanEmoji(outb);
+                string label = FitPillLabel("节点 ", cleanOut, suffix, maxPillW - 14f, s => g.MeasureString(s, fp).Width);
+                float bw = Math.Min(maxPillW, g.MeasureString(label, fp).Width + 14f);
+                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                _delayRect = pill;
+                bool isDirectExit = Profile.ClassifyExit(outb) == Profile.ExitKind.Direct;
+                Color pillBg = isWarn ? Theme.WarnSoft : (isDirectExit ? Theme.SubCard : (_hover == Btn.Delay ? Theme.Hover : Theme.AccentSoft));
+                Color pillFg = isWarn ? Theme.Warn : (isDirectExit ? Theme.Dim : Theme.Accent);
+                Theme.Fill(g, pillBg, pill, 10f);
+                Draw.Text(g, label, fp, pillFg, pill, Draw.Center);
+            }
+            if (false && kernelMeta.Length == 0) { }
+
+            if (dualColumn)
+            {
+                // 中间竖线 + 右上对称双行流量速率（>=520px 起即展示完整双栏流量面板）
+                using (var vpen = new Pen(Theme.Line))
+                    g.DrawLine(vpen, divX, SummaryTop + 10f, divX, SummaryTop + SummaryH - 10f);
+
+                float rx = sparkRect.X, rw = sparkRect.Width;
+                bool estimated = _traffic != null && _traffic.Estimated > 0;
+                bool rateOk = _state.ConfigOk && _traffic != null && _traffic.Ok;
+                DrawRateRow(g, rx, rw, SummaryTop + 5, estimated ? "代理≈" : "代理", rateOk,
+                    _rateProxyDown, _rateProxyUp, Theme.Accent);
+                DrawRateRow(g, rx, rw, SummaryTop + 23, "直连", rateOk,
+                    _rateDirectDown, _rateDirectUp, Theme.Dim);
             }
 
-            // 右列：两条通道的实时速率 + 迷你走势
-            float rx = 244, rw = WinW - 18 - 12 - rx;
-            // 链路未知时速率含按名单估算的部分，用「≈」明示，不冒充实测。
-            bool estimated = _traffic != null && _traffic.Estimated > 0;
-            Draw.Text(g, estimated ? "代理≈" : "代理", _fTiny, Theme.Dim,
-                      new RectangleF(rx - 10, SummaryTop + 5, 36, 15));
-            Draw.Text(g, _traffic == null || !_traffic.Ok ? "—" :
-                "↓ " + Traffic.Speed(_rateProxyDown) + "   ↑ " + Traffic.Speed(_rateProxyUp),
-                _fRate, Theme.Accent, new RectangleF(rx + 28, SummaryTop + 4, rw - 28, 16), Draw.Right);
+            if (!sparkRect.IsEmpty)
+            {
+                if (_state.ConfigOk)
+                {
+                    using (var bpen = new Pen(Color.FromArgb(Theme.Dark ? 55 : 65, Theme.Line), 1f))
+                        g.DrawLine(bpen, sparkRect.X, sparkRect.Bottom - 1.5f, sparkRect.Right, sparkRect.Bottom - 1.5f);
+                }
 
-            Draw.Text(g, "直连", _fTiny, Theme.Dim, new RectangleF(rx, SummaryTop + 25, 26, 15));
-            Draw.Text(g, _traffic == null || !_traffic.Ok ? "—" :
-                "↓ " + Traffic.Speed(_rateDirectDown) + "   ↑ " + Traffic.Speed(_rateDirectUp),
-                _fRate, Theme.Dim, new RectangleF(rx + 28, SummaryTop + 24, rw - 28, 16), Draw.Right);
+                var sparkAt = _sparkAt.ToArray();
+                bool hasDirectSpark = _sparkDirect.Count >= 2 && sparkAt.Length == _sparkDirect.Count;
+                bool hasProxySpark = _sparkProxy.Count >= 2 && sparkAt.Length == _sparkProxy.Count;
+                if (hasDirectSpark)
+                    Draw.Spark(g, _sparkDirect.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
+                        sparkRect, Theme.Dim, _sparkPulse);
+                if (hasProxySpark)
+                    Draw.Spark(g, _sparkProxy.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
+                        sparkRect, Theme.Accent, _sparkPulse);
 
-            var sparkRect = SparkRect;
-            var sparkAt = _sparkAt.ToArray();
-            if (_sparkProxy.Count >= 2 && sparkAt.Length == _sparkProxy.Count)
-                Draw.Spark(g, _sparkProxy.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
-                    sparkRect, Theme.Accent, _sparkPulse);
-            if (_sparkDirect.Count >= 2 && sparkAt.Length == _sparkDirect.Count)
-                Draw.Spark(g, _sparkDirect.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
-                    sparkRect, Theme.Dim, _sparkPulse);
-
-            if (_traffic != null && !_traffic.Ok)
-                Draw.Text(g, "流量读取中…", _fTiny, Theme.Dim, sparkRect, Draw.Right);
+                var tipAlign = dualColumn ? Draw.Right : Draw.Center;
+                if (!_state.ConfigOk)
+                    Draw.Text(g, dualColumn ? "内核未连接" : "等待连接", _fTiny, Theme.Dim, sparkRect, tipAlign);
+                else if (_traffic != null && !_traffic.Ok)
+                    Draw.Text(g, dualColumn ? "流量读取中…" : "等待曲线…", _fTiny, Theme.Dim, sparkRect, tipAlign);
+                else if (!hasProxySpark)
+                    Draw.Text(g, "采样中…", _fTiny, Theme.Dim, sparkRect, tipAlign);
+            }
         }
 
         void DrawSortButton(Graphics g)
@@ -1902,7 +4107,7 @@ namespace ProxyPicker.UI
                 g.DrawLine(pen, x, y + 4, x + 6, y + 4);
                 g.DrawLine(pen, x, y + 8, x + 3, y + 8);
             }
-            Draw.Text(g, label, _fTiny, c, new RectangleF(r.X + 22, r.Y, 34, r.Height));
+            Draw.Text(g, label, _fTiny, c, new RectangleF(r.X + 24, r.Y, r.Width - 28, r.Height));
         }
 
         void DrawChromeButton(Graphics g, RectangleF r, Btn btn, string text)
@@ -1945,6 +4150,27 @@ namespace ProxyPicker.UI
             }
         }
 
+        void DrawMax(Graphics g)
+        {
+            var r = MaxRect;
+            if (_hover == Btn.Max) Theme.Fill(g, Theme.Hover, r, 7f);
+            using (var pen = new Pen(_hover == Btn.Max ? Theme.Fg : Theme.Dim, 1.35f))
+            {
+                float cx = r.X + 13f, cy = r.Y + 13f;
+                if (WindowState == FormWindowState.Maximized)
+                {
+                    g.DrawRectangle(pen, cx - 3f, cy - 5f, 8f, 8f);
+                    using (var br = new SolidBrush(Theme.Card))
+                        g.FillRectangle(br, cx - 5f, cy - 3f, 8f, 8f);
+                    g.DrawRectangle(pen, cx - 5f, cy - 3f, 8f, 8f);
+                }
+                else
+                {
+                    g.DrawRectangle(pen, cx - 4.8f, cy - 4.8f, 9.6f, 9.6f);
+                }
+            }
+        }
+
         void DrawSaveButton(Graphics g)
         {
             bool saveHover = _hover == Btn.Save && !_busy;
@@ -1964,23 +4190,26 @@ namespace ProxyPicker.UI
 
         void DrawHelp(Graphics g)
         {
+            float lw = LogicalW, lh = LogicalH;
             using (var b = new SolidBrush(Color.FromArgb(150, 0, 0, 0)))
-                g.FillRectangle(b, 0, 0, WinW, WinH);
+                g.FillRectangle(b, 0, 0, lw, lh);
 
             var card = HelpCard;
             Draw.Shadow(g, card, 14f, 90);
             Theme.Fill(g, Theme.Card, card, 14f);
             Theme.Stroke(g, Theme.Line, card, 14f);
 
-            Draw.Text(g, "怎么用", _fHelpTitle, Theme.Fg, new RectangleF(44, 88, 200, 24));
-            Draw.Text(g, "一分钟看完，后面不用再查", _fSmall, Theme.Dim, new RectangleF(44, 112, 260, 16));
+            float helpTitleW = Math.Max(130f, card.Right - 170f - (card.X + 20f));
+            Draw.Text(g, LogicalW < 580f ? "ProxyPicker 说明与诊断" : "ProxyPicker 功能说明与环境诊断",
+                _fHelpTitle, Theme.Fg, new RectangleF(card.X + 20, card.Y + 14, helpTitleW, 24));
+            Draw.Text(g, LogicalW < 580f ? "四边拖拽调尺寸 · Ctrl+1/2/3 切页" : "窗口四边与四角可自由拖拽缩放 · 双击标题栏最大化",
+                _fSmall, Theme.Dim, new RectangleF(card.X + 20, card.Y + 38, helpTitleW, 16));
 
             var envInfo = Discovery.Detect();
             Draw.Text(g, envInfo.Ok ? envInfo.Client : "未检测到客户端", _fTiny, Theme.Dim,
-                new RectangleF(HelpCard.Right - 160, 92, 118, 16), Draw.Right);
+                new RectangleF(card.Right - 196, card.Y + 16, 154, 16), Draw.Right);
 
-            // 版本号：没接仓库就只显示号码；接了就变成可点的「检查更新」；
-            // 查到新版本则直接写成「v1.0.0 → v1.1.0 去下载」，点了打开网页，不自动替换。
+            // 版本号：没接仓库就只显示号码；接了就变成可点的「检查更新」
             bool uHover = _hover == Btn.HelpUpdate;
             string verText;
             Color verColor;
@@ -2009,52 +4238,52 @@ namespace ProxyPicker.UI
                 g.DrawLine(pen, cx + d, cy - d, cx - d, cy + d);
             }
 
-            string firstTitle = "开 = 走代理，关 = 直连";
-            string firstBody = "改完点「保存并生效」，只重连改到的软件。网速是每秒采样估值，短连接可能少算。";
+            string firstTitle = "第 1 页「软件分流」：开 = 走代理，关 = 直连";
+            string firstBody = "勾完软件点右下角「保存并生效」，只重连改到的软件；直接点击摘要卡片左下的「白名单 / 订阅兼容」胶囊可随手切模式。";
             if (_mismatch > 0)
             {
-                // 把「哪个软件、什么原因、下一步」直接摆在帮助面板第一屏，
-                // 不再让用户自己去猜「分流异常 1 个」是哪一个。
                 var lines = new List<string>();
                 foreach (var m in _mismatchItems.Take(3))
                     lines.Add(m.Exe + "：预期" + (m.Expected ? "代理" : "直连") + "，实际 "
                         + m.Proxy + " 代理 / " + m.Direct + " 直连。" + m.Reason + "；" + m.Action);
                 if (_mismatchItems.Count > 3)
-                    lines.Add("还有 " + (_mismatchItems.Count - 3) + " 个，回主界面点「分流异常」看完整清单。");
-                firstTitle = "分流异常 " + _mismatch + " 个（主界面可点开全部）";
+                    lines.Add("还有 " + (_mismatchItems.Count - 3) + " 个，回第 1 页点异常提示看完整清单。");
+                firstTitle = "分流异常 " + _mismatch + " 个（点摘要卡片橙字可看明细并自动修复）";
                 firstBody = string.Join("  ", lines.ToArray());
             }
 
             string[][] items =
             {
                 new[] { firstTitle, firstBody },
-                new[] { "四个标签只是在换视角", "常用只放高频和已选软件；找不到就切「全部」（标签上有总数）或在搜索框输名字。绿色版、MSIX、脚本类软件可能扫不到，托盘菜单「手动添加软件…」可手选 exe，加过一次会一直留着。" },
-                new[] { "顺序可以拖", "按住任意一行上下拖动即可排序；点标签右侧按钮，能切回「智能」按使用习惯自动排。" },
-                new[] { "右键有更多", "看完整路径、复制进程名；同名冲突和相关辅助进程会提示，也能一键一起勾上。" },
-                new[] { "换电脑直接用", "默认「代理白名单」：只有勾的走代理，其余直连；想按订阅分流点下面切「订阅兼容」。登录窗口（WebView2）已自动放行，避免 ChatGPT 登不上。每次启动自动查一次新版本，有新版会弹托盘通知；要关掉把 settings.json 的 loginWindowProxy / updateCheck 设为 false。" }
+                new[] { "第 2 页「节点策略」：并发测速与自动故障切换", "一键测试全部节点延迟，勾选备选池并启用「超时自动切换」；主节点异常时自动切换至低延迟备选节点并推送通知。" },
+                new[] { "第 3 页「链路体检」：零干扰独立旁路检测与全量节点评估", "通过独立本地旁路引擎检测真实出口 IP、风险评级、地区一致性及 Google / Gemini / OpenAI / Claude 连通性；评估过程不切换主节点、不断开正在进行的浏览或工作。" },
+                new[] { "跨主机便携与绿色软件识别", "无需依赖外部检测工具，开箱自动发现客户端内核与进程目录；支持从托盘菜单手动登记便携绿色版可执行文件。" },
+                new[] { "代理模式选择 & 登录窗口保护", "「白名单模式」仅让勾选软件走代理、其余全部直连；「订阅兼容」保留订阅分流并强制送选。WebView2 系统登录窗口已内置放行。" }
             };
 
-            float y = 142;
+            bool twoRowHelpFooter = LogicalW < 580f;
+            float footerLineY = card.Bottom - (twoRowHelpFooter ? 88f : 58f);
+            float y = card.Y + 60f;
+            float rowStep = Math.Min(68f, (footerLineY - 8f - y) / items.Length);
             for (int i = 0; i < items.Length; i++)
             {
-                var badge = new RectangleF(44, y + 1, 18, 18);
+                var badge = new RectangleF(card.X + 20, y + 1, 18, 18);
                 using (var b = new SolidBrush(Theme.AccentSoft)) g.FillEllipse(b, badge);
                 using (var font = Theme.Ui(10f, FontStyle.Bold))
                     Draw.Text(g, (i + 1).ToString(), font, Theme.Accent, badge, Draw.Center);
 
                 Draw.Text(g, items[i][0], _fTabActive, Theme.Fg,
-                    new RectangleF(72, y, card.Width - 60, 18));
+                    new RectangleF(card.X + 48, y, card.Width - 68, 18));
                 Draw.TextWrap(g, items[i][1], _fHelp, Theme.Dim,
-                    new RectangleF(72, y + 19, card.Width - 68, 56));
-                y += 76;
+                    new RectangleF(card.X + 48, y + 19, card.Width - 68, rowStep - 22f));
+                y += rowStep;
             }
 
-            // 底部四个按钮：诊断 / 恢复隐藏 / 分流模式 / IPv6 防泄漏。
-            // 后两个会改全局行为，开启时用强调色描边，跟一次性的动作区分开。
-            var line = new RectangleF(44, card.Bottom - 68, card.Width - 40, 1);
+            // 底部四个按钮：诊断 / 恢复隐藏 / 分流模式 / IPv6 防泄漏
+            var line = new RectangleF(card.X + 20, footerLineY, card.Width - 40, 1);
             using (var pen = new Pen(Theme.Line)) g.DrawLine(pen, line.X, line.Y, line.Right, line.Y);
 
-            using (var font = Theme.Ui(9.5f))
+            using (var font = Theme.Ui(10f))
             {
                 bool dh = _hover == Btn.HelpDiag;
                 Theme.Fill(g, dh ? Theme.BtnHover : Theme.Btn, HelpDiagRect, 8f);
@@ -2098,16 +4327,7 @@ namespace ProxyPicker.UI
 
         static string CleanEmoji(string s)
         {
-            if (string.IsNullOrEmpty(s)) return s ?? "";
-            var sb = new System.Text.StringBuilder(s.Length);
-            for (int i = 0; i < s.Length; i++)
-            {
-                char c = s[i];
-                if (char.IsHighSurrogate(c) && i + 1 < s.Length && char.IsLowSurrogate(s[i + 1])) { i++; continue; }
-                if (c == 0x200D || (c >= 0xFE00 && c <= 0xFE0F)) continue;
-                sb.Append(c);
-            }
-            return sb.ToString().Trim();
+            return Draw.CleanEmoji(s);
         }
 
         string TabText(int i)
@@ -2145,11 +4365,21 @@ namespace ProxyPicker.UI
                 return HelpCard.Contains(x, y) ? Btn.None : Btn.HelpClose;
             }
 
-            if (_mismatch > 0 && MismatchRect.Contains(x, y)) return Btn.Mismatch;
             if (CloseRect.Contains(x, y)) return Btn.Close;
+            if (MaxRect.Contains(x, y)) return Btn.Max;
             if (MinRect.Contains(x, y)) return Btn.Min;
             if (RefreshRect.Contains(x, y)) return Btn.Refresh;
             if (HelpRect.Contains(x, y)) return Btn.Help;
+
+            if (NavSegRect(0).Contains(x, y)) return Btn.Nav0;
+            if (NavSegRect(1).Contains(x, y)) return Btn.Nav1;
+            if (NavSegRect(2).Contains(x, y)) return Btn.Nav2;
+
+            if (_page != 0) return Btn.None;
+
+            if (!_modeChipRect.IsEmpty && _modeChipRect.Contains(x, y)) return Btn.ModeChip;
+            if (_mismatch > 0 && MismatchRect.Contains(x, y)) return Btn.Mismatch;
+            if (!_delayRect.IsEmpty && _delayRect.Contains(x, y)) return Btn.Delay;
             if (SaveRect.Contains(x, y)) return Btn.Save;
             if (DirectRect.Contains(x, y)) return Btn.Direct;
             if (SortRect.Contains(x, y)) return Btn.Sort;
@@ -2158,7 +4388,7 @@ namespace ProxyPicker.UI
 
         int HitTab(Point p)
         {
-            if (_help) return -1;
+            if (_help || _page != 0) return -1;
             float x = p.X / Theme.S, y = p.Y / Theme.S;
             for (int i = 0; i < 4; i++) if (TabRect(i).Contains(x, y)) return i;
             return -1;
@@ -2179,12 +4409,23 @@ namespace ProxyPicker.UI
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button != MouseButtons.Left) return;
             var b = HitButton(e.Location);
+            if (e.Button == MouseButtons.Right)
+            {
+                if (b == Btn.Delay) TestDelayPublic();
+                else if (b == Btn.ModeChip) ShowModePickerMenu();
+                return;
+            }
+            if (e.Button != MouseButtons.Left) return;
             if (b == Btn.Close) { Close(); return; }   // 走 OnFormClosing -> 还原配置 -> 真退出
+            if (b == Btn.Max) { ToggleMaximize(); return; }
             if (b == Btn.Min) { MinimizeToTray(); return; }
-            if (b == Btn.Refresh) { RefreshAsync(); return; }
+            if (b == Btn.Refresh) { if (_page == 1 || _page == 2) _ = LoadNodesCatalogAsync(); else RefreshAsync(); return; }
             if (b == Btn.Help) { OpenHelp(); return; }
+            if (b == Btn.Nav0) { SwitchPage(0); return; }
+            if (b == Btn.Nav1) { SwitchPage(1); return; }
+            if (b == Btn.Nav2) { SwitchPage(2); return; }
+            if (b == Btn.ModeChip) { ShowModePickerMenu(); return; }
             if (b == Btn.Save) { SaveAsync(); return; }
             if (b == Btn.Direct) { AllDirect(); return; }
             if (b == Btn.Sort) { CycleSortAsk(); return; }
@@ -2195,13 +4436,59 @@ namespace ProxyPicker.UI
             if (b == Btn.HelpIpv6) { ToggleIpv6Guard(); return; }
             if (b == Btn.HelpUpdate) { VersionClick(); return; }
             if (b == Btn.Mismatch) { ShowMismatchDialog(); return; }
+            if (b == Btn.Delay) { PushAndSwitchPage(1); return; }
 
             int tab = HitTab(e.Location);
             if (tab >= 0) { _tab = tab; Settings.Current.Tab = tab; Settings.Save(); RebuildVisible(true); return; }
-            if (!_help && e.Y / Theme.S < TitleH)
+            if (!_help && e.Y / Theme.S < TitleH && WindowState != FormWindowState.Maximized)
             {
                 ReleaseCapture(); SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(HTCAPTION), IntPtr.Zero);
             }
+        }
+
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            base.OnMouseDoubleClick(e);
+            if (e.Button != MouseButtons.Left || _help) return;
+            if (e.Y / Theme.S < TitleH && HitButton(e.Location) == Btn.None)
+                ToggleMaximize();
+        }
+
+        /// <summary>在摘要卡片点击左下角模式胶囊时直接弹出「白名单 / 订阅兼容」模式菜单。</summary>
+        void ShowModePickerMenu()
+        {
+            if (!UiAlive || _busy || _modeChipRect.IsEmpty) return;
+            var menu = new ContextMenuStrip { ShowImageMargin = false };
+            menu.Closed += (s, e) =>
+            {
+                var c = (ContextMenuStrip)s;
+                if (!UiAlive) return;
+                BeginInvoke(new Action(() => { if (!c.IsDisposed) c.Dispose(); }));
+            };
+
+            bool isPatch = Settings.PatchOnly;
+            var whiteItem = new ToolStripMenuItem((isPatch ? "   " : "✓ ") + "代理白名单模式（只有勾选软件走代理，其余直连）");
+            whiteItem.Click += (s, e) => ApplyModeSelection(false);
+            menu.Items.Add(whiteItem);
+
+            var patchItem = new ToolStripMenuItem((isPatch ? "✓ " : "   ") + "订阅兼容模式（保留原订阅规则，仅强送勾选软件）");
+            patchItem.Click += (s, e) => ApplyModeSelection(true);
+            menu.Items.Add(patchItem);
+
+            menu.Show(this, new Point(Theme.Px(_modeChipRect.X), Theme.Px(_modeChipRect.Bottom + 4)));
+        }
+
+        void ApplyModeSelection(bool patchOnly)
+        {
+            if (!UiAlive || _busy || Settings.PatchOnly == patchOnly) return;
+            Settings.SetMode(patchOnly ? Settings.ModePatch : Settings.ModeWhitelist);
+            _state.Applied = false;
+            _modeChanged = true;
+            SetStatus("分流模式已切到「" + (patchOnly ? "订阅兼容" : "代理白名单") + "」，点右下角「保存并生效」应用", Theme.Warn);
+            Toast(patchOnly ? "已切到「订阅兼容」" : "已切到「代理白名单」",
+                patchOnly ? "未勾软件保留订阅规则 · 记得点保存" : "未勾软件全部直连 · 记得点保存",
+                patchOnly ? Theme.Warn : Theme.Accent, 2);
+            Invalidate();
         }
 
         /// <summary>
@@ -2228,29 +4515,190 @@ namespace ProxyPicker.UI
                     + "   实测：" + m.Proxy + " 条代理 / " + m.Direct + " 条直连"
                     + (string.IsNullOrEmpty(m.Node) ? "" : "   节点：" + m.Node));
                 sb.AppendLine("   原因：" + m.Reason);
-                sb.AppendLine("   下一步：" + m.Action);
+                sb.AppendLine("   原因排查：" + m.Action);
                 sb.AppendLine();
             }
-            sb.AppendLine("统计只算本次规则生效后新建的连接；之前建立的长连接已排除，");
-            sb.AppendLine("程序自动放行的辅助进程已按「走代理」计入预期，不会再误报。");
-            sb.AppendLine("按 Ctrl+C 可复制这份清单；帮助面板的「复制诊断」还带内核状态。");
-            MessageBox.Show(this, sb.ToString(), "分流异常明细（" + _mismatchItems.Count + " 个）",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            sb.AppendLine("统计只算规则生效后新建的连接；辅助进程已按走代理计入预期。");
+            sb.AppendLine("按 Ctrl+C 可复制以上清单。");
+            sb.AppendLine();
+            sb.AppendLine("点击「是(Y)」立即自动修复：修正规则模式/进程识别、重推名单规则，并精确断开上述错路连接以立即重新分流；");
+            sb.AppendLine("点击「否(N)」仅关闭窗口。");
+            var choice = MessageBox.Show(this, sb.ToString(),
+                "发现 " + _mismatchItems.Count + " 个分流异常 — 是否立即自动修复？",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (choice == DialogResult.Yes)
+                _ = RepairMismatchAsync(false);
+        }
+
+        /// <summary>托盘菜单也可直接触发「一键修复分流异常」。</summary>
+        public void RepairMismatchPublic()
+        {
+            if (!UiAlive) return;
+            if (InvokeRequired) { try { BeginInvoke(new Action(RepairMismatchPublic)); } catch { } return; }
+            _ = RepairMismatchAsync(false);
+        }
+
+        async Task RepairMismatchAsync(bool auto = false)
+        {
+            bool ownsBusy = false;
+            try
+            {
+                if (!UiAlive || _busy || _shuttingDown) return;
+                if (auto && (Settings.RepairSuspended || _modeChanged || !Profile.HasSavedIntent)) return;
+                if (!auto) _autoMismatchCount = 0;
+
+                ownsBusy = true;
+                int fixRevision = _revision;
+                BeginBusy();
+                _lastRepairAt = DateTime.UtcNow;
+                _lastAutoMismatchAt = DateTime.UtcNow;
+                SetStatus(auto
+                    ? "正在自动修复分流异常（校对内核设置、重推规则并断开错路连接）…"
+                    : "正在修复分流异常（校对内核设置、重推规则并断开错路连接）…", Theme.Dim);
+
+                var mismatchSnapshot = new List<Traffic.MismatchItem>(_mismatchItems ?? new List<Traffic.MismatchItem>());
+                bool hadRowsLoaded = _all.Count > 0;
+                List<string> proxy;
+                if (hadRowsLoaded)
+                {
+                    proxy = _all.Where(r => r.Proxy).Select(r => r.Exe).ToList();
+                }
+                else
+                {
+                    // --tray 后台启动还没打开面板时，_all 尚为空：不能拿空列表覆盖磁盘已有白名单。
+                    var diskItems = Profile.Load();
+                    if (Profile.LastLoadFailed)
+                    {
+                        SetStatus("读取已保存名单失败，已中止修复以免覆盖名单：" + Profile.LastLoadError, Theme.Warn);
+                        if (!auto) Toast("未能自动修复", Profile.LastLoadError, Theme.Warn, 2);
+                        return;
+                    }
+                    proxy = diskItems.Where(i => !i.IsPathRule).Select(i => i.Exe).ToList();
+                }
+                var visible = VisibleExes();
+                var paths = PathMap();
+                var policies = PolicyMapFromRows();
+                List<Profile.Item> builtItems = null;
+
+                var outcome = await Task.Run(() => Profile.WithApplyLock(() =>
+                {
+                    string cfg = Paths.ClashYaml;
+                    bool configPatched = false;
+                    string configErr = "";
+                    bool configOk = Profile.PatchKernelConfigsForRules(cfg, out configPatched, out configErr);
+
+                    builtItems = ComposeWithHelpers(proxy, visible, paths, policies);
+                    // 主动修复链路：
+                    // 1) autoRecover=false，免受未首次保存或暂停标记阻挡；
+                    // 2) forceRuleMode=true，防止 PUT /configs 全文用磁盘里的 global/direct 盖掉前面刚修好的 mode=rule。
+                    var applyRes = Profile.Apply(builtItems, false, cfg, -1, null, true);
+
+                    int scanned = 0;
+                    var wrongSnap = Profile.CaptureWrongRouteConnections(mismatchSnapshot, out scanned, cfg);
+                    Profile.ReconnectOutcome closeOutcome = null;
+                    if (wrongSnap.Error == null && wrongSnap.Ids.Count > 0)
+                        closeOutcome = Profile.CloseCapturedConnections(wrongSnap, cfg);
+
+                    var stateAfter = Profile.ReadKernelState(cfg);
+                    return new
+                    {
+                        ConfigOk = configOk,
+                        ConfigPatched = configPatched,
+                        ConfigErr = configErr,
+                        Apply = applyRes,
+                        WrongSnap = wrongSnap,
+                        Closed = closeOutcome,
+                        State = stateAfter
+                    };
+                }));
+
+                if (!UiAlive || fixRevision != _revision) return;
+
+                if (outcome.State != null) _state = outcome.State;
+                if (outcome.Apply != null && outcome.Apply.Ok)
+                {
+                    Settings.ResumeRepair();
+                    SetEffectiveProxy(builtItems);
+                    if (hadRowsLoaded)
+                    {
+                        _savedProxy = new HashSet<string>(proxy, StringComparer.OrdinalIgnoreCase);
+                        _list.SavedProxy = _savedProxy;
+                    }
+                }
+
+                if (outcome.ConfigOk && outcome.Apply != null && outcome.Apply.Ok)
+                {
+                    // 修复真正通过后才重设流量基线并清空旧异常标记，下一秒重新采样验证
+                    Traffic.NotePush();
+                    _mismatch = 0;
+                    _mismatchItems = new List<Traffic.MismatchItem>();
+                    _mismatchStreak = 0;
+                    _repairFails = 0;
+                    _repairNoProgress = 0;
+                }
+
+                int closed = outcome.Closed != null ? outcome.Closed.Closed : 0;
+                int failedClose = outcome.Closed != null ? outcome.Closed.Failed : 0;
+                bool hasBlockedOut = proxy.Count > 0 && (string.IsNullOrEmpty(_state.Outbound) || Profile.IsBlockedPolicy(_state.Outbound));
+
+                AuditLog.Record(auto ? "AUTOFIX" : "FIX",
+                    "异常修复：configPatched=" + outcome.ConfigPatched +
+                    " applyOk=" + (outcome.Apply != null && outcome.Apply.Ok) +
+                    " wrongClosed=" + closed + " wrongFailed=" + failedClose +
+                    " outbound=" + _state.Outbound);
+
+                if (!outcome.ConfigOk)
+                {
+                    SetStatus("修复部分失败：" + outcome.ConfigErr, Theme.Warn);
+                    Toast("未能自动修复内核设置", outcome.ConfigErr, Theme.Warn, 2);
+                }
+                else if (outcome.Apply != null && !outcome.Apply.Ok)
+                {
+                    SetStatus("规则补回未通过：" + outcome.Apply.Message, Theme.Warn);
+                    Toast("规则补回未确认", outcome.Apply.Message, Theme.Warn, 2);
+                }
+                else if (hasBlockedOut)
+                {
+                    // 节点指向 DIRECT/REJECT 只能用户在 Clash 客户端手动换节点，停止自动重复重试以免扰民。
+                    _autoMismatchCount = 3;
+                    string warn = "规则和连接已刷新，但策略组「" + _state.Policy + "」当前指向 " +
+                                  (string.IsNullOrEmpty(_state.Outbound) ? "未找到" : _state.Outbound) +
+                                  "，请在 Clash 客户端切换到一个可用代理节点";
+                    SetStatus(warn, Theme.Warn);
+                    Toast("规则已修好，但当前未选可用节点", warn, Theme.Warn, 2);
+                }
+                else
+                {
+                    var actions = new List<string>();
+                    if (outcome.ConfigPatched) actions.Add("已切回规则模式/进程识别");
+                    actions.Add("已重推 " + (builtItems == null ? 0 : builtItems.Count) + " 条规则");
+                    if (closed > 0) actions.Add("已断开 " + closed + " 条错路连接");
+                    if (failedClose > 0) actions.Add(failedClose + " 条连接断开失败");
+                    string summary = string.Join(" · ", actions.ToArray());
+                    SetStatus("已自动修复分流异常：" + summary, Theme.Ok);
+                    if (!auto)
+                        Toast("分流异常已修复", summary + "；请重新发起一次请求验证", Theme.Ok, 2);
+                    else if (_autoMismatchCount <= 1)
+                        Toast("已自动修复分流异常", summary, Theme.Ok, 1);
+                }
+                UpdateLogContext();
+                PollTraffic();
+            }
+            catch (Exception ex) { ReportFailure("自动修复分流异常", ex); }
+            finally { if (ownsBusy) FinishBusy(); }
         }
 
         void OpenHelp()
         {
             _help = true;
-            _list.Visible = false;
-            _search.Visible = false;
+            ApplyPageVisibility();
             Invalidate();
         }
 
         void CloseHelp()
         {
             _help = false;
-            _list.Visible = true;
-            _search.Visible = true;
+            ApplyPageVisibility();
             // 面板里切过模式就补一句话：切换只改了偏好，真正生效还差一次保存
             if (_modeChanged)
             {
@@ -2290,20 +4738,23 @@ namespace ProxyPicker.UI
         /// </summary>
         void ToggleIpv6Guard()
         {
-            if (!UiAlive || _busy) return;
+            if (!UiAlive || _busy || _ipv6Busy) return;
+            _ipv6Busy = true;
             bool on = !Settings.Ipv6GuardOn;
             SetStatus(on ? "正在开启 IPv6 防泄漏…" : "正在关闭 IPv6 防泄漏…", Theme.Warn);
             Task.Run(() => Settings.SetIpv6Guard(on)).ContinueWith(t =>
             {
+                var ex = t.IsFaulted ? t.Exception : null;   // 始终先消费异步异常防止销毁后泄漏
                 if (!UiAlive) return;
                 // 失败不能只吞掉异常还显示「已开启」（评审 R5-4）。
-                if (t.IsFaulted)
+                if (ex != null)
                 {
-                    string msg = t.Exception == null ? "未知错误" : t.Exception.GetBaseException().Message;
+                    string msg = ex.GetBaseException().Message;
                     try
                     {
                         BeginInvoke(new Action(() =>
                         {
+                            _ipv6Busy = false;
                             Toast("IPv6 设置没保存成功", msg, Theme.Warn, 2);
                             SetStatus("IPv6 防泄漏开关未生效：" + msg, Theme.Warn);
                         }));
@@ -2315,6 +4766,7 @@ namespace ProxyPicker.UI
                 {
                     BeginInvoke(new Action(() =>
                     {
+                        _ipv6Busy = false;
                         Toast(on ? "已开启 IPv6 防泄漏" : "已关闭 IPv6 防泄漏",
                             on ? "保存时会写入 ipv6: false；Clash Verge 可能覆盖它，要彻底关闭请在客户端设置里改"
                                : "程序不再改动 IPv6，下次保存即恢复无干预状态",
@@ -2522,15 +4974,23 @@ namespace ProxyPicker.UI
             if (intentCleared)
             {
                 _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                // 独立审阅第二轮：派生名单也要一起清。以前还原后 _effectiveProxy 还留着
+                // 独立审阅第二轮：派生名单（含目录正则）也要一起清。以前还原后还留着
                 // 上一次接管的「预期代理名单」，流量采样会拿旧预期去比新直连，误报分流异常。
-                _effectiveProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                SetEffectiveProxy(null);
                 _list.SavedProxy = _savedProxy;
                 foreach (var r in _all) { r.Proxy = false; r.Known = false; }
                 _modeChanged = false;
+                _mismatch = 0;
+                _mismatchItems = new List<Traffic.MismatchItem>();
+                _mismatchStreak = 0;
+                _autoMismatchCount = 0;
+                _lastAutoMismatchAt = DateTime.MinValue;
             }
             _state.Applied = false;
             _autoRepaired = false;
+            ResetDelayBannerState();
+            _catalogSeq++;
+            if (_busy) { _pendingRefresh = true; return; }
             RebuildVisible(true);
             RefreshAsync();
         }
@@ -2577,14 +5037,15 @@ namespace ProxyPicker.UI
             Traffic.Sample snap = _traffic;
             Task.Run(() => DiagnosticsText(snap)).ContinueWith(t =>
             {
+                var taskEx = t.IsFaulted ? t.Exception : null;   // 防止窗体销毁后漏掉 Task 异常
                 if (!UiAlive) return;
                 try
                 {
                     BeginInvoke(new Action(() =>
                     {
-                        if (t.IsFaulted)
+                        if (taskEx != null)
                         {
-                            string msg = t.Exception == null ? "未知错误" : t.Exception.GetBaseException().Message;
+                            string msg = taskEx.GetBaseException().Message;
                             Toast("复制失败", msg, Theme.Warn, 1);
                             return;
                         }
@@ -2608,7 +5069,20 @@ namespace ProxyPicker.UI
             Toast("已恢复隐藏项", "被隐藏的软件回到列表了", Theme.Ok, 0);
         }
 
-        protected override void OnResize(EventArgs e) { base.OnResize(e); LayoutChildren(); }
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            LayoutChildren();
+            Invalidate();
+        }
+
+        protected override void OnResizeEnd(EventArgs e)
+        {
+            base.OnResizeEnd(e);
+            if (_restoringSize || WindowState != FormWindowState.Normal) return;
+            if (ClientSize.Width > 0 && ClientSize.Height > 0)
+                Settings.SetWindowSize((int)Math.Round(LogicalW), (int)Math.Round(LogicalH));
+        }
 
         protected override void Dispose(bool disposing)
         {
@@ -2634,6 +5108,44 @@ namespace ProxyPicker.UI
                 if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.F1) { CloseHelp(); e.SuppressKeyPress = true; }
                 return;
             }
+            if (e.Control && e.KeyCode == Keys.W)
+            { MinimizeToTray(); e.SuppressKeyPress = true; return; }
+            if (e.Control && (e.KeyCode == Keys.D1 || e.KeyCode == Keys.NumPad1))
+            { SwitchPage(0); e.SuppressKeyPress = true; return; }
+            if (e.Control && (e.KeyCode == Keys.D2 || e.KeyCode == Keys.NumPad2))
+            { SwitchPage(1); e.SuppressKeyPress = true; return; }
+            if (e.Control && (e.KeyCode == Keys.D3 || e.KeyCode == Keys.NumPad3))
+            { SwitchPage(2); e.SuppressKeyPress = true; return; }
+
+            if (_page == 1)
+            {
+                if (e.Control && e.KeyCode == Keys.F) { _nodesPage.FocusSearch(); e.SuppressKeyPress = true; return; }
+                if (e.KeyCode == Keys.F1) { OpenHelp(); e.SuppressKeyPress = true; return; }
+                if (e.KeyCode == Keys.Escape)
+                {
+                    if (_nodesPage.SearchFocused) return;
+                    if (_pageHistory.Count > 0) NavigateBack();
+                    else SwitchPage(0, true);
+                    e.SuppressKeyPress = true;
+                    return;
+                }
+                return;
+            }
+            if (_page == 2)
+            {
+                if (e.KeyCode == Keys.F1) { OpenHelp(); e.SuppressKeyPress = true; return; }
+                if (e.KeyCode == Keys.Escape)
+                {
+                    if (!_qualityPage.GoBack())
+                    {
+                        if (_pageHistory.Count > 0) NavigateBack();
+                        else SwitchPage(0, true);
+                    }
+                    e.SuppressKeyPress = true;
+                    return;
+                }
+                return;
+            }
 
             // 搜索框聚焦时，全局快捷键不能吞掉输入：空格也要能打进 "Visual Studio"，
             // 更不能按一下就切换列表里选中行的勾选（评审 R3-4）。
@@ -2648,7 +5160,7 @@ namespace ProxyPicker.UI
             if (e.KeyCode == Keys.Escape)
             {
                 if (!string.IsNullOrEmpty(_search.Text)) { _search.Text = ""; e.SuppressKeyPress = true; return; }
-                HideToTray(); return;
+                return;
             }
             if (e.KeyCode == Keys.F1) { OpenHelp(); e.SuppressKeyPress = true; return; }
             if (e.KeyCode == Keys.Down) { _list.MoveSelection(1); e.SuppressKeyPress = true; return; }

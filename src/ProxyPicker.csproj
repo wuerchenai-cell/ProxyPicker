@@ -12,13 +12,16 @@
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=ProxyPicker</PathMap>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <Product>ProxyPicker</Product>
     <AssemblyTitle>ProxyPicker</AssemblyTitle>
     <Company>ProxyPicker</Company>
-    <Version>1.3.8</Version>
+    <Version>2.2.3</Version>
+    <FileVersion>2.2.3.0</FileVersion>
+    <AssemblyVersion>2.2.3.0</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>

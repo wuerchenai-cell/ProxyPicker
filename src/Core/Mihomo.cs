@@ -51,6 +51,8 @@ namespace ProxyPicker.Core
         /// 以前没有任何同步，可能出现互相清掉绑定或拼出空密钥（独立审阅第二轮）。
         /// 所有请求与绑定变更都走同一把锁；Monitor 可重入，嵌套调用不会自锁。</summary>
         static readonly object ChannelGate = new object();
+        static int _forgetEpoch;
+        static int _appliedForgetEpoch;
 
         public static string LastPipeName { get { lock (ChannelGate) { return _pipeName; } } }
         public static string LastEndpoint { get { lock (ChannelGate) { return _endpoint; } } }
@@ -198,6 +200,26 @@ namespace ProxyPicker.Core
             return hits;
         }
 
+        /// <summary>过滤掉 Windows 特权 Helper 服务 RPC 管道与 FlClash 原生 JSON-RPC 管道，仅保留 Clash/Mihomo HTTP 控制管道。</summary>
+        internal static bool IsRestControlPipeName(string pipeName)
+        {
+            if (string.IsNullOrWhiteSpace(pipeName)) return false;
+            string n = pipeName.Trim().ToLowerInvariant();
+            if (n.IndexOf("service", StringComparison.Ordinal) >= 0 ||
+                n.IndexOf("helper", StringComparison.Ordinal) >= 0 ||
+                n.IndexOf("daemon", StringComparison.Ordinal) >= 0)
+                return false;
+            // FlClash Windows 命名管道仅用于 Flutter <-> FlClashCore 的 JSON-RPC，不走 Clash REST HTTP 协议
+            if (n.IndexOf("flclash", StringComparison.Ordinal) >= 0)
+                return false;
+            return n.IndexOf("mihomo", StringComparison.Ordinal) >= 0 ||
+                   n.IndexOf("clash", StringComparison.Ordinal) >= 0 ||
+                   n.IndexOf("verge", StringComparison.Ordinal) >= 0 ||
+                   n.IndexOf("nyanpasu", StringComparison.Ordinal) >= 0 ||
+                   n.IndexOf("sparkle", StringComparison.Ordinal) >= 0 ||
+                   n.IndexOf("party", StringComparison.Ordinal) >= 0;
+        }
+
         /// <summary>找到 mihomo 的控制管道（优先 production）。</summary>
         public static string FindPipe()
         {
@@ -205,35 +227,37 @@ namespace ProxyPicker.Core
         }
 
         /// <summary>
-        /// v1.3.7：管道名不再只看「有几个」，还要看「像不像本次选中的那个客户端」。
-        /// Clash Verge Rev 的管道叫 verge-mihomo-*，别的客户端不会用这个前缀；
-        /// 两个客户端同时装、同时开时，以前只要恰好有一个 production 就直接选它，
-        /// 于是可能把 B 的配置推给 A 的内核。现在先按客户端收窄候选；
-        /// 收窄后一个都不剩时保持原候选（宁可退回旧行为，也不能让单客户端用户存不了盘）。
+        /// v2.2.2：先过滤掉特权服务/前端 RPC 管道，再枚举全部合法 REST 控制管道，
+        /// 避免因为机器上有 verge-mihomo-* / mihomo-* 残留就短路漏掉 nyanpasu-mihomo。
+        /// 客户端过滤严格按白名单放行、默认拒绝。
         /// </summary>
         public static string FindPipe(string clientHint)
         {
             var all = EnumNamedPipes();
-            var hits = all
-                .Where(n => n.StartsWith("verge-mihomo-", StringComparison.OrdinalIgnoreCase) ||
-                            n.StartsWith("mihomo-", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            if (hits.Count == 0)
-            {
-                hits = all
-                    .Where(n => n.IndexOf("mihomo", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                n.IndexOf("clash", StringComparison.OrdinalIgnoreCase) >= 0)
-                    .ToList();
-            }
+            var restPipes = all.Where(IsRestControlPipeName).ToList();
             _pipeAmbiguous = null;
-            if (hits.Count == 0) return null;
+            if (restPipes.Count == 0) return null;
 
-            if (!string.IsNullOrEmpty(clientHint) && hits.Count > 1)
+            List<string> hits;
+            if (!string.IsNullOrEmpty(clientHint))
             {
-                var prefer = hits.Where(n => PipeMatchesClient(n, clientHint)).ToList();
-                if (prefer.Count > 0 && prefer.Count < hits.Count) hits = prefer;
+                hits = restPipes.Where(n => PipeMatchesClient(n, clientHint)).ToList();
             }
+            else
+            {
+                hits = restPipes
+                    .Where(n => n.StartsWith("verge-mihomo-", StringComparison.OrdinalIgnoreCase) ||
+                                n.StartsWith("mihomo-", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (hits.Count == 0)
+                {
+                    hits = restPipes
+                        .Where(n => n.IndexOf("mihomo", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                    n.IndexOf("clash", StringComparison.OrdinalIgnoreCase) >= 0)
+                        .ToList();
+                }
+            }
+            if (hits.Count == 0) return null;
 
             // 同时存在多个内核控制管道时，无法确认「配置 / Secret / 管道」属于同一个客户端实例。
             // 宁可失败关闭，也不能拿 A 的密钥推给 B（评审 R6-2 的保守落地）。
@@ -247,13 +271,33 @@ namespace ProxyPicker.Core
             return hits[0];
         }
 
-        /// <summary>Verge 的管道只可能属于 Verge；反过来别的客户端不会用 verge- 前缀。</summary>
-        static bool PipeMatchesClient(string pipe, string clientHint)
+        /// <summary>管道名与选中客户端家族的一致性核对（默认拒绝未明确匹配的管道）。</summary>
+        internal static bool PipeMatchesClient(string pipe, string clientHint)
         {
-            bool vergePipe = pipe.StartsWith("verge-", StringComparison.OrdinalIgnoreCase);
-            bool vergeClient = (clientHint ?? "").IndexOf("Verge", StringComparison.OrdinalIgnoreCase) >= 0;
-            if (vergePipe) return vergeClient;
-            return true;
+            if (!IsRestControlPipeName(pipe)) return false;
+            if (string.IsNullOrEmpty(clientHint)) return true;
+
+            string p = pipe.ToLowerInvariant();
+            string c = clientHint.ToLowerInvariant();
+            // FlClash 默认不提供 Mihomo REST 命名管道，统一走本地 HTTP 控制接口
+            if (c.IndexOf("flclash", StringComparison.Ordinal) >= 0) return false;
+
+            if (c.IndexOf("verge", StringComparison.Ordinal) >= 0)
+                return p.StartsWith("verge-mihomo", StringComparison.Ordinal);
+            if (c.IndexOf("nyanpasu", StringComparison.Ordinal) >= 0)
+                return p.IndexOf("nyanpasu", StringComparison.Ordinal) >= 0;
+            if (c.IndexOf("sparkle", StringComparison.Ordinal) >= 0)
+                return p.IndexOf("sparkle", StringComparison.Ordinal) >= 0 ||
+                       p == "mihomo" || p.StartsWith("mihomo-", StringComparison.Ordinal);
+            if (c.IndexOf("party", StringComparison.Ordinal) >= 0)
+                return p.IndexOf("party", StringComparison.Ordinal) >= 0 ||
+                       p == "mihomo" || p.StartsWith("mihomo-", StringComparison.Ordinal);
+            if (c.IndexOf("for windows", StringComparison.Ordinal) >= 0)
+                return p == "clash" || p.StartsWith("clash-", StringComparison.Ordinal);
+            if (c.IndexOf("自定义", StringComparison.Ordinal) >= 0 || c.IndexOf("内核", StringComparison.Ordinal) >= 0)
+                return p == "mihomo" || p.StartsWith("mihomo-", StringComparison.Ordinal) ||
+                       p == "clash" || p.StartsWith("clash-", StringComparison.Ordinal);
+            return false;
         }
 
         public static string ReadSecret(string knownConfigPath = null)
@@ -352,24 +396,42 @@ namespace ProxyPicker.Core
             lock (ChannelGate) { return RequestCore(method, path, body, timeoutMs, knownConfigPath); }
         }
 
+        static void SyncForgetEpochUnlocked()
+        {
+            int cur = System.Threading.Volatile.Read(ref _forgetEpoch);
+            if (_appliedForgetEpoch != cur)
+            {
+                ClearChannelFieldsUnlocked();
+                _appliedForgetEpoch = cur;
+            }
+        }
+
         static ApiResult RequestCore(string method, string path, string body, int timeoutMs,
                                      string knownConfigPath)
         {
-            EnsureBoundToCurrentConfig(knownConfigPath);
-            var sw = Stopwatch.StartNew();
-            var viaPipe = TryPipe(method, path, body, timeoutMs, sw, knownConfigPath);
-            if (viaPipe != null) { HandleAuthFailure(viaPipe); return viaPipe; }
-
-            var viaHttp = TryHttp(method, path, body, timeoutMs, sw, knownConfigPath);
-            if (viaHttp != null) { HandleAuthFailure(viaHttp); return viaHttp; }
-
-            return new ApiResult
+            SyncForgetEpochUnlocked();
+            try
             {
-                Error = !string.IsNullOrEmpty(_pipeAmbiguous) ? _pipeAmbiguous :
-                        !string.IsNullOrEmpty(_securityError) ? _securityError
-                    : "找不到 mihomo 控制接口（Clash / mihomo 没启动？）",
-                Ms = sw.ElapsedMilliseconds
-            };
+                EnsureBoundToCurrentConfig(knownConfigPath);
+                var sw = Stopwatch.StartNew();
+                var viaPipe = TryPipe(method, path, body, timeoutMs, sw, knownConfigPath);
+                if (viaPipe != null) { HandleAuthFailure(viaPipe); return viaPipe; }
+
+                var viaHttp = TryHttp(method, path, body, timeoutMs, sw, knownConfigPath);
+                if (viaHttp != null) { HandleAuthFailure(viaHttp); return viaHttp; }
+
+                return new ApiResult
+                {
+                    Error = !string.IsNullOrEmpty(_pipeAmbiguous) ? _pipeAmbiguous :
+                            !string.IsNullOrEmpty(_securityError) ? _securityError
+                        : "找不到 mihomo 控制接口（Clash / mihomo 没启动？）",
+                    Ms = sw.ElapsedMilliseconds
+                };
+            }
+            finally
+            {
+                SyncForgetEpochUnlocked();
+            }
         }
 
         /// <summary>客户端重启换过 Secret / 控制面时，401/403 后重新读取，不必重启本程序（评审 R3-9）。</summary>
@@ -399,25 +461,25 @@ namespace ProxyPicker.Core
                     try { trustError = ValidatePipeServer(pipe.ServerProcessId); }
                     catch (Exception ex)
                     {
-                        // 身份校验抛异常同样失败关闭，不静默回退到 HTTP（评审 R5-1）。
-                        _securityError = "管道身份校验异常：" + ex.Message;
-                        r.Error = "已阻止向命名管道发送控制密钥：身份校验异常";
-                        r.Ms = sw.ElapsedMilliseconds;
-                        return r;
+                        // 此时 sent == false（密钥尚未发出）：清空不可信管道缓存，保留安全错误并允许继续尝试已核实的 HTTP 回环端口
+                        _pipeName = null;
+                        _securityError = "已阻止向命名管道发送控制密钥：身份校验异常（" + ex.Message + "）";
+                        return null;
                     }
                     if (trustError != null)
                     {
-                        _securityError = trustError;
-                        r.Error = "已阻止向命名管道发送控制密钥：" + trustError;
-                        r.Ms = sw.ElapsedMilliseconds;
-                        return r;
+                        // 同样尚未写出密钥：不卡死本地 HTTP 控制端口回退；若 HTTP 也不可用，RequestCore 会把 _securityError 暴露出来
+                        _pipeName = null;
+                        _securityError = "已阻止向命名管道发送控制密钥：" + trustError;
+                        return null;
                     }
 
                     byte[] payload = Encoding.UTF8.GetBytes(body ?? "");
+                    string sec = CleanHeaderSecret(_secret);
                     string head =
                         method + " " + path + " HTTP/1.0\r\n" +
                         "Host: localhost\r\n" +
-                        "Authorization: Bearer " + _secret + "\r\n" +
+                        (!string.IsNullOrEmpty(sec) ? "Authorization: Bearer " + sec + "\r\n" : "") +
                         "Content-Type: application/json\r\n" +
                         "Content-Length: " + payload.Length + "\r\n\r\n";
                     byte[] hb = Encoding.ASCII.GetBytes(head);
@@ -624,10 +686,42 @@ namespace ProxyPicker.Core
             return result;
         }
 
-        static bool IsKernelExecutable(string fullPathOrName)
+        internal static bool IsKernelExecutable(string fullPathOrName)
         {
-            string name = Path.GetFileName(fullPathOrName ?? "").ToLowerInvariant();
-            return name.Contains("mihomo") || name.Contains("clash") || name.Contains("verge");
+            return ProbeSidecar.IsLikelyKernelExe(fullPathOrName);
+        }
+
+        /// <summary>判断监听控制端口的内核进程名是否明确归属于当前选中的客户端（仅允许已登记的纯净内核程序名）。</summary>
+        internal static bool KernelProcessMatchesClient(string processName, string clientHint)
+        {
+            string raw = (processName ?? "").Trim();
+            if (raw.Length == 0) return false;
+            string exeName = Path.GetFileName(raw);
+            if (!exeName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) exeName += ".exe";
+            if (!IsKernelExecutable(exeName)) return false;
+
+            string p = Path.GetFileNameWithoutExtension(exeName).ToLowerInvariant();
+            string c = (clientHint ?? "").ToLowerInvariant();
+            if (p.Length == 0 || c.Length == 0) return false;
+            if (c.IndexOf("flclash", StringComparison.Ordinal) >= 0)
+                return p == "flclashcore";
+            if (c.IndexOf("verge", StringComparison.Ordinal) >= 0)
+                return p == "verge-mihomo" || p == "verge-mihomo-alpha";
+            if (c.IndexOf("nyanpasu", StringComparison.Ordinal) >= 0)
+                return p == "nyanpasu-mihomo" || p == "nyanpasu-mihomo-alpha" ||
+                       p == "clash" || p == "clash-meta";
+            if (c.IndexOf("sparkle", StringComparison.Ordinal) >= 0)
+                return p == "sparkle-mihomo" || p == "mihomo" || p == "mihomo-alpha" ||
+                       p.StartsWith("mihomo-windows-", StringComparison.Ordinal);
+            if (c.IndexOf("party", StringComparison.Ordinal) >= 0)
+                return p == "party-mihomo" || p == "mihomo" || p == "mihomo-alpha" ||
+                       p.StartsWith("mihomo-windows-", StringComparison.Ordinal);
+            if (c.IndexOf("for windows", StringComparison.Ordinal) >= 0)
+                return p == "clash-win64" || p == "clash-win32" || p == "clash-win" ||
+                       p == "clash" || p == "clash-meta";
+            return p == "mihomo" || p == "mihomo-alpha" || p == "clash" || p == "clash-meta" ||
+                   p == "mihomo-core" || p == "clash-core" || p == "clash.meta" ||
+                   p.StartsWith("mihomo-windows-", StringComparison.Ordinal);
         }
 
         /// <summary>读进程令牌的用户 SID；读不到返回 null（提权服务属正常情况）。</summary>
@@ -741,9 +835,12 @@ namespace ProxyPicker.Core
             // 多实例时连 HTTP 回退也不能发密钥，避免把 A 的 Secret 送到 B（评审 R6-2）。
             if (!string.IsNullOrEmpty(_pipeAmbiguous))
                 return new ApiResult { Error = _pipeAmbiguous, Ms = sw.ElapsedMilliseconds };
+            string priorSecErr = _securityError;
             string ep = Endpoint(knownConfigPath);
             if (ep == null)
             {
+                if (string.IsNullOrEmpty(_securityError) && !string.IsNullOrEmpty(priorSecErr))
+                    _securityError = priorSecErr;
                 if (!string.IsNullOrEmpty(_securityError))
                     return new ApiResult { Error = _securityError, Ms = sw.ElapsedMilliseconds };
                 return null;
@@ -769,8 +866,9 @@ namespace ProxyPicker.Core
                 // v1.3.7 就是在这里之前被一句无条件 `sendSecret = true` 覆盖掉的，
                 // 所以把不变量钉在真正用到它的这一行上。
                 if (_endpointGuessed && sendSecret) sendSecret = false;
-                if (sendSecret && !string.IsNullOrEmpty(_secret))
-                    req.Headers["Authorization"] = "Bearer " + _secret;
+                string sec = CleanHeaderSecret(_secret);
+                if (sendSecret && !string.IsNullOrEmpty(sec))
+                    req.Headers["Authorization"] = "Bearer " + sec;
 
                 if (body != null)
                 {
@@ -801,21 +899,40 @@ namespace ProxyPicker.Core
                 }
                 else
                 {
-                    _endpoint = null; _endpointTried = false;
+                    _endpoint = null; _endpointTried = false; _endpointGuessed = false;
                     r.Error = we.Status + ": " + we.Message;
                 }
             }
             catch (Exception ex)
             {
-                _endpoint = null; _endpointTried = false;
+                _endpoint = null; _endpointTried = false; _endpointGuessed = false;
                 r.Error = ex.GetType().Name + ": " + ex.Message;
             }
             r.Ms = sw.ElapsedMilliseconds;
             return r;
         }
 
-        static void ParseHttp(string text, ApiResult r)
+        /// <summary>过滤控制密钥中的换行和空字符，杜绝 HTTP 请求头注入与管道写异常。</summary>
+        internal static string CleanHeaderSecret(string secret)
         {
+            if (string.IsNullOrEmpty(secret)) return "";
+            for (int i = 0; i < secret.Length; i++)
+            {
+                char c = secret[i];
+                if (c == '\r' || c == '\n' || c == '\0') return "";
+            }
+            return secret;
+        }
+
+        internal static void ParseHttp(string text, ApiResult r)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                r.Status = 0;
+                r.Body = "";
+                if (string.IsNullOrEmpty(r.Error)) r.Error = "命名管道返回空响应";
+                return;
+            }
             int sep = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
             string headTxt = sep < 0 ? text : text.Substring(0, sep);
             r.Body = sep < 0 ? "" : text.Substring(sep + 4);
@@ -826,6 +943,8 @@ namespace ProxyPicker.Core
                 int st;
                 if (int.TryParse(parts[1], out st)) r.Status = st;
             }
+            if (r.Status == 0 && string.IsNullOrEmpty(r.Error))
+                r.Error = "命名管道返回无效响应";
         }
 
         /// <summary>
@@ -845,16 +964,26 @@ namespace ProxyPicker.Core
 
             string configured;
             string sameFileSecret = null;
+            string clientHint;
+            string targetCfgPath;
             if (!string.IsNullOrEmpty(knownConfigPath))
             {
                 // R4：与绑定/secret 同一份配置，控制器地址不能另走一次 Detect() 猜测。
                 // 收尾批 P3-1：同一次读出的 secret 一并往下传，不再让 ProbeMihomo
                 // 重开文件读第二遍（少一次 IO，也少一次两套解析发散的机会）。
+                targetCfgPath = knownConfigPath;
                 Discovery.ReadController(knownConfigPath, out sameFileSecret, out configured);
+                clientHint = Discovery.ClientForConfig(knownConfigPath);
+                if (string.IsNullOrEmpty(clientHint))
+                    clientHint = Discovery.GuessClient(Path.GetDirectoryName(knownConfigPath));
             }
             else
             {
-                configured = Discovery.Detect().Controller;
+                var env = Discovery.Detect();
+                targetCfgPath = env.ConfigPath;
+                configured = env.Controller;
+                sameFileSecret = env.Secret;
+                clientHint = env.Client;
             }
             if (!string.IsNullOrEmpty(configured))
             {
@@ -875,18 +1004,209 @@ namespace ProxyPicker.Core
                 return _endpoint;
             }
 
+            // v2.2.2 P1 安全收口：配置没有写明 external-controller 且无认证 secret 时，
+            // 不能仅凭“本机有个叫 mihomo.exe 的进程”就放开 PUT/PATCH 写权限。
+            // 仅当：1) 唯一命中的纯 127.x 精确回环监听端口可通 /version，且
+            //       2) 该监听 PID 的命令行（-f 或默认 config.yaml 下的 -d）实证正在运行同一份配置文件，且
+            //       3) SecretGate 核对通过，
+            // 才允许可写升级；其余所有推测端口一律标为 _endpointGuessed = true（只读 GET/HEAD、禁止任何写操作）。
+            if (string.IsNullOrEmpty(sameFileSecret) && !string.IsNullOrEmpty(clientHint))
+            {
+                var matchedEps = EnumMatchedKernelEndpoints(clientHint);
+                var verifiedOk = new List<MatchedEndpoint>();
+                foreach (var mep in matchedEps)
+                {
+                    if (ProbeVersion(mep.Endpoint, null) == ProbeResult.Ok)
+                        verifiedOk.Add(mep);
+                }
+                if (verifiedOk.Count == 1)
+                {
+                    var only = verifiedOk[0];
+                    bool proven = !string.IsNullOrEmpty(targetCfgPath) && PidProvesConfig(only.Pid, targetCfgPath);
+                    bool maySend;
+                    string gateErr;
+                    if (CanTrustMatchedEndpointWrite(false, false, 1, only.ExactLoopback, proven) &&
+                        SecretGate(only.Endpoint, out maySend, out gateErr))
+                    {
+                        _endpoint = only.Endpoint;
+                        _endpointGuessed = false;
+                        return _endpoint;
+                    }
+                    _endpoint = only.Endpoint;
+                    _endpointGuessed = true;
+                    return _endpoint;
+                }
+            }
+
             // 独立审阅第二轮 P1：这些端口是猜出来的，/version 只能证明「有个 mihomo 在听」，
             // 不能证明它加载的就是这次选中的配置。标记为未关联，TryHttp 会据此
             // 拒绝写操作、也不发送所选配置的 Bearer Secret。
-            string[] candidates = { "127.0.0.1:9090", "127.0.0.1:9097", "127.0.0.1:6170", "127.0.0.1:9091" };
+            string[] candidates =
+            {
+                "127.0.0.1:9090", "127.0.0.1:9097", "127.0.0.1:6170",
+                "127.0.0.1:9091", "127.0.0.1:47808", "127.0.0.1:9092"
+            };
             foreach (var ep in candidates)
             {
-                if (!ProbeMihomo(ep, false)) continue;   // 探测阶段本来就不带密钥
+                if (!ProbeMihomo(ep, false, guessed: true)) continue;   // 探测阶段本来就不带密钥
                 _endpoint = ep;
                 _endpointGuessed = true;
                 return _endpoint;
             }
             return null;
+        }
+
+        struct MatchedEndpoint
+        {
+            public string Endpoint;
+            public int Pid;
+            public bool ExactLoopback;
+        }
+
+        /// <summary>无显式控制器 + 空 secret 时是否允许将命中端点升级为可写通道（纯函数供自检约束）。</summary>
+        internal static bool CanTrustMatchedEndpointWrite(
+            bool hasConfiguredController,
+            bool hasSecret,
+            int verifiedCount,
+            bool exactLoopback,
+            bool cmdlineProvesConfig)
+        {
+            if (hasConfiguredController) return true;
+            if (hasSecret) return false;
+            return verifiedCount == 1 && exactLoopback && cmdlineProvesConfig;
+        }
+
+        /// <summary>核对内核进程命令行中的 -f/--config（或无 -f 时仅面向 config.yaml 的 -d）是否指向目标配置文件。</summary>
+        internal static bool CommandLineProvesConfig(string cmdLine, string expectedConfigPath)
+        {
+            if (string.IsNullOrWhiteSpace(cmdLine) || string.IsNullOrWhiteSpace(expectedConfigPath)) return false;
+            string expectedFull;
+            try { expectedFull = Path.GetFullPath(expectedConfigPath.Trim('"', '\'')); }
+            catch { return false; }
+
+            var args = Discovery.SplitCommandLine(cmdLine);
+            string explicitCfg = null;
+            string explicitDir = null;
+            for (int i = 0; i < args.Count; i++)
+            {
+                string a = args[i];
+                int eq = a.IndexOf('=');
+                string flag = eq > 0 ? a.Substring(0, eq).ToLowerInvariant() : a.ToLowerInvariant();
+                string val = null;
+                if (eq > 0 && (flag == "-f" || flag == "--config" || flag == "-d" || flag == "--directory"))
+                    val = a.Substring(eq + 1);
+                else if (flag == "-f" || flag == "--config" || flag == "-d" || flag == "--directory")
+                {
+                    if (i + 1 < args.Count) { val = args[i + 1]; i++; }
+                }
+                if (string.IsNullOrEmpty(val)) continue;
+                val = val.Trim('"', '\'');
+                if (flag == "-f" || flag == "--config") explicitCfg = val;
+                else explicitDir = val;
+            }
+
+            try
+            {
+                if (!string.IsNullOrEmpty(explicitCfg))
+                {
+                    string gotFull = Path.GetFullPath(explicitCfg);
+                    return string.Equals(gotFull, expectedFull, StringComparison.OrdinalIgnoreCase);
+                }
+                if (!string.IsNullOrEmpty(explicitDir) &&
+                    string.Equals(Path.GetFileName(expectedFull), "config.yaml", StringComparison.OrdinalIgnoreCase))
+                {
+                    string gotDir = Path.GetFullPath(explicitDir).TrimEnd('\\');
+                    string expectedDir = (Path.GetDirectoryName(expectedFull) ?? "").TrimEnd('\\');
+                    return string.Equals(gotDir, expectedDir, StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        static bool PidProvesConfig(int pid, string expectedConfigPath)
+        {
+            if (pid <= 0 || string.IsNullOrEmpty(expectedConfigPath)) return false;
+            try
+            {
+                using (var q = new System.Management.ManagementObjectSearcher(
+                    "SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + pid))
+                {
+                    foreach (System.Management.ManagementBaseObject mo in q.Get())
+                    {
+                        string cmd = "";
+                        try { cmd = Convert.ToString(mo["CommandLine"]) ?? ""; } catch { }
+                        if (CommandLineProvesConfig(cmd, expectedConfigPath)) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>枚举当前本机 TCP 表中由与 clientHint 匹配的核实内核进程正在监听的回环端口（优先精确 127.x 监听）。</summary>
+        static List<MatchedEndpoint> EnumMatchedKernelEndpoints(string clientHint)
+        {
+            var exactList = new List<MatchedEndpoint>();
+            var wildcardList = new List<MatchedEndpoint>();
+            if (string.IsNullOrEmpty(clientHint)) return exactList;
+            var exactSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var wildSeenPorts = new HashSet<int>();
+            try
+            {
+                int size = 0;
+                uint rc = GetExtendedTcpTable(IntPtr.Zero, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+                if (rc != ERROR_INSUFFICIENT_BUFFER || size <= 0) return exactList;
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    int allocSize = size;
+                    if (allocSize < 4) return exactList;
+                    IntPtr buf = Marshal.AllocHGlobal(allocSize);
+                    try
+                    {
+                        rc = GetExtendedTcpTable(buf, ref size, false, AF_INET, TCP_TABLE_OWNER_PID_LISTENER, 0);
+                        if (rc == ERROR_INSUFFICIENT_BUFFER) continue;
+                        if (rc != 0) return exactList;
+                        int count = Marshal.ReadInt32(buf);
+                        int maxRows = (allocSize - 4) / 24;
+                        if (count > maxRows) count = maxRows;
+                        IntPtr row = IntPtr.Add(buf, 4);
+                        for (int i = 0; i < count; i++)
+                        {
+                            uint rawAddr = unchecked((uint)Marshal.ReadInt32(row, 4));
+                            bool isExactLoop = (rawAddr & 0xFF) == 127;
+                            bool isAny = rawAddr == 0;
+                            int rawPort = Marshal.ReadInt32(row, 8);
+                            int port = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
+                            int pid = Marshal.ReadInt32(row, 20);
+                            if ((isExactLoop || isAny) && port > 0 && port <= 65535 && pid > 0)
+                            {
+                                var chain = ProcessChain((uint)pid);
+                                if (chain.Count > 0 &&
+                                    chain.Take(2).Any(e => IsKernelExecutable(e.Name)) &&
+                                    chain.Take(2).Any(e => KernelProcessMatchesClient(e.Name, clientHint)))
+                                {
+                                    if (isExactLoop)
+                                    {
+                                        string ep = new IPAddress(rawAddr) + ":" + port;
+                                        if (exactSeen.Add(ep))
+                                            exactList.Add(new MatchedEndpoint { Endpoint = ep, Pid = pid, ExactLoopback = true });
+                                    }
+                                    else if (wildSeenPorts.Add(port))
+                                    {
+                                        wildcardList.Add(new MatchedEndpoint { Endpoint = "127.0.0.1:" + port, Pid = pid, ExactLoopback = false });
+                                    }
+                                }
+                            }
+                            row = IntPtr.Add(row, 24);
+                        }
+                        break;
+                    }
+                    finally { Marshal.FreeHGlobal(buf); }
+                }
+            }
+            catch { }
+            return exactList.Count > 0 ? exactList : wildcardList;
         }
 
         /// <summary>只接受 127/::1 与 localhost 字面量；绝不解析任意主机名，也不接受 0.0.0.0。</summary>
@@ -969,8 +1289,9 @@ namespace ProxyPicker.Core
                 req.Proxy = null;
                 req.KeepAlive = false;
                 req.AllowAutoRedirect = false;
-                if (!string.IsNullOrEmpty(secret))
-                    req.Headers["Authorization"] = "Bearer " + secret;
+                string cleanSec = CleanHeaderSecret(secret);
+                if (!string.IsNullOrEmpty(cleanSec))
+                    req.Headers["Authorization"] = "Bearer " + cleanSec;
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 {
                     if (resp.StatusCode != HttpStatusCode.OK) return ProbeResult.NotMihomo;
@@ -1077,7 +1398,7 @@ namespace ProxyPicker.Core
             lock (ListenerGate)
             {
                 if (string.Equals(_listenerEp, ep, StringComparison.OrdinalIgnoreCase) &&
-                    unchecked((uint)(Environment.TickCount - (int)_listenerAtTick)) < 10000 &&
+                    unchecked((uint)(Environment.TickCount - (int)_listenerAtTick)) < ListenerCacheTtlMs(_listenerVerdict) &&
                     (_listenerVerdict != ListenerKind.Kernel || ListenerStillAlive(_listenerPid)))
                 {
                     detail = _listenerDetail;
@@ -1185,13 +1506,15 @@ namespace ProxyPicker.Core
             return list;
         }
 
+        public static uint ListenerCacheTtlMs(ListenerKind kind)
+        {
+            // Unknown 缩短缓存，防止内核慢启动或短暂切换端口时卡在「身份未知」长达 10 秒
+            return kind == ListenerKind.Unknown ? 1500u : 10000u;
+        }
+
         static bool TryFindListenerPidAf(int port, int af, List<IPAddress> targets, bool wildcard, out int pid)
         {
             pid = 0;
-            int size = 0;
-            uint rc = GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
-            if (rc != ERROR_INSUFFICIENT_BUFFER || size <= 0) return false;
-
             int rowSize = af == AF_INET ? 24 : 56;
             int portOff = af == AF_INET ? 8 : 20;
             int pidOff = af == AF_INET ? 20 : 52;
@@ -1204,26 +1527,41 @@ namespace ProxyPicker.Core
                 if (!anyV4) return false;
             }
 
-            IntPtr buf = Marshal.AllocHGlobal(size);
-            try
+            int size = 0;
+            uint rc = GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            if (rc != ERROR_INSUFFICIENT_BUFFER || size <= 0) return false;
+
+            // TCP 监听表在两次 P/Invoke 间可能扩容导致再次返回 ERROR_INSUFFICIENT_BUFFER，最多重试 3 轮
+            for (int attempt = 0; attempt < 3; attempt++)
             {
-                rc = GetExtendedTcpTable(buf, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
-                if (rc != 0) return false;
-                int count = Marshal.ReadInt32(buf);
-                IntPtr row = IntPtr.Add(buf, 4);
-                for (int i = 0; i < count; i++)
+                int allocSize = size;
+                if (allocSize < 4) return false;
+                IntPtr buf = Marshal.AllocHGlobal(allocSize);
+                try
                 {
-                    int rawPort = Marshal.ReadInt32(row, portOff);
-                    int p = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
-                    if (p == port && AddressMatches(row, af, targets, wildcard))
+                    rc = GetExtendedTcpTable(buf, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
+                    if (rc == ERROR_INSUFFICIENT_BUFFER) continue;
+                    if (rc != 0) return false;
+                    int count = Marshal.ReadInt32(buf);
+                    if (count <= 0) return false;
+                    int maxRows = (allocSize - 4) / rowSize;
+                    if (count > maxRows) count = maxRows;
+                    IntPtr row = IntPtr.Add(buf, 4);
+                    for (int i = 0; i < count; i++)
                     {
-                        pid = Marshal.ReadInt32(row, pidOff);
-                        if (pid > 0) return true;
+                        int rawPort = Marshal.ReadInt32(row, portOff);
+                        int p = ((rawPort & 0xFF) << 8) | ((rawPort >> 8) & 0xFF);
+                        if (p == port && AddressMatches(row, af, targets, wildcard))
+                        {
+                            pid = Marshal.ReadInt32(row, pidOff);
+                            if (pid > 0) return true;
+                        }
+                        row = IntPtr.Add(row, rowSize);
                     }
-                    row = IntPtr.Add(row, rowSize);
+                    return false;
                 }
+                finally { Marshal.FreeHGlobal(buf); }
             }
-            finally { Marshal.FreeHGlobal(buf); }
             return false;
         }
 
@@ -1257,13 +1595,62 @@ namespace ProxyPicker.Core
         /// 那一份配置。以前 GetJson 没有这个参数，Request 会回退到 Detect()；Detect 有
         /// 5 秒缓存，过期窗口内可能与本次推送绑定的不是同一份配置。不传时保持原行为。
         /// </summary>
+        public sealed class ApiJsonResult
+        {
+            public bool Ok;
+            public int Status;
+            public string Error;
+            public int Ms;
+            public Dictionary<string, object> Data;
+        }
+
+        /// <summary>保留 HTTP 状态码与错误原因的 JSON 查询，避免把鉴权失败/超时误判成「数据为空」。</summary>
+        public static ApiJsonResult ParseJsonResponse(ApiResult r)
+        {
+            var res = new ApiJsonResult
+            {
+                Status = r != null ? r.Status : 0,
+                Ms = r != null ? (int)r.Ms : 0
+            };
+            if (r == null)
+            {
+                res.Error = "内核请求未返回结果";
+                return res;
+            }
+            if (!r.Ok)
+            {
+                res.Error = !string.IsNullOrEmpty(r.Error) ? r.Error : ("HTTP " + r.Status);
+                return res;
+            }
+            try
+            {
+                var obj = Json.AsObject(Json.Parse(r.Body));
+                if (obj == null)
+                {
+                    res.Error = "内核返回了非 JSON 对象";
+                    return res;
+                }
+                res.Ok = true;
+                res.Data = obj;
+                return res;
+            }
+            catch (Exception ex)
+            {
+                res.Error = "解析内核 JSON 失败: " + ex.Message;
+                return res;
+            }
+        }
+
+        public static ApiJsonResult FetchJson(string path, int timeoutMs = 10000, string knownConfigPath = null)
+        {
+            return ParseJsonResponse(Request("GET", path, null, timeoutMs, knownConfigPath));
+        }
+
         public static Dictionary<string, object> GetJson(string path, int timeoutMs = 10000,
                                                           string knownConfigPath = null)
         {
-            var r = Request("GET", path, null, timeoutMs, knownConfigPath);
-            if (!r.Ok) return null;
-            try { return Json.AsObject(Json.Parse(r.Body)); }
-            catch { return null; }
+            var res = FetchJson(path, timeoutMs, knownConfigPath);
+            return res.Ok ? res.Data : null;
         }
 
         /// <summary>内核版本信息；用来判断某条规则类型能不能用，而不是推过去再被整份拒绝。</summary>
@@ -1284,17 +1671,22 @@ namespace ProxyPicker.Core
         static readonly object VersionGate = new object();
 
         /// <summary>读一次 /version 并缓存 60 秒；读不到返回 null（调用方按「保守但可用」处理）。</summary>
-        public static VersionInfo KernelVersion()
+        public static VersionInfo KernelVersion(string knownConfigPath = null)
         {
             lock (VersionGate)
             {
                 if (_version != null && (DateTime.UtcNow - _versionAt).TotalSeconds < 60) return _version;
-                var json = GetJson("/version", 3000);
-                if (json == null) return null;
-                var v = new VersionInfo();
-                v.Version = Json.Str(json, "version") ?? "";
-                v.Meta = Json.Bool(json, "meta", false);
-                ParseVersion(v.Version, v);
+            }
+            // 先释放 VersionGate 再请求内核：GetJson -> Forget 会按 ChannelGate -> ListenerGate -> VersionGate 加锁，
+            // 若在 VersionGate 内发起请求，另一线程跑 Forget() 时会形成 ABBA 互锁死锁。
+            var json = GetJson("/version", 3000, knownConfigPath);
+            if (json == null) return null;
+            var v = new VersionInfo();
+            v.Version = Json.Str(json, "version") ?? "";
+            v.Meta = Json.Bool(json, "meta", false);
+            ParseVersion(v.Version, v);
+            lock (VersionGate)
+            {
                 _version = v;
                 _versionAt = DateTime.UtcNow;
                 return v;
@@ -1591,6 +1983,139 @@ namespace ProxyPicker.Core
                 try { if (fakeSrv != null) fakeSrv.Stop(); } catch { }
             }
 
+            // v1.4.0：回归测试 — FetchJson 状态分诊 + Forget 全缓存清理
+            var err401 = ParseJsonResponse(new ApiResult { Status = 401, Error = "secret 不匹配（HTTP 401）", Ms = 12 });
+            var okObj = ParseJsonResponse(new ApiResult { Status = 200, Body = "{\"version\":\"1.19.0\"}", Ms = 8 });
+            var badJson = ParseJsonResponse(new ApiResult { Status = 200, Body = "<html>oops</html>", Ms = 5 });
+            check("v1.4.0 FetchJson 区分鉴权/协议错误与合法 JSON 对象",
+                !err401.Ok && err401.Status == 401 && err401.Error.IndexOf("401", StringComparison.Ordinal) >= 0 &&
+                okObj.Ok && okObj.Data != null && Json.Str(okObj.Data, "version") == "1.19.0" &&
+                !badJson.Ok && !string.IsNullOrEmpty(badJson.Error),
+                "401=" + err401.Error + " ok=" + okObj.Ok + " bad=" + badJson.Error);
+
+            lock (ListenerGate)
+            {
+                _listenerEp = "127.0.0.1:9090";
+                _listenerVerdict = ListenerKind.Other;
+                _listenerDetail = "selftest";
+                _listenerAtTick = unchecked((uint)Environment.TickCount);
+                _listenerPid = 12345;
+            }
+            lock (VersionGate) { _version = new VersionInfo { Version = "stale" }; _versionAt = DateTime.UtcNow; }
+            Forget();
+            bool clearedAll;
+            lock (ListenerGate) clearedAll = _listenerEp == null && _listenerVerdict == ListenerKind.Unknown && _listenerPid == 0;
+            lock (VersionGate) clearedAll = clearedAll && _version == null && _versionAt == DateTime.MinValue;
+            check("v1.4.0 Forget() 同步清空监听核对缓存与内核版本缓存",
+                clearedAll && ListenerCacheTtlMs(ListenerKind.Unknown) < ListenerCacheTtlMs(ListenerKind.Kernel),
+                "cleared=" + clearedAll);
+
+            check("v1.4.0 CleanHeaderSecret 拒绝 CRLF/NUL 头注入并放行合法密钥",
+                CleanHeaderSecret("my$ecret=1") == "my$ecret=1" &&
+                CleanHeaderSecret("bad\r\nX-Test: 1") == "" &&
+                CleanHeaderSecret("bad\nX-Test: 1") == "" &&
+                CleanHeaderSecret("bad\0sec") == "",
+                "");
+
+            var badPipeEmpty = new ApiResult();
+            ParseHttp("", badPipeEmpty);
+            var badPipeGarbled = new ApiResult();
+            ParseHttp("GARBAGE NO STATUS\r\n\r\n{}", badPipeGarbled);
+            var okPipe = new ApiResult();
+            ParseHttp("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"ok\":true}", okPipe);
+            check("v1.4.0 ParseHttp 对空/无状态行管道响应填充明确错误且不静默放行",
+                badPipeEmpty.Status == 0 && !string.IsNullOrEmpty(badPipeEmpty.Error) && !badPipeEmpty.Ok &&
+                badPipeGarbled.Status == 0 && !string.IsNullOrEmpty(badPipeGarbled.Error) && !badPipeGarbled.Ok &&
+                okPipe.Ok && okPipe.Body == "{\"ok\":true}",
+                "emptyErr=" + badPipeEmpty.Error + " garbledErr=" + badPipeGarbled.Error);
+
+            check("v2.2.0 IsRestControlPipeName 拒绝服务/Helper/FlClash-RPC 管道且按客户端家族强隔离",
+                !IsRestControlPipeName("clash-verge-service") &&
+                !IsRestControlPipeName("FlClashHelperService") &&
+                !IsRestControlPipeName("FlClash") &&
+                IsRestControlPipeName("verge-mihomo-production-123") &&
+                !PipeMatchesClient("verge-mihomo-production-123", "FlClash") &&
+                !PipeMatchesClient("verge-mihomo-production-123", "Sparkle") &&
+                PipeMatchesClient("verge-mihomo-production-123", "Clash Verge Rev") &&
+                KernelProcessMatchesClient("FlClashCore.exe", "FlClash") &&
+                !KernelProcessMatchesClient("verge-mihomo.exe", "FlClash"),
+                "");
+
+            // v2.2.2 P1 & P2 回归：管道默认拒绝、内核精确文件名名单、无控制器+空Secret 默认只读（需 -f 实证才可写）、Forget 不阻塞持锁 I/O
+            check("v2.2.2 管道筛选默认拒绝跨端复用并识别 Nyanpasu 管道",
+                !PipeMatchesClient("mihomo-999", "Clash Verge Rev") &&
+                !PipeMatchesClient("verge-mihomo-production-1", "Clash Nyanpasu") &&
+                PipeMatchesClient("nyanpasu-mihomo", "Clash Nyanpasu") &&
+                PipeMatchesClient("mihomo-abc", "Sparkle") &&
+                !PipeMatchesClient("weird-custom-pipe", "Sparkle"),
+                "");
+
+            check("v2.2.2 IsKernelExecutable 与 KernelProcessMatchesClient 精确放行内核并拒绝 GUI/服务外壳",
+                !IsKernelExecutable("FlClash.exe") &&
+                !IsKernelExecutable("clash-verge.exe") &&
+                !IsKernelExecutable("clash-verge-service.exe") &&
+                !IsKernelExecutable("FlClashHelperService.exe") &&
+                !IsKernelExecutable("Mihomo Party.exe") &&
+                IsKernelExecutable("FlClashCore.exe") &&
+                IsKernelExecutable("verge-mihomo.exe") &&
+                IsKernelExecutable("clash-win64.exe") &&
+                !KernelProcessMatchesClient("FlClash.exe", "FlClash") &&
+                !KernelProcessMatchesClient("clash-verge-service.exe", "Clash Verge Rev"),
+                "");
+
+            bool canWriteNoProof = CanTrustMatchedEndpointWrite(false, false, 1, true, false);
+            bool canWriteWildcard = CanTrustMatchedEndpointWrite(false, false, 1, false, true);
+            bool canWriteWithSecret = CanTrustMatchedEndpointWrite(false, true, 1, true, true);
+            bool canWriteProven = CanTrustMatchedEndpointWrite(false, false, 1, true, true);
+            bool writeBlockedReadOnly = !SecretDecision("PUT", "{}", true, "127.0.0.1:9090", out gSend, out gErr) && !gSend;
+            check("v2.2.2 无控制器+空Secret 缺 -f 实证时严格保持只读并拒绝写操作",
+                !canWriteNoProof && !canWriteWildcard && !canWriteWithSecret && canWriteProven &&
+                writeBlockedReadOnly &&
+                CommandLineProvesConfig("mihomo.exe -f \"C:\\A\\cfg.yaml\"", @"C:\A\cfg.yaml") &&
+                !CommandLineProvesConfig("mihomo.exe -f \"C:\\B\\cfg.yaml\"", @"C:\A\cfg.yaml") &&
+                !CommandLineProvesConfig("mihomo.exe", @"C:\A\cfg.yaml") &&
+                CommandLineProvesConfig("mihomo.exe -d \"C:\\A\"", @"C:\A\config.yaml") &&
+                !CommandLineProvesConfig("mihomo.exe -d \"C:\\A\"", @"C:\A\clash-verge.yaml"),
+                "");
+
+            string fSavedBound = _boundConfigPath;
+            try
+            {
+                _boundConfigPath = @"C:\PP-TEST\hold.yaml";
+                var holdEntered = new System.Threading.ManualResetEventSlim(false);
+                var holdRelease = new System.Threading.ManualResetEventSlim(false);
+                var holder = new System.Threading.Thread(() =>
+                {
+                    lock (ChannelGate)
+                    {
+                        SyncForgetEpochUnlocked();
+                        try
+                        {
+                            holdEntered.Set();
+                            holdRelease.Wait(1500);
+                        }
+                        finally { SyncForgetEpochUnlocked(); }
+                    }
+                });
+                holder.IsBackground = true;
+                holder.Start();
+                holdEntered.Wait(1000);
+                var fgSw = Stopwatch.StartNew();
+                Forget();
+                fgSw.Stop();
+                holdRelease.Set();
+                holder.Join(1500);
+                string afterBound;
+                lock (ChannelGate) { afterBound = _boundConfigPath; }
+                check("v2.2.2 Forget() 在 ChannelGate 被网络持锁时不阻塞并延迟自动作废绑定",
+                    fgSw.ElapsedMilliseconds < 80 && afterBound == null,
+                    "ms=" + fgSw.ElapsedMilliseconds + " after=" + (afterBound ?? "null"));
+            }
+            finally
+            {
+                _boundConfigPath = fSavedBound;
+            }
+
             sb.AppendLine();
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();
@@ -1605,70 +2130,106 @@ namespace ProxyPicker.Core
         public static string RequestRaw(string method, string path, string body, int timeoutMs)
         {
             var sb = new StringBuilder();
-            EnsureBoundToCurrentConfig();   // P1-①：--raw 也复用 Endpoint() 缓存，同样要先按当前选中配置失效
-            string pipe = FindPipe();
-            string sec = ReadSecret();
-            sb.AppendLine("pipe     : " + (pipe ?? "<未找到>"));
-            sb.AppendLine("secret   : " + (string.IsNullOrEmpty(sec) ? "未配置" : "已配置（不回显）"));
-            sb.AppendLine("endpoint : " + (Endpoint() ?? "<无 HTTP 端口>"));
-            if (!string.IsNullOrEmpty(_securityError)) sb.AppendLine("security : " + _securityError);
-            sb.AppendLine();
-            if (pipe == null) return sb.ToString();
-
-            try
+            string pipe, sec, ambiguous;
+            lock (ChannelGate)
             {
-                using (var p = PipeConnection.Open(PipeRoot + pipe))
+                EnsureBoundToCurrentConfig();   // P1-①：--raw 也复用 Endpoint() 缓存，同样要先按当前选中配置失效
+                pipe = FindPipe();
+                sec = ReadSecret();
+                ambiguous = _pipeAmbiguous;
+                sb.AppendLine("pipe     : " + (pipe ?? "<未找到>"));
+                sb.AppendLine("secret   : " + (string.IsNullOrEmpty(sec) ? "未配置" : "已配置（不回显）"));
+                sb.AppendLine("endpoint : " + (Endpoint() ?? "<无 HTTP 端口>"));
+                if (!string.IsNullOrEmpty(_securityError)) sb.AppendLine("security : " + _securityError);
+                sb.AppendLine();
+                if (pipe == null) return sb.ToString();
+                if (!string.IsNullOrEmpty(ambiguous))
                 {
-                    string trustError = ValidatePipeServer(p.ServerProcessId);
-                    sb.AppendLine("identity : " + (trustError != null ? "不通过" : (_pipeTrustDetail ?? "已核实")));
-                    if (trustError != null)
-                    {
-                        sb.AppendLine("[已阻止] 未发送控制密钥：" + trustError);
-                        return sb.ToString();
-                    }
-
-                    byte[] payload = Encoding.UTF8.GetBytes(body ?? "");
-                    string head =
-                        method + " " + path + " HTTP/1.0\r\n" +
-                        "Host: localhost\r\n" +
-                        "Authorization: Bearer " + sec + "\r\n" +
-                        "Content-Type: application/json\r\n" +
-                        "Content-Length: " + payload.Length + "\r\n\r\n";
-                    byte[] hb = Encoding.ASCII.GetBytes(head);
-                    byte[] all = hb;
-                    if (payload.Length > 0)
-                    {
-                        all = new byte[hb.Length + payload.Length];
-                        Buffer.BlockCopy(hb, 0, all, 0, hb.Length);
-                        Buffer.BlockCopy(payload, 0, all, hb.Length, payload.Length);
-                    }
-                    p.WriteAll(all);
-                    sb.Append(Encoding.UTF8.GetString(p.ReadToEnd(timeoutMs)));
+                    sb.AppendLine("[已阻止] 未发送控制密钥：" + ambiguous);
+                    return sb.ToString();
                 }
+
+                try
+                {
+                    using (var p = PipeConnection.Open(PipeRoot + pipe))
+                    {
+                        string trustError = ValidatePipeServer(p.ServerProcessId);
+                        sb.AppendLine("identity : " + (trustError != null ? "不通过" : (_pipeTrustDetail ?? "已核实")));
+                        if (trustError != null)
+                        {
+                            sb.AppendLine("[已阻止] 未发送控制密钥：" + trustError);
+                            return sb.ToString();
+                        }
+
+                        byte[] payload = Encoding.UTF8.GetBytes(body ?? "");
+                        var headSb = new StringBuilder();
+                        headSb.Append(method).Append(" ").Append(path).Append(" HTTP/1.0\r\n");
+                        headSb.Append("Host: localhost\r\n");
+                        string cleanSec = CleanHeaderSecret(sec);
+                        if (!string.IsNullOrEmpty(cleanSec))
+                            headSb.Append("Authorization: Bearer ").Append(cleanSec).Append("\r\n");
+                        headSb.Append("Content-Type: application/json\r\n");
+                        headSb.Append("Content-Length: ").Append(payload.Length).Append("\r\n\r\n");
+                        byte[] hb = Encoding.ASCII.GetBytes(headSb.ToString());
+                        byte[] all = hb;
+                        if (payload.Length > 0)
+                        {
+                            all = new byte[hb.Length + payload.Length];
+                            Buffer.BlockCopy(hb, 0, all, 0, hb.Length);
+                            Buffer.BlockCopy(payload, 0, all, hb.Length, payload.Length);
+                        }
+                        p.WriteAll(all);
+                        sb.Append(Encoding.UTF8.GetString(p.ReadToEnd(timeoutMs)));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    sb.AppendLine("[异常] " + ex.GetType().Name + ": " + ex.Message);
+                }
+                return sb.ToString();
             }
-            catch (Exception ex)
-            {
-                sb.AppendLine("[异常] " + ex.GetType().Name + ": " + ex.Message);
-            }
-            return sb.ToString();
+        }
+
+        static void ClearChannelFieldsUnlocked()
+        {
+            _pipeName = null;
+            _secret = null;
+            _endpoint = null;
+            _endpointTried = false;
+            _endpointGuessed = false;
+            _securityError = null;
+            _trustedPipePid = 0;
+            _trustedPipeName = null;
+            _trustedAtTick = 0;
+            _pipeTrustDetail = null;
+            _pipeAmbiguous = null;
+            _boundConfigPath = null;
         }
 
         public static void Forget()
         {
-            lock (ChannelGate)
+            int target = System.Threading.Interlocked.Increment(ref _forgetEpoch);
+            if (System.Threading.Monitor.TryEnter(ChannelGate, 0))
             {
-                _pipeName = null;
-                _secret = null;
-                _endpoint = null;
-                _endpointTried = false;
-                _endpointGuessed = false;
-                _securityError = null;
-                _trustedPipePid = 0;
-                _trustedPipeName = null;
-                _trustedAtTick = 0;
-                _pipeTrustDetail = null;
-                _pipeAmbiguous = null;
-                _boundConfigPath = null;
+                try
+                {
+                    ClearChannelFieldsUnlocked();
+                    _appliedForgetEpoch = target;
+                }
+                finally { System.Threading.Monitor.Exit(ChannelGate); }
+            }
+            lock (ListenerGate)
+            {
+                _listenerEp = null;
+                _listenerVerdict = ListenerKind.Unknown;
+                _listenerDetail = null;
+                _listenerAtTick = 0;
+                _listenerPid = 0;
+            }
+            lock (VersionGate)
+            {
+                _version = null;
+                _versionAt = DateTime.MinValue;
             }
         }
     }

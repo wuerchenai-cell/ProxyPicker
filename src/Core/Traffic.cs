@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace ProxyPicker.Core
 {
@@ -130,7 +131,7 @@ namespace ProxyPicker.Core
             return true;
         }
 
-        enum Chain { Unknown, Direct, Proxy, Rejected }
+        internal enum Chain { Unknown, Direct, Proxy, Rejected }
 
         sealed class Mark
         {
@@ -184,21 +185,44 @@ namespace ProxyPicker.Core
         /// 是否把「预期与实际不符」判为异常。订阅兼容模式下未勾选的软件按订阅规则走，
         /// 走代理本来就是合法的，所以那种模式不判定。
         /// </param>
-        public static Sample Poll(ICollection<string> proxyExes, bool judgeMismatch = true)
+        static bool SafeRegexMatch(Regex rx, string text)
         {
-            var s = new Sample();
-            s.Judged = judgeMismatch;
-            DateTime baseline = BaselineUtc;
+            if (rx == null || string.IsNullOrEmpty(text)) return false;
+            try { return rx.IsMatch(text); }
+            catch { return false; }
+        }
+
+        public static Sample Poll(ICollection<string> proxyExes, bool judgeMismatch = true, IList<Regex> proxyPathRegexes = null)
+        {
             var root = Mihomo.GetJson("/connections", 8000);
             if (root == null)
             {
-                s.Ok = false;
-                s.Error = "读不到连接表";
-                return s;
+                return new Sample
+                {
+                    Judged = judgeMismatch,
+                    Ok = false,
+                    Error = "读不到连接表"
+                };
             }
+            return AnalyzeConnections(root, proxyExes, judgeMismatch, BaselineUtc, proxyPathRegexes, DateTime.UtcNow.Ticks, true);
+        }
 
+        /// <summary>
+        /// 解析一次 `/connections` 响应并按预期名单、目录正则和基线时刻做出口对账。
+        /// 抽成独立内部方法，使自检可以直接喂模拟连接表验证标准化与目录规则排除逻辑。
+        /// </summary>
+        internal static Sample AnalyzeConnections(Dictionary<string, object> root,
+                                                  ICollection<string> proxyExes,
+                                                  bool judgeMismatch,
+                                                  DateTime baseline,
+                                                  IList<Regex> proxyPathRegexes = null,
+                                                  long nowTicks = 0,
+                                                  bool updateHistory = true)
+        {
+            var s = new Sample();
+            s.Judged = judgeMismatch;
             object raw;
-            var arr = root.TryGetValue("connections", out raw) ? Json.AsArray(raw) : null;
+            var arr = root != null && root.TryGetValue("connections", out raw) ? Json.AsArray(raw) : null;
             if (arr == null)
             {
                 s.Ok = false;
@@ -213,14 +237,16 @@ namespace ProxyPicker.Core
             {
                 var d = Json.AsObject(item);
                 var meta = Json.Obj(d, "metadata");
+                string procPath = Json.Str(meta, "processPath") ?? "";
                 string exe = Json.Str(meta, "process") ?? "";
                 if (exe.Length == 0)
                 {
-                    string path = Json.Str(meta, "processPath") ?? "";
-                    int slash = path.LastIndexOf('\\');
-                    exe = slash >= 0 ? path.Substring(slash + 1) : path;
+                    int slash = procPath.LastIndexOfAny(new[] { '\\', '/' });
+                    exe = slash >= 0 ? procPath.Substring(slash + 1) : procPath;
                 }
-                exe = exe.ToLowerInvariant();
+                // 与 Profile.SelectWrongRouteConnections 同口径：mihomo 有时省略 .exe 后缀，
+                // 必须先标准化后再比对 _effectiveProxy，否则会反复触发「未勾选却走代理」假异常。
+                exe = Profile.Normalize(exe).ToLowerInvariant();
                 if (exe.Length > 0)
                 {
                     int seenN;
@@ -246,7 +272,18 @@ namespace ProxyPicker.Core
                     // 新连接：本次的全部字节就是它这一轮的增量
                 }
 
-                bool expected = proxyExes != null && proxyExes.Contains(exe);
+                bool expected = proxyExes != null && exe.Length > 0 && proxyExes.Contains(exe);
+                if (!expected && proxyPathRegexes != null && proxyPathRegexes.Count > 0 && procPath.Length > 0)
+                {
+                    for (int i = 0; i < proxyPathRegexes.Count; i++)
+                    {
+                        if (SafeRegexMatch(proxyPathRegexes[i], procPath))
+                        {
+                            expected = true;
+                            break;
+                        }
+                    }
+                }
                 Chain chain = ChainOf(d);
 
                 // 规则只对「新连接」生效：mihomo 不会给已经连上的连接重新匹配。
@@ -267,6 +304,11 @@ namespace ProxyPicker.Core
                     {
                         rt = new Route { Expected = expected };
                         s.Routes[exe] = rt;
+                    }
+                    else if (expected && !rt.Expected)
+                    {
+                        // 同一进程先遇到缺 processPath 的条目、后遇到命中目录规则的条目时，升级预期。
+                        rt.Expected = true;
                     }
                     if (chain == Chain.Proxy)
                     {
@@ -323,8 +365,8 @@ namespace ProxyPicker.Core
                 s.Mismatch = s.Mismatches.Count;
             }
 
-            long nowTicks = DateTime.UtcNow.Ticks;
-            double seconds = _prevTicks == 0 ? 0 : (nowTicks - _prevTicks) / (double)TimeSpan.TicksPerSecond;
+            if (nowTicks == 0) nowTicks = DateTime.UtcNow.Ticks;
+            double seconds = !updateHistory || _prevTicks == 0 ? 0 : (nowTicks - _prevTicks) / (double)TimeSpan.TicksPerSecond;
             if (seconds <= 0.05)
             {
                 // 第一次采样没有参照，先给 0，避免出现一个巨大的假峰值
@@ -340,10 +382,13 @@ namespace ProxyPicker.Core
                 s.Seconds = seconds;
             }
 
-            lock (Gate)
+            if (updateHistory)
             {
-                _prev = now;
-                _prevTicks = nowTicks;
+                lock (Gate)
+                {
+                    _prev = now;
+                    _prevTicks = nowTicks;
+                }
             }
             return s;
         }
@@ -351,14 +396,25 @@ namespace ProxyPicker.Core
         /// <summary>看真实链路：DIRECT 算直连，REJECT / REJECT-DROP 算被拒，其余算代理，读不出来算未知。
         /// v1.3.8：出口分类改走 Profile.ClassifyExit 这一处口径。以前这里自己判字符串，
         /// 只认 DIRECT 和 REJECT，REJECT-DROP 的连接被算成「走代理」，和保存校验对不上。</summary>
-        static Chain ChainOf(Dictionary<string, object> conn)
+        internal static Chain ChainOf(Dictionary<string, object> conn)
         {
             object raw;
             if (conn == null || !conn.TryGetValue("chains", out raw)) return Chain.Unknown;
             var chains = Json.AsArray(raw);
             if (chains == null || chains.Count == 0) return Chain.Unknown;
+            // mihomo /connections 的 chains[0] 是实际末级出站（DIRECT / REJECT / 真实节点），
+            // chains[Count-1] 是规则最初命中的顶层策略组（如 PP-FIXED）。
+            // 若用户把策略组切到了 DIRECT/REJECT，chains 形如 ["DIRECT", "PP-FIXED"]；
+            // 只看最后一个元素会把「组内直连穿透」误判为走了代理。
+            string first = chains[0] as string ?? "";
+            if (first.Length > 0)
+            {
+                var firstKind = Profile.ClassifyExit(first);
+                if (firstKind == Profile.ExitKind.Direct) return Chain.Direct;
+                if (firstKind == Profile.ExitKind.Rejected) return Chain.Rejected;
+            }
             string last = chains[chains.Count - 1] as string ?? "";
-            if (last.Length == 0) return Chain.Unknown;
+            if (last.Length == 0) return first.Length > 0 ? Chain.Proxy : Chain.Unknown;
             var kind = Profile.ClassifyExit(last);
             if (kind == Profile.ExitKind.Direct) return Chain.Direct;
             if (kind == Profile.ExitKind.Rejected) return Chain.Rejected;
@@ -437,6 +493,185 @@ namespace ProxyPicker.Core
                 Profile.ClassifyExit("日本 01") == Profile.ExitKind.Proxy &&
                 !Profile.IsBlockedPolicy("日本 01") &&
                 Profile.ClassifyExit("direct") == Profile.ExitKind.Direct);
+
+            // v1.4.0：精确筛选分流异常里「真正走错链路」的连接（只断错路，不伤及正常链路和 REJECT）
+            var mockConns = new Dictionary<string, object>
+            {
+                { "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-wrong-dir" },
+                            { "chains", new List<object> { "DIRECT" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "chrome.exe" } } }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-ok-proxy" },
+                            { "chains", new List<object> { "日本 01" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "chrome.exe" } } }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-wrong-proxy" },
+                            { "chains", new List<object> { "美国 02" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "wechat.exe" } } }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-rejected" },
+                            { "chains", new List<object> { "REJECT-DROP" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "chrome.exe" } } }
+                        }
+                    }
+                }
+            };
+            var mismatches = new List<MismatchItem>
+            {
+                new MismatchItem { Exe = "chrome.exe", Expected = true },
+                new MismatchItem { Exe = "wechat.exe", Expected = false }
+            };
+            var wrongSnap = Profile.SelectWrongRouteConnections(mockConns, mismatches);
+            check("T12 SelectWrongRouteConnections 只筛选方向相反的错路连接",
+                wrongSnap.Ids.Count == 2 && wrongSnap.Ids.Contains("c-wrong-dir") &&
+                wrongSnap.Ids.Contains("c-wrong-proxy") && !wrongSnap.Ids.Contains("c-ok-proxy") &&
+                !wrongSnap.Ids.Contains("c-rejected"));
+
+            // T13：mihomo chains[0] 为末级出站、chains[Count-1] 为顶层策略组：组切到 DIRECT/REJECT 时不能误判成走了代理
+            var leafDirectConn = new Dictionary<string, object>
+            {
+                { "chains", new List<object> { "DIRECT", "PP-FIXED" } }
+            };
+            var leafRejectConn = new Dictionary<string, object>
+            {
+                { "chains", new List<object> { "REJECT-DROP", "PP-FIXED" } }
+            };
+            var leafProxyConn = new Dictionary<string, object>
+            {
+                { "chains", new List<object> { "日本 01", "自动选择", "PP-FIXED" } }
+            };
+            check("T13 ChainOf 优先识别 chains[0] 实际末级直连/拦截，防策略组切 DIRECT 后误判代理",
+                ChainOf(leafDirectConn) == Chain.Direct &&
+                ChainOf(leafRejectConn) == Chain.Rejected &&
+                ChainOf(leafProxyConn) == Chain.Proxy);
+
+            // T14：连接 metadata.process 不带 .exe 后缀时，SelectWrongRouteConnections 标准化后仍能命中并捕获
+            var bareNameConns = new Dictionary<string, object>
+            {
+                {
+                    "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-bare-wrong" },
+                            { "metadata", new Dictionary<string, object> { { "process", "chrome" } } },
+                            { "chains", new List<object> { "DIRECT", "DIRECT" } }
+                        }
+                    }
+                }
+            };
+            var bareSnap = Profile.SelectWrongRouteConnections(bareNameConns, mismatches);
+            check("T14 SelectWrongRouteConnections 标准化无后缀进程名后仍准确匹配错路连接",
+                bareSnap.Ids.Count == 1 && bareSnap.Ids.Contains("c-bare-wrong"));
+
+            // T15：AnalyzeConnections 对无后缀进程名先标准化，避免 chrome 匹配不到 chrome.exe 导致反复假异常
+            var nowUtc = DateTime.UtcNow;
+            var recentStart = nowUtc.ToString("o");
+            var proxyOnlyConns = new Dictionary<string, object>
+            {
+                {
+                    "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-bare-ok" },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-B", "PP-FIXED" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "chrome" } } }
+                        }
+                    }
+                }
+            };
+            var expectedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "chrome.exe" };
+            var barePollSample = AnalyzeConnections(proxyOnlyConns, expectedSet, true, nowUtc.AddMinutes(-5), null, nowUtc.Ticks, false);
+            check("T15 AnalyzeConnections 标准化无后缀进程名后不再误报分流异常",
+                barePollSample.Mismatch == 0 && barePollSample.Seen.ContainsKey("chrome.exe") &&
+                barePollSample.Routes.ContainsKey("chrome.exe") && barePollSample.Routes["chrome.exe"].Expected);
+
+            // T16：AnalyzeConnections 识别 PROCESS-PATH-REGEX 目录子进程，不把辅助工具误判成未勾选却走代理
+            string cursorPat = AppGroup.PatternFor(@"C:\Users\demo\AppData\Local\Programs\cursor");
+            var pathRegexes = new List<Regex> { new Regex(cursorPat, RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(50)) };
+            var dirConns = new Dictionary<string, object>
+            {
+                {
+                    "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-helper-ok" },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-B", "PP-FIXED" } },
+                            {
+                                "metadata", new Dictionary<string, object>
+                                {
+                                    { "process", "rg" },
+                                    { "processPath", @"C:\Users\demo\AppData\Local\Programs\cursor\resources\app\bin\rg.exe" }
+                                }
+                            }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-outside-wrong" },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-B", "PP-FIXED" } },
+                            {
+                                "metadata", new Dictionary<string, object>
+                                {
+                                    { "process", "curl.exe" },
+                                    { "processPath", @"C:\Windows\System32\curl.exe" }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            var dirPollSample = AnalyzeConnections(dirConns, expectedSet, true, nowUtc.AddMinutes(-5), pathRegexes, nowUtc.Ticks, false);
+            check("T16 AnalyzeConnections 结合目录正则放行子进程，同时保留真错路检出",
+                dirPollSample.Mismatch == 1 && dirPollSample.Mismatches[0].Exe == "curl.exe" &&
+                dirPollSample.Routes.ContainsKey("rg.exe") && dirPollSample.Routes["rg.exe"].Expected);
+
+            // T17：同进程先遇到无 processPath 条目、后遇到命中目录规则条目时，预期仍能提升为 true
+            var seqConns = new Dictionary<string, object>
+            {
+                {
+                    "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-seq-1" },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-B", "PP-FIXED" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "helper.exe" } } }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "c-seq-2" },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-B", "PP-FIXED" } },
+                            {
+                                "metadata", new Dictionary<string, object>
+                                {
+                                    { "process", "helper" },
+                                    { "processPath", @"C:\Users\demo\AppData\Local\Programs\cursor\helper.exe" }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            var seqSample = AnalyzeConnections(seqConns, expectedSet, true, nowUtc.AddMinutes(-5), pathRegexes, nowUtc.Ticks, false);
+            check("T17 同进程先缺路径后命中目录规则时升级 Expected，防顺序误报",
+                seqSample.Mismatch == 0 && seqSample.Routes["helper.exe"].Expected);
 
             sb.AppendLine(pass + "/" + total + " 流量对账口径通过");
             return sb.ToString();
