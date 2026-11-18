@@ -40,19 +40,32 @@ namespace ProxyPicker.UI
 
         static float DetectScale()
         {
-            uint dpi = 96;
-            try
+            return DetectWindowScale(IntPtr.Zero);
+        }
+
+        /// <summary>按指定窗口句柄所在屏幕读取 DPI（支持多屏混合 DPI 初始落点），句柄为空时回退系统 DPI。</summary>
+        internal static float DetectWindowScale(IntPtr hwnd)
+        {
+            uint dpi = 0;
+            if (hwnd != IntPtr.Zero)
             {
-                // GetDpiForSystem 是 Win10 1607+ 的系统 DPI，比 GDI+ 的无窗口 Graphics 可靠
-                dpi = GetDpiForSystem();
+                try { dpi = GetDpiForWindow(hwnd); } catch { dpi = 0; }
             }
-            catch
+            if (dpi < 72)
             {
                 try
                 {
-                    using (var g = Graphics.FromHwnd(IntPtr.Zero)) dpi = (uint)Math.Round(g.DpiX);
+                    // GetDpiForSystem 是 Win10 1607+ 的系统 DPI，比 GDI+ 的无窗口 Graphics 可靠
+                    dpi = GetDpiForSystem();
                 }
-                catch { dpi = 96; }
+                catch
+                {
+                    try
+                    {
+                        using (var g = Graphics.FromHwnd(hwnd)) dpi = (uint)Math.Round(g.DpiX);
+                    }
+                    catch { dpi = 96; }
+                }
             }
             if (dpi < 72) dpi = 96;
 
@@ -65,6 +78,8 @@ namespace ProxyPicker.UI
 
         [DllImport("user32.dll")]
         static extern uint GetDpiForSystem();
+        [DllImport("user32.dll")]
+        static extern uint GetDpiForWindow(IntPtr hwnd);
 
         /// <summary>逻辑像素 -> 设备像素。</summary>
         public static int Px(float logical)

@@ -425,8 +425,16 @@ namespace ProxyPicker.Core
                         if (!string.IsNullOrEmpty(dir))
                         {
                             list.Add(dir);
+                            list.Add(Path.Combine(dir, "data"));
+                            list.Add(Path.Combine(dir, "config"));
+                            list.Add(Path.Combine(dir, "profiles"));
                             string up = Path.GetDirectoryName(dir);
-                            if (!string.IsNullOrEmpty(up)) list.Add(up);
+                            if (!string.IsNullOrEmpty(up))
+                            {
+                                list.Add(up);
+                                list.Add(Path.Combine(up, "data"));
+                                list.Add(Path.Combine(up, "profiles"));
+                            }
                         }
                     }
                     catch { }
@@ -2926,6 +2934,17 @@ namespace ProxyPicker.Core
                 !IsClientRunning(@"C:\Users\u\AppData\Roaming\custom-clash", new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "clash-verge" }) &&
                 idxMerge > 0 && idxEx > idxMerge && idxPg > idxEx &&
                 Json.Str(surrObj, "emo") == "\uD83D\uDE00" && Json.Str(surrObj, "bad") == "\uFFFD",
+                "");
+
+            var bomObj = Json.AsObject(Json.Parse("\uFEFF{\"ok\":true}"));
+            check("v2.2.5 更新链接 HTTPS 白名单防恶意执行 + JSON BOM 跳过",
+                Updater.IsSafeReleaseUrl("https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v2.2.4") &&
+                !Updater.IsSafeReleaseUrl("http://github.com/wuerchenai-cell/ProxyPicker/releases") &&
+                !Updater.IsSafeReleaseUrl("file:///C:/evil.exe") &&
+                !Updater.IsSafeReleaseUrl("javascript:alert(1)") &&
+                !Updater.IsSafeReleaseUrl("cmd.exe") &&
+                !Updater.IsSafeReleaseUrl("https://evil.com/wuerchenai-cell/ProxyPicker/releases") &&
+                Json.Bool(bomObj, "ok", false),
                 "");
 
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");

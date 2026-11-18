@@ -29,9 +29,8 @@ namespace ProxyPicker.Core
             s = Regex.Replace(s, @"https?://[^\s""']+", "<链接已隐藏>");
 
             // IPv4 打码，但别把「ProxyPicker 1.1.0.0」这类版本号涂掉（复审 P2）。
-            // 豁免只认「版本号那个位置」：前面紧挨着 "ProxyPicker " 且后面就是行尾。
-            // 早先写成「整行含版本字样就放过」，将来日志里只要写一句
-            // 「ProxyPicker 已连上 45.33.12.7」，那个 IP 就会原样带出去。
+            // 豁免只认紧贴在「ProxyPicker」后面的一段四段数字版本号（即紧靠行中 ProxyPicker 的下一段数字）；
+            // 同行其它位置（如「ProxyPicker 已连上 45.33.12.7」）或后续再出现的 IPv4 均正常打码。
             string snapshot = s;
             s = Regex.Replace(snapshot, @"\b(?!127\.0\.0\.1)\d{1,3}(?:\.\d{1,3}){3}\b", m =>
             {

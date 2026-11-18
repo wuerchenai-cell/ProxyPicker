@@ -36,6 +36,25 @@ namespace ProxyPicker.Core
 
         public static void OverrideForTest(string slug) { _testSlug = slug; }
 
+        /// <summary>返回当前仓库官方 Releases 页面地址。</summary>
+        internal static string SafeReleasesPageUrl
+        {
+            get { return "https://github.com/" + RepoSlug + "/releases"; }
+        }
+
+        /// <summary>校验更新地址仅限官方 HTTPS GitHub 仓库路径，防 settings.json/响应被篡改后 Process.Start 触发任意执行。</summary>
+        internal static bool IsSafeReleaseUrl(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return false;
+            Uri uri;
+            if (!Uri.TryCreate(url.Trim(), UriKind.Absolute, out uri)) return false;
+            if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) return false;
+            if (!string.Equals(uri.Host, "github.com", StringComparison.OrdinalIgnoreCase)) return false;
+            string prefix = "/" + RepoSlug.Trim('/');
+            return uri.AbsolutePath.Equals(prefix, StringComparison.OrdinalIgnoreCase) ||
+                   uri.AbsolutePath.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase);
+        }
+
         const string ApiRoot = "https://api.github.com/repos/";
 
         public static bool Enabled
@@ -111,9 +130,7 @@ namespace ProxyPicker.Core
                     info.Ok = true;
                     info.Latest = Clean(tag);
                     string rawHtmlUrl = Json.Str(root, "html_url") ?? "";
-                    string safeReleases = "https://github.com/" + RepoSlug + "/releases";
-                    info.Url = rawHtmlUrl.StartsWith(safeReleases, StringComparison.OrdinalIgnoreCase)
-                        ? rawHtmlUrl : safeReleases;
+                    info.Url = IsSafeReleaseUrl(rawHtmlUrl) ? rawHtmlUrl.Trim() : SafeReleasesPageUrl;
                     string published = Json.Str(root, "published_at");
                     if (published.Length >= 10) info.Date = published.Substring(0, 10);
                     info.Newer = NewerThan(info.Latest, Current);

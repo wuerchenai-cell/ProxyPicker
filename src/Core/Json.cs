@@ -15,7 +15,8 @@ namespace ProxyPicker.Core
         public static object Parse(string text)
         {
             if (string.IsNullOrEmpty(text)) return null;
-            int i = 0;
+            int i = text[0] == '\uFEFF' ? 1 : 0;
+            if (i >= text.Length) return null;
             object value = ParseValue(text, ref i, 0);
             SkipWs(text, ref i);
             if (i != text.Length) throw new FormatException("JSON 末尾有多余内容 @" + i);

@@ -367,9 +367,9 @@ namespace ProxyPicker.Core
 
             if (nowTicks == 0) nowTicks = DateTime.UtcNow.Ticks;
             double seconds = !updateHistory || _prevTicks == 0 ? 0 : (nowTicks - _prevTicks) / (double)TimeSpan.TicksPerSecond;
-            if (seconds <= 0.05)
+            if (seconds <= 0.05 || seconds > 15.0)
             {
-                // 第一次采样没有参照，先给 0，避免出现一个巨大的假峰值
+                // 首次采样或电脑休眠唤醒后长中断（>15s）直接重建基线、不以超长秒数稀释网速
                 s.ProxyDown = s.ProxyUp = s.DirectDown = s.DirectUp = 0;
                 s.Seconds = 0;
             }
@@ -699,6 +699,14 @@ namespace ProxyPicker.Core
             var lateNext = AnalyzeConnections(lateConn, expectedSet, false, nowUtc, null, nowUtc.AddSeconds(2).Ticks, true);
             check("T18 新连接首见高累计字节当秒增量记 0，仅在第二拍按实增计算，防虚假尖峰",
                 lateFirst.ProxyDown == 0 && lateNext.ProxyDown >= 5000 && lateNext.ProxyDown < 10000);
+
+            // T19：电脑休眠唤醒间隔（>15 秒）重建基线而不以超长跨度除出虚假极小网速
+            Reset();
+            AnalyzeConnections(lateConn, expectedSet, false, nowUtc, null, nowUtc.Ticks, true);
+            ((Dictionary<string, object>)((List<object>)lateConn["connections"])[0])["download"] = 200105120.0;
+            var afterSleep = AnalyzeConnections(lateConn, expectedSet, false, nowUtc, null, nowUtc.AddHours(2).Ticks, true);
+            check("T19 休眠唤醒后长中断首轮自动重建基线（Seconds=0、速率清零而非稀释）",
+                afterSleep.Seconds == 0 && afterSleep.ProxyDown == 0);
             Reset();
 
             sb.AppendLine(pass + "/" + total + " 流量对账口径通过");

@@ -406,6 +406,25 @@ namespace ProxyPicker.UI
         {
             base.OnHandleCreated(e);
             try { int round = 2; DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int)); } catch { }
+            try
+            {
+                // 多屏混合 DPI 下，窗口初始落在非主屏时立即按所在屏幕重算缩放与字号，不等拖动后 WM_DPICHANGED
+                float winScale = Theme.DetectWindowScale(Handle);
+                if (Math.Abs(winScale - Theme.S) > 0.02f)
+                {
+                    float prevW = LogicalW, prevH = LogicalH;
+                    Theme.SetScale(winScale);
+                    BuildFonts();
+                    _search.Font = _fInput;
+                    _list.RefreshThemeAndFonts();
+                    _nodesPage.RefreshThemeAndFonts();
+                    _qualityPage.RefreshThemeAndFonts();
+                    if (WindowState == FormWindowState.Normal)
+                        ClientSize = ClampLogicalClientSize(prevW, prevH, Theme.S, Screen.FromControl(this).WorkingArea);
+                    LayoutChildren();
+                }
+            }
+            catch { }
             ApplyWindowIcons();
             try { if (!_timerRaised) { timeBeginPeriod(1); _timerRaised = true; } } catch { }
         }
@@ -3415,14 +3434,15 @@ namespace ProxyPicker.UI
                         result.Sw.NewOutbound + "（切后实测 " + result.BestDelay + "ms · 清理连接 " + result.Sw.ClosedConnections + " 条）");
                     string msg = BuildFailoverNotifyText(CleanEmoji(timedOutNode), CleanEmoji(result.Sw.NewOutbound), result.BestDelay);
                     _nodesPage.SetCurrentOutbound(result.Sw.NewOutbound, result.BestDelay, false, _state.ProxyActive);
-                    _nodesPage.SetLastFailoverSummary("最近自动切换 " + timeTag + "：" + msg);
+                    _nodesPage.SetLastFailoverSummary("最近自动切换 " + timeTag + "：" + msg + "（内核即时生效，若重启客户端重置将再次自动优选）");
                     _qualityPage.SetCurrentOutbound(result.Sw.NewOutbound);
                     SetStatus(msg, Theme.Ok);
-                    Toast("已自动切换节点", msg, Theme.Ok, 2);
+                    Toast("已自动切换节点", msg + "\n本次运行内核生效（若重启客户端回退将重新优选）", Theme.Ok, 2);
                     // 无论窗口在后台还是打开着，都主动弹系统托盘气泡通知用户，以免错过（用户要求）
                     if (TrayBalloon != null)
                         TrayBalloon("ProxyPicker 已自动切换节点", msg +
-                            (result.Sw.ClosedConnections > 0 ? ("\n已断开 " + result.Sw.ClosedConnections + " 条旧连接") : "\n切后实测可用"));
+                            (result.Sw.ClosedConnections > 0 ? ("\n已断开 " + result.Sw.ClosedConnections + " 条旧连接") : "\n切后实测可用") +
+                            "（内核生效，重启客户端后如回退将再次自动切换）");
                     if (_nodesLoadedOnce) _ = LoadNodesCatalogAsync();
                 }
                 else
@@ -3633,7 +3653,7 @@ namespace ProxyPicker.UI
                 float divX, l1, l2;
                 RectangleF spark, mini;
                 ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
-                float x = LogicalW < 660f ? 176f : 206f;
+                float x = LogicalW < 660f ? 174f : 186f;
                 float w = Math.Max(0f, l1 - x);
                 return new RectangleF(x, SummaryTop + 13, w, 18);
             }
@@ -4938,7 +4958,14 @@ namespace ProxyPicker.UI
                 {
                     try
                     {
-                        System.Diagnostics.Process.Start(_update.Url);
+                        string safeUrl = Updater.IsSafeReleaseUrl(_update.Url)
+                            ? _update.Url.Trim()
+                            : Updater.SafeReleasesPageUrl;
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                        {
+                            FileName = safeUrl,
+                            UseShellExecute = true
+                        });
                         Toast("已在浏览器打开", "下载后自己替换 exe 就行，程序不会去改自己", Theme.Accent, 2);
                     }
                     catch (Exception ex) { Toast("打不开浏览器", ex.Message, Theme.Warn, 1); }
@@ -5012,8 +5039,8 @@ namespace ProxyPicker.UI
             if (!string.IsNullOrEmpty(cached) && Updater.NewerThan(cached, Updater.Current))
             {
                 string url = Settings.CachedLatestUrl;
-                if (string.IsNullOrEmpty(url))
-                    url = "https://github.com/" + Updater.RepoSlug + "/releases";
+                if (!Updater.IsSafeReleaseUrl(url))
+                    url = Updater.SafeReleasesPageUrl;
                 _update = new Updater.Info
                 {
                     Ok = true, Newer = true,
@@ -5215,6 +5242,9 @@ namespace ProxyPicker.UI
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
+            _mismatchRect = RectangleF.Empty;
+            _delayRect = RectangleF.Empty;
+            _modeChipRect = RectangleF.Empty;
             LayoutChildren();
             Invalidate();
         }

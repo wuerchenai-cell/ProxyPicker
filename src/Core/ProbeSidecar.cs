@@ -643,7 +643,15 @@ namespace ProxyPicker.Core
                 hJob = CreateKillOnCloseJob();
                 if (hJob != IntPtr.Zero)
                 {
-                    try { AssignProcessToJobObject(hJob, proc.Handle); } catch { }
+                    try
+                    {
+                        if (!AssignProcessToJobObject(hJob, proc.Handle))
+                            AuditLog.Record("SIDECAR", "旁路探测子进程未能绑定 Job Object，异常退出后请留意是否有残留内核进程");
+                    }
+                    catch (Exception jex)
+                    {
+                        AuditLog.Record("SIDECAR", "旁路探测 Job Object 绑定异常：" + jex.Message);
+                    }
                 }
 
                 session = new SidecarSession

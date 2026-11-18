@@ -184,7 +184,8 @@ namespace ProxyPicker.Core
         }
 
         static readonly Regex RxJp = new Regex(@"(?<![A-Za-z])(?:JP|JPN|JAPAN|NRT|HND|KIX)(?![A-Za-z])", RegexOptions.IgnoreCase);
-        static readonly Regex RxUs = new Regex(@"(?<![A-Za-z])(?:US|USA|LAX|SJC|SEA|NYC|SFO|DFW|ORD)(?![A-Za-z])", RegexOptions.IgnoreCase);
+        static readonly Regex RxUs = new Regex(@"(?<![A-Za-z])(?:US|USA|LAX|SJC|NYC|SFO|DFW|ORD)(?![A-Za-z])", RegexOptions.IgnoreCase);
+        static readonly Regex RxSeaIata = new Regex(@"(?<![A-Za-z])SEA(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxSg = new Regex(@"(?<![A-Za-z])(?:SG|SGP|SIN)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxTw = new Regex(@"(?<![A-Za-z])(?:TW|TWN|TPE)(?![A-Za-z])", RegexOptions.IgnoreCase);
         static readonly Regex RxHk = new Regex(@"(?<![A-Za-z])(?:HK|HKG)(?![A-Za-z])", RegexOptions.IgnoreCase);
@@ -229,6 +230,8 @@ namespace ProxyPicker.Core
                 s.IndexOf("狮城", StringComparison.Ordinal) >= 0 ||
                 s.IndexOf("Singapore", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 RxSg.IsMatch(s)) return "SG";
+
+            if (RxSeaIata.IsMatch(s)) return "US";
 
             if (s.IndexOf("🇹🇼", StringComparison.Ordinal) >= 0 ||
                 s.IndexOf("台湾", StringComparison.Ordinal) >= 0 ||
@@ -834,6 +837,8 @@ namespace ProxyPicker.Core
                 ParseRegionFromNodeName("🇩🇪 法兰克福 01") == "DE" &&
                 ParseRegionFromNodeName("德国 FRA-BGP") == "DE" &&
                 ParseRegionFromNodeName("Frankfurt-01") == "DE" &&
+                ParseRegionFromNodeName("Singapore SEA-01") == "SG" &&
+                ParseRegionFromNodeName("SEA-01") == "US" &&
                 ParseRegionFromNodeName("🇬🇧 伦敦 UK1") == "GB" &&
                 ParseRegionFromNodeName("🇦🇺 悉尼 AU1") == "AU" &&
                 ParseRegionFromNodeName("Focus-VIP-01") == "" &&
