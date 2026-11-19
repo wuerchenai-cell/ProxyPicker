@@ -315,15 +315,16 @@ namespace ProxyPicker.UI
         {
             if (_exiting) return;      // DoEvents 期间重复点退出不能起第二个还原任务
             _exiting = true;
-            // 退出还原期间禁止再开保存任务：DoEvents 会继续分发点击，
+            // 退出还原期间禁止再开保存或菜单任务：DoEvents 会继续分发点击，
             // 以前用户还能点「保存」，任务等锁 → 还原放锁 → 抢在 Exit 前又推一次配置。
+            try { if (_menu != null) _menu.Enabled = false; } catch { }
             try { _form.BeginShutdown(); } catch { }
             bool restored = false;
             string why = "";
             try
             {
                 // 还原会等锁（最多 30 秒）+ 推配置（最多 15 秒），不能卡在 UI 线程一动不动。
-                // 放到后台执行，同时抽消息泵，让窗口还能重绘；最多等 35 秒。
+                // 放到后台执行，同时抽消息泵，让窗口还能重绘拖动；最多等 35 秒。
                 string backgroundWhy = "";
                 bool backgroundOk = false;
                 var task = System.Threading.Tasks.Task.Run(() =>
@@ -344,30 +345,40 @@ namespace ProxyPicker.UI
                 }
                 else why = "还原超时（可能仍在保存，规则未必已撤销）";
                 Core.AuditLog.Record("EXIT",
-                    restored ? "退出：已还原内核配置（规则块已移除）" : "退出：还原失败 · " + why);
+                    restored
+                        ? (string.IsNullOrEmpty(why) ? "退出：已还原内核配置（规则块已移除）" : "退出：" + why)
+                        : "退出：还原失败 · " + why);
             }
             catch (Exception ex) { restored = false; why = ex.Message; }
 
-            // 说清楚再退出：消息循环结束之后再弹窗不可靠。
-            // 保存中退出以前会静默跳过还原，用户以为已经还原——现在必须明确告知。
+            // 仅当控制面真的可疑失败（例如内核仍在跑却返 401/500、安全拦截或跨进程锁超时）才弹窗告知，
+            // 并且传入合法 owner、按用户直觉「点是=立即退出 / 点否=暂不退出」处理，绝不把人卡死在弹窗里。
             if (!restored)
             {
                 try
                 {
-                    // 独立审阅第二轮：超时不等于后台任务已停，强制结束进程可能把还原打断。
-                    // 给用户「继续运行再试」与「带残留退出」两个明确选择，不默认强杀。
-                    var choice = MessageBox.Show(
-                        "退出前没能把配置还原回去：" + why +
-                        "\n\n规则可能还留在内核里。\n\n" +
-                        "点「是」＝继续运行，稍后用托盘「还原上次保存前的配置」再试一次；\n" +
-                        "点「否」＝接受残留并退出（后台还原任务可能尚未结束）。",
-                        "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                    if (choice == DialogResult.Yes) { _exiting = false; _form.EndShutdown(); return; }
+                    IWin32Window owner = (_form != null && !_form.IsDisposed && _form.Visible && _form.IsHandleCreated)
+                        ? (IWin32Window)_form : null;
+                    string prompt = "退出前未完成配置还原：" + why +
+                        "\n\n如果代理客户端仍在运行，工具写入的分流规则可能还会留在内存中。\n\n" +
+                        "点「是」＝立即退出 ProxyPicker\n" +
+                        "点「否」＝暂不退出（留在后台，稍后可用托盘「还原上次保存前的配置」重试）";
+                    var choice = owner != null
+                        ? MessageBox.Show(owner, prompt, "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+                        : MessageBox.Show(prompt, "ProxyPicker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (choice != DialogResult.Yes)
+                    {
+                        _exiting = false;
+                        try { if (_menu != null) _menu.Enabled = true; } catch { }
+                        _form.EndShutdown();
+                        return;
+                    }
                 }
                 catch
                 {
-                    // 对话框弹出异常时不能静默强杀未结束的后台还原，保守留在托盘并记一次状态提示
+                    // 对话框弹出异常时不能静默强杀未结束的后台还原，保守留在托盘并恢复状态
                     _exiting = false;
+                    try { if (_menu != null) _menu.Enabled = true; } catch { }
                     _form.EndShutdown();
                     return;
                 }

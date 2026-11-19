@@ -703,13 +703,30 @@ namespace ProxyPicker.UI
             _shuttingDown = true;
             _batchDelayCancel = true;
             _batchQualityCancel = true;
-            try { Enabled = false; } catch { }
+            // 退出期间先停掉轮询与看守计时器，避免后台每秒抢通道锁拖慢还原；
+            // 仅禁用子控件操作而不把顶层窗体整窗 Enabled=false 冻成无响应假死。
+            try { _trafficTimer.Stop(); } catch { }
+            try { _watchTimer.Stop(); } catch { }
+            SetChildControlsEnabled(false);
+            SetStatus("正在清理内核规则并退出…", Theme.Dim);
         }
 
         public void EndShutdown()
         {
             _shuttingDown = false;
             try { Enabled = true; } catch { }
+            SetChildControlsEnabled(true);
+            try { _watchTimer.Start(); } catch { }
+            try { if (Visible) _trafficTimer.Start(); } catch { }
+            SetStatus("已取消退出，继续在后台守护分流", Theme.Dim);
+        }
+
+        void SetChildControlsEnabled(bool enabled)
+        {
+            try { if (_list != null) _list.Enabled = enabled; } catch { }
+            try { if (_search != null) _search.Enabled = enabled; } catch { }
+            try { if (_nodesPage != null) _nodesPage.Enabled = enabled; } catch { }
+            try { if (_qualityPage != null) _qualityPage.Enabled = enabled; } catch { }
         }
 
         /// <summary>点「×」时抛给 TrayContext：走「还原 + 退出」，不再静默收进托盘。</summary>
@@ -723,6 +740,7 @@ namespace ProxyPicker.UI
                 // 于是进程一直活着、托盘图标又可能被折叠，就变成「我明明关了它怎么还在跑」。
                 // 想后台看守请点标题栏的「—」。
                 e.Cancel = true;
+                if (_shuttingDown) return;
                 var handler = CloseRequested;
                 if (handler != null) { try { handler(); } catch { } return; }
                 RealExit();
@@ -739,7 +757,7 @@ namespace ProxyPicker.UI
             bool needRepair = false;
             try
             {
-                if (!UiAlive || _busy) return;
+                if (!UiAlive || _busy || _shuttingDown) return;
                 if (DirtyCount > 0 && _all.Count > 0)
                 {
                     SetStatus("有未保存改动；请先保存，再刷新", Theme.Warn);
@@ -879,7 +897,7 @@ namespace ProxyPicker.UI
 
         void WatchTick()
         {
-            if (!UiAlive) return;
+            if (!UiAlive || _shuttingDown) return;
             // 定期调用 Clash /proxies/{节点}/delay 测速；即使收进托盘也会按配置间隔持续巡检并在超时时弹窗提醒
             if (!_busy && !_delayTesting && ShouldRunPeriodicDelayTest())
                 _ = RunDelayTestAsync(false);
@@ -902,7 +920,7 @@ namespace ProxyPicker.UI
             bool owns = false;
             try
             {
-                if (!UiAlive || _busy || _watching) return;
+                if (!UiAlive || _busy || _watching || _shuttingDown) return;
                 // 名单读取失败时不要重试 3 次再弹「补回失败」（复审 P3）。
                 if (Profile.LastLoadFailed) return;
 
@@ -1632,7 +1650,7 @@ namespace ProxyPicker.UI
 
         void AllDirect()
         {
-            if (!UiAlive || _busy) return;
+            if (!UiAlive || _busy || _shuttingDown) return;
             if (_all.Count == 0) return;
             foreach (var r in _all) r.Proxy = false;
             _list.Invalidate(); ShowDirtyStatus();
@@ -1644,7 +1662,7 @@ namespace ProxyPicker.UI
         /// </summary>
         public void AllDirectPublic()
         {
-            if (!UiAlive) return;
+            if (!UiAlive || _shuttingDown) return;
             if (_help) CloseHelp();
             if (_page != 0) SwitchPage(0);
             if (_busy) { Toast("正在忙", "等当前操作结束再点「全部设为直连」", Theme.Warn, 1); return; }
@@ -1947,7 +1965,7 @@ namespace ProxyPicker.UI
             bool ownsPoll = false;
             try
             {
-                if (!UiAlive || !Visible || _polling) return;
+                if (!UiAlive || !Visible || _polling || _shuttingDown) return;
                 ownsPoll = true;
                 _polling = true;
                 // 流量采样与「刷新软件列表」互不阻塞；否则刷新期间曲线必然断一拍。
@@ -2120,7 +2138,7 @@ namespace ProxyPicker.UI
             bool ownsCheck = false;
             try
             {
-                if (!UiAlive || _busy || _checkingOutbound || _nodeActionBusy) return;
+                if (!UiAlive || _busy || _checkingOutbound || _nodeActionBusy || _shuttingDown) return;
                 ownsCheck = true;
                 _checkingOutbound = true;
                 int revision = _revision;
@@ -2374,14 +2392,14 @@ namespace ProxyPicker.UI
         /// <summary>托盘菜单与摘要胶囊共用的主动测速入口。</summary>
         public void TestDelayPublic()
         {
-            if (!UiAlive) return;
+            if (!UiAlive || _shuttingDown) return;
             if (InvokeRequired) { try { BeginInvoke(new Action(TestDelayPublic)); } catch { } return; }
             _ = RunDelayTestAsync(true);
         }
 
         async Task RunDelayTestAsync(bool manual)
         {
-            if (!UiAlive || _delayTesting || _nodeActionBusy || _batchDelayRunning || _failoverBusy) return;
+            if (!UiAlive || _delayTesting || _nodeActionBusy || _batchDelayRunning || _failoverBusy || _shuttingDown) return;
             string node = _state.Outbound;
             if (string.IsNullOrEmpty(node) || Profile.ClassifyExit(node) != Profile.ExitKind.Proxy)
             {
@@ -4572,6 +4590,14 @@ namespace ProxyPicker.UI
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
+            if (_shuttingDown)
+            {
+                if (e.Button == MouseButtons.Left && !_help && e.Y / Theme.S < TitleH && WindowState != FormWindowState.Maximized)
+                {
+                    ReleaseCapture(); SendMessage(Handle, WM_NCLBUTTONDOWN, new IntPtr(HTCAPTION), IntPtr.Zero);
+                }
+                return;
+            }
             var b = HitButton(e.Location);
             if (e.Button == MouseButtons.Right)
             {
@@ -5276,6 +5302,7 @@ namespace ProxyPicker.UI
 
         void OnFormKeyDown(object sender, KeyEventArgs e)
         {
+            if (_shuttingDown) return;
             if (_help)
             {
                 if (e.KeyCode == Keys.Escape || e.KeyCode == Keys.F1) { CloseHelp(); e.SuppressKeyPress = true; }

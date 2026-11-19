@@ -280,6 +280,18 @@ namespace ProxyPicker.Core
             return false;
         }
 
+        /// <summary>判断配置路径对应的客户端（非 Windows 服务外壳）当前是否有活跃进程。</summary>
+        internal static bool HasRunningClientProcess(string configPath)
+        {
+            if (string.IsNullOrEmpty(configPath)) return false;
+            try
+            {
+                string dir = Path.GetDirectoryName(configPath) ?? "";
+                return IsClientRunning(dir, RunningProcessNames());
+            }
+            catch { return false; }
+        }
+
         /// <summary>只做本机 TCP 连接探测，不发任何控制请求、不读取密钥。</summary>
         static bool ControllerListening(string controller)
         {

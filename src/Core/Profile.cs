@@ -1411,7 +1411,34 @@ namespace ProxyPicker.Core
                 }
                 catch { }
                 bool readOk;
-                var live = ReadRules(out readOk, cfg);   // 收尾批 P2-1：退出还原回读同源
+                var rulesRes = Mihomo.FetchJson("/rules", 10000, cfg);
+                var live = ParseRulesResponse(rulesRes, out readOk);   // 收尾批 P2-1：退出还原回读同源
+                // 若控制面完全不可达（且无任何 HTTP 401/500 错码或安全拦截），说明用户已先关闭 Clash：
+                // 本工具从不改磁盘订阅文件，内存规则与配置变更已随内核退出一同清除，
+                // 此时不应继续阻塞 PushConfig 超时，更不能假报「规则没改回来」卡死退出流程。
+                if (!readOk && Mihomo.ShouldSkipPushWhenControlOffline(
+                        rulesRes.Status, 0, Mihomo.LastSecurityError, null))
+                {
+                    var off = Mihomo.CheckControlOffline(cfg);
+                    if (off.OfflineConfirmed && Discovery.HasRunningClientProcess(cfg))
+                    {
+                        // 避开内核重启或刚点关闭时的短暂过渡窗口
+                        System.Threading.Thread.Sleep(250);
+                        off = Mihomo.CheckControlOffline(cfg);
+                    }
+                    if (off.OfflineConfirmed && Mihomo.ShouldSkipPushWhenControlOffline(
+                            rulesRes.Status, off.ObservedStatus, Mihomo.LastSecurityError, null))
+                    {
+                        Settings.ClearRestoreBaseline();
+                        message = "代理内核未运行（内存规则已随客户端关闭清除）";
+                        return true;
+                    }
+                    if (off.ObservedStatus == 200)
+                    {
+                        rulesRes = Mihomo.FetchJson("/rules", 10000, cfg);
+                        live = ParseRulesResponse(rulesRes, out readOk);
+                    }
+                }
                 // 复审 F-02：任一位置存在自家规则都算，不能只看首条；读失败必须按「有」处理。
                 bool fpmRestore = !string.IsNullOrEmpty(fpm) && !fpm.Equals("always", StringComparison.OrdinalIgnoreCase);
                 // 完全接管 + 明确保存过空名单时，段首 MATCH,DIRECT 也是本工具留下的，必须一并撤掉。
@@ -1703,14 +1730,13 @@ namespace ProxyPicker.Core
             return ReadRules(out ok, null);
         }
 
-        public static List<RuleInfo> ReadRules(out bool ok, string knownConfigPath)
+        internal static List<RuleInfo> ParseRulesResponse(Mihomo.ApiJsonResult res, out bool ok)
         {
             ok = false;
             var list = new List<RuleInfo>();
-            var obj = Mihomo.GetJson("/rules", 10000, knownConfigPath);
-            if (obj == null) return list;
+            if (res == null || !res.Ok || res.Data == null) return list;
             object raw;
-            if (!obj.TryGetValue("rules", out raw)) return list;
+            if (!res.Data.TryGetValue("rules", out raw)) return list;
             var arr = Json.AsArray(raw);
             if (arr == null) return list;
             foreach (var o in arr)
@@ -1726,6 +1752,11 @@ namespace ProxyPicker.Core
             }
             ok = true;
             return list;
+        }
+
+        public static List<RuleInfo> ReadRules(out bool ok, string knownConfigPath)
+        {
+            return ParseRulesResponse(Mihomo.FetchJson("/rules", 10000, knownConfigPath), out ok);
         }
 
         /// <summary>内核当前实际运行的节点（GLOBAL 当前选择）。</summary>

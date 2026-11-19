@@ -449,10 +449,19 @@ namespace ProxyPicker.Core
             if (r != null && (r.Status == 401 || r.Status == 403)) Forget();
         }
 
+        static string ResolveClientHint(string cfg)
+        {
+            if (string.IsNullOrEmpty(cfg)) return "";
+            string hint = Discovery.ClientForConfig(cfg);
+            if (!string.IsNullOrEmpty(hint)) return hint;
+            string guessed = Discovery.GuessClient(Path.GetDirectoryName(cfg));
+            return string.Equals(guessed, "mihomo", StringComparison.OrdinalIgnoreCase) ? "" : guessed;
+        }
+
         static ApiResult TryPipe(string method, string path, string body, int timeoutMs, Stopwatch sw,
                                  string knownConfigPath = null)
         {
-            if (_pipeName == null) _pipeName = FindPipe(Discovery.ClientForConfig(knownConfigPath));
+            if (_pipeName == null) _pipeName = FindPipe(ResolveClientHint(knownConfigPath));
             if (_pipeName == null && !string.IsNullOrEmpty(_pipeAmbiguous))
                 return new ApiResult { Error = _pipeAmbiguous, Ms = sw.ElapsedMilliseconds };
             if (_pipeName == null) return null;
@@ -1297,11 +1306,113 @@ namespace ProxyPicker.Core
             Ok = 3
         }
 
+        /// <summary>退出前离线判定返回值：确认无控制管道、无回环控制端口在听且无安全/鉴权阻止。</summary>
+        internal sealed class ControlOfflineReport
+        {
+            public bool OfflineConfirmed;
+            public int ObservedStatus;
+            public string Detail = "";
+        }
+
+        /// <summary>纯函数判定：仅当没有任何 HTTP 响应（如 401/500）且无安全拦截/多实例歧义时，才允许继续走内核离线收尾。</summary>
+        internal static bool ShouldSkipPushWhenControlOffline(
+            int rulesStatus,
+            int versionStatus,
+            string securityError,
+            string pipeAmbiguous)
+        {
+            return rulesStatus == 0 && versionStatus == 0 &&
+                   string.IsNullOrEmpty(securityError) &&
+                   string.IsNullOrEmpty(pipeAmbiguous);
+        }
+
+        /// <summary>清空陈旧通道缓存并实探一次当前管道与回环控制端口，核实代理内核是否确实已关闭。</summary>
+        public static ControlOfflineReport CheckControlOffline(string knownConfigPath = null)
+        {
+            var rep = new ControlOfflineReport();
+            lock (ChannelGate)
+            {
+                ClearChannelFieldsUnlocked();
+                EnsureBoundToCurrentConfig(knownConfigPath);
+                string cfg = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : _boundConfigPath;
+                string hint = ResolveClientHint(cfg);
+
+                string pipe = FindPipe(hint);
+                if (!string.IsNullOrEmpty(_pipeAmbiguous))
+                {
+                    rep.Detail = _pipeAmbiguous;
+                    return rep;
+                }
+                if (pipe != null)
+                {
+                    var sw = Stopwatch.StartNew();
+                    _pipeName = pipe;
+                    var viaPipe = TryPipe("GET", "/version", null, 2000, sw, cfg);
+                    if (viaPipe != null)
+                    {
+                        rep.ObservedStatus = viaPipe.Status;
+                        rep.Detail = viaPipe.Ok ? "控制管道仍在运行" : (!string.IsNullOrEmpty(viaPipe.Error) ? viaPipe.Error : ("HTTP " + viaPipe.Status));
+                        return rep;
+                    }
+                    if (!string.IsNullOrEmpty(_securityError))
+                    {
+                        rep.Detail = _securityError;
+                        return rep;
+                    }
+                }
+
+                // 若配置显式写了回环控制器且该端口此刻确有监听并回了 HTTP 响应（如 401/500），不算离线
+                if (!string.IsNullOrEmpty(cfg) && File.Exists(cfg))
+                {
+                    string sec, ctrl;
+                    Discovery.ReadController(cfg, out sec, out ctrl);
+                    string cfgEp, cfgReason;
+                    if (!string.IsNullOrEmpty(ctrl) && TryLoopbackEndpoint(ctrl, out cfgEp, out cfgReason))
+                    {
+                        var pv = ProbeVersion(cfgEp, null);
+                        if (pv != ProbeResult.Error)
+                        {
+                            rep.ObservedStatus = pv == ProbeResult.Unauthorized ? 401 : 200;
+                            rep.Detail = "显式控制端口仍有响应（" + pv + "）";
+                            return rep;
+                        }
+                    }
+                }
+
+                string ep = Endpoint(cfg);
+                if (!string.IsNullOrEmpty(_securityError))
+                {
+                    rep.Detail = _securityError;
+                    return rep;
+                }
+                if (!string.IsNullOrEmpty(_pipeAmbiguous))
+                {
+                    rep.Detail = _pipeAmbiguous;
+                    return rep;
+                }
+                if (ep != null)
+                {
+                    rep.ObservedStatus = 200;
+                    rep.Detail = "检测到活跃控制端口 " + ep;
+                    return rep;
+                }
+
+                rep.OfflineConfirmed = true;
+                rep.Detail = "无可用控制管道且无活跃控制端口";
+                return rep;
+            }
+        }
+
         static ProbeResult ProbeVersion(string ep, string secret)
         {
             var sw = Stopwatch.StartNew();
             try
             {
+                string host; int port; bool tableOk;
+                if (SplitHostPort(ep, out host, out port) &&
+                    !IsLoopbackPortListening(host, port, out tableOk) && tableOk)
+                    return ProbeResult.Error;
+
                 var req = (HttpWebRequest)WebRequest.Create("http://" + ep + "/version");
                 req.Method = "GET";
                 req.Timeout = 900;
@@ -1532,9 +1643,67 @@ namespace ProxyPicker.Core
             return kind == ListenerKind.Unknown ? 1500u : 10000u;
         }
 
+        /// <summary>预检本机 TCP 监听表，毫秒级跳过无进程监听的回环端口（避免 Windows loopback 未监听端口吃满 Connect 超时）。</summary>
+        internal static bool IsLoopbackPortListening(string host, int port, out bool tableAvailable)
+        {
+            tableAvailable = false;
+            if (port <= 0 || port > 65535) return false;
+            List<IPAddress> targets = LoopbackTargets(host);
+            if (targets.Count == 0) return false;
+
+            bool anyV4 = false, anyV6 = false;
+            foreach (var t in targets)
+            {
+                if (t.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) anyV4 = true;
+                else if (t.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6) anyV6 = true;
+            }
+
+            bool v4Ok = !anyV4, v6Ok = true;
+            int unusedPid;
+            if (anyV4)
+            {
+                if (ScanTcpTableAf(port, AF_INET, targets, false, out unusedPid, out v4Ok))
+                { tableAvailable = true; return true; }
+                bool v4WildOk;
+                if (ScanTcpTableAf(port, AF_INET, targets, true, out unusedPid, out v4WildOk))
+                { tableAvailable = true; return true; }
+                v4Ok = v4Ok && v4WildOk;
+            }
+
+            bool hasV6Stack = false;
+            try { hasV6Stack = System.Net.Sockets.Socket.OSSupportsIPv6; } catch { }
+            if (anyV6 || hasV6Stack)
+            {
+                v6Ok = false;
+                if (anyV6)
+                {
+                    if (ScanTcpTableAf(port, AF_INET6, targets, false, out unusedPid, out v6Ok))
+                    { tableAvailable = true; return true; }
+                }
+                else
+                {
+                    v6Ok = true;
+                }
+                bool v6WildOk;
+                if (ScanTcpTableAf(port, AF_INET6, targets, true, out unusedPid, out v6WildOk))
+                { tableAvailable = true; return true; }
+                v6Ok = v6Ok && v6WildOk;
+            }
+
+            tableAvailable = v4Ok && (v6Ok || !hasV6Stack);
+            return false;
+        }
+
         static bool TryFindListenerPidAf(int port, int af, List<IPAddress> targets, bool wildcard, out int pid)
         {
+            bool unusedTableOk;
+            return ScanTcpTableAf(port, af, targets, wildcard, out pid, out unusedTableOk);
+        }
+
+        static bool ScanTcpTableAf(int port, int af, List<IPAddress> targets, bool wildcard, out int pid, out bool tableOk)
+        {
             pid = 0;
+            tableOk = false;
             int rowSize = af == AF_INET ? 24 : 56;
             int portOff = af == AF_INET ? 8 : 20;
             int pidOff = af == AF_INET ? 20 : 52;
@@ -1544,11 +1713,12 @@ namespace ProxyPicker.Core
                 bool anyV4 = false;
                 foreach (var t in targets)
                     if (t.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork) anyV4 = true;
-                if (!anyV4) return false;
+                if (!anyV4) { tableOk = true; return false; }
             }
 
             int size = 0;
             uint rc = GetExtendedTcpTable(IntPtr.Zero, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
+            if (rc == 0) { tableOk = true; return false; }
             if (rc != ERROR_INSUFFICIENT_BUFFER || size <= 0) return false;
 
             // TCP 监听表在两次 P/Invoke 间可能扩容导致再次返回 ERROR_INSUFFICIENT_BUFFER，最多重试 3 轮
@@ -1562,6 +1732,7 @@ namespace ProxyPicker.Core
                     rc = GetExtendedTcpTable(buf, ref size, false, af, TCP_TABLE_OWNER_PID_LISTENER, 0);
                     if (rc == ERROR_INSUFFICIENT_BUFFER) continue;
                     if (rc != 0) return false;
+                    tableOk = true;
                     int count = Marshal.ReadInt32(buf);
                     if (count <= 0) return false;
                     int maxRows = (allocSize - 4) / rowSize;
@@ -1988,11 +2159,53 @@ namespace ProxyPicker.Core
                 th.IsBackground = true;
                 th.Start();
                 bool probed = ProbeMihomo("127.0.0.1:" + fakePort, true, null, "SELFTEST-SECRET");
-                fakeSrv.Stop();
-                th.Join(3000);
+                bool tblDead;
+                bool livePortListening = IsLoopbackPortListening("127.0.0.1", fakePort, out tblDead);
+                ControlOfflineReport off401 = null;
+                ControlOfflineReport offClosed = null;
+                var swOff = new Stopwatch();
+                bool savedSuppress = SuppressBindLog;
+                SuppressBindLog = true;
+                string tmpOffDir = Path.Combine(Path.GetTempPath(), "pp_offcheck_" + Guid.NewGuid().ToString("N").Substring(0, 8), "com.follow", "flclash");
+                try
+                {
+                    Directory.CreateDirectory(tmpOffDir);
+                    string tmpOffCfg = Path.Combine(tmpOffDir, "config.yaml");
+                    File.WriteAllText(tmpOffCfg, "external-controller: 127.0.0.1:" + fakePort + "\n", new UTF8Encoding(false));
+                    off401 = CheckControlOffline(tmpOffCfg);
+                    fakeSrv.Stop();
+                    th.Join(3000);
+                    swOff.Start();
+                    offClosed = CheckControlOffline(tmpOffCfg);
+                    swOff.Stop();
+                }
+                finally
+                {
+                    SuppressBindLog = savedSuppress;
+                    try { Directory.Delete(Path.GetDirectoryName(Path.GetDirectoryName(tmpOffDir)), true); } catch { }
+                    Forget();
+                }
+                var swDead = Stopwatch.StartNew();
+                bool deadPortListening = IsLoopbackPortListening("127.0.0.1", fakePort, out tblDead);
+                swDead.Stop();
                 check("v1.3.8 本地假服务回 401 也拿不到 Secret（身份核对先于带密钥请求）",
                     !probed && gotAuth == null,
                     gotAuth == null ? "" : "服务端收到了 Authorization 头");
+                check("v2.2.6 IsLoopbackPortListening 命中活跃端口并毫秒跳过已关闭端口",
+                    livePortListening && (!tblDead || (!deadPortListening && swDead.ElapsedMilliseconds < 150)),
+                    "live=" + livePortListening + " tbl=" + tblDead + " dead=" + deadPortListening + " ms=" + swDead.ElapsedMilliseconds);
+                check("v2.2.6 ShouldSkipPushWhenControlOffline 与 CheckControlOffline 区分离线与 401",
+                    ShouldSkipPushWhenControlOffline(0, 0, null, null) &&
+                    !ShouldSkipPushWhenControlOffline(401, 0, null, null) &&
+                    !ShouldSkipPushWhenControlOffline(0, 500, null, null) &&
+                    !ShouldSkipPushWhenControlOffline(0, 0, "已阻止发送密钥", null) &&
+                    !ShouldSkipPushWhenControlOffline(0, 0, null, "检测到 2 个 mihomo 控制管道") &&
+                    off401 != null && !off401.OfflineConfirmed && off401.ObservedStatus == 401 &&
+                    offClosed != null && offClosed.OfflineConfirmed && offClosed.ObservedStatus == 0 &&
+                    swOff.ElapsedMilliseconds < 250,
+                    "off401=" + (off401 == null ? "null" : (off401.OfflineConfirmed + "/" + off401.ObservedStatus)) +
+                    " offClosed=" + (offClosed == null ? "null" : (offClosed.OfflineConfirmed + "/" + offClosed.ObservedStatus)) +
+                    " offMs=" + swOff.ElapsedMilliseconds);
             }
             catch (Exception ex)
             {

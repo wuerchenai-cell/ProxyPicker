@@ -503,7 +503,7 @@ namespace ProxyPicker
                     string msg;
                     bool ok = Core.Profile.LeaveNoTrace(out msg);
                     File.WriteAllText(args[1],
-                        Core.Redactor.Apply("ok=" + ok + "\nmsg=" + (ok ? "已撤掉内核里的规则块（IPv6 也已恢复）" : msg)),
+                        Core.Redactor.Apply("ok=" + ok + "\nmsg=" + (ok ? (string.IsNullOrEmpty(msg) ? "已撤掉内核里的规则块（IPv6 也已恢复）" : msg) : msg)),
                         new System.Text.UTF8Encoding(false));
                     if (!ok) Environment.ExitCode = 1;
                 }

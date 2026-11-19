@@ -2,17 +2,17 @@
 
 只让「你勾选的软件」走代理 —— 一个给 Clash / mihomo 系客户端用的**按进程分流**小面板。
 
-单文件 exe，1,301,528 字节（约 1271 KB），不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
+单文件 exe，1,305,624 字节（约 1275 KB），不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
 
 [**下载最新版**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
 [直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
 [更新记录](CHANGELOG.md)
 
-> **最新版 v2.2.5**（2026-11-18）：在 `v2.2.4`（测速防误判与自动切换切后验真）基础上，完成两份独立多视角复审（WorkBuddy + Grok）全部实锤项的收口加固：
-> ① **更新安全与副屏 DPI 自适应**：`Updater` 新增 `IsSafeReleaseUrl()` 严格限定 `https://github.com/wuerchenai-cell/ProxyPicker` 白名单路径后再通过安全 `ProcessStartInfo` 拉起；窗体句柄创建阶段即通过 `Theme.DetectWindowScale()` 主动读取所在屏幕 DPI 缩放，副屏冷启动无需拖移即可清晰匹配比例。
-> ② **精确度、休眠恢复与可观测性收口**：拆分 `SEA` 与 `SG` 地区匹配消除 `Singapore SEA-01` 误判；`Traffic` 在系统休眠唤醒长中断（`> 15s`）首轮自动重建基线防速率畸变；`Json.Parse` 兼容 UTF-8 BOM；`Discovery` 增探便携配置子目录；`TryAutoFailoverAsync` 明确提示仅内核内存即时生效；`ProbeSidecar` 记录 Job 绑定异常审计并清理缩放交互热区缓存；
-> 离线自检 **294 项**（通用性 200 + 控制接口安全 50 + 流量对账 19 + 节点管理 7 + 网络质量与风控 13 + 零干扰侧车探测 5，全部 0 失败）。
-> 前版 v2.2.4–v1.4.0 已并入本版（详见 [CHANGELOG](CHANGELOG.md)）。
+> **最新版 v2.2.6**（2026-11-19）：彻底根治「先关闭 Clash，再关闭 ProxyPicker 时误报规则未改回并卡死」问题：
+> ① **毫秒级监听表预检 & 离线精准识别**：`Mihomo` 通过 `GetExtendedTcpTable` 毫秒跳过无监听回环端口，消除未监听端口串行超时阻塞；`LeaveNoTraceCore` 严格区分「代理内核已关闭（`Status == 0` 且无安全/鉴权错误）」与「内核运行中鉴权/推送失败」，因为本工具从未修改磁盘订阅文件，Clash 关闭后内存规则已随进程清除，此时直接清理恢复基线并秒级无弹窗退出。
+> ② **退出防假死与直觉交互**：`MainForm.BeginShutdown()` 立即停止流量与看守计时器、仅禁用子控件而不再整窗冻灰，彻底阻断退出期间后台抢锁；仅在内核确实运行但还原异常时带主窗体 `owner` 置前弹窗，并修正为符合直觉的「点『是』＝立即退出 / 点『否』＝暂不退出」。
+> 离线自检 **296 项**（通用性 200 + 控制接口安全 52 + 流量对账 19 + 节点管理 7 + 网络质量与风控 13 + 零干扰侧车探测 5，全部 0 失败）。
+> 前版 v2.2.5–v1.4.0 已并入本版（详见 [CHANGELOG](CHANGELOG.md)）。
 > 切换客户端后请等几秒或点一次右上角「↻ 刷新」：程序会立即重扫活跃客户端并切换控制通道。
 
 ![主界面](docs/img/main.png)
@@ -126,7 +126,7 @@ dotnet build src\ProxyPicker.csproj -c Release
 只读自检出口（不改任何配置）：
 
 ```bat
-ProxyPicker.exe --selftest 自检.txt     :: 通用 200 + 安全 50 + 流量 19 + 节点 7 + 风控 13 + 侧车 5（共 294 项）
+ProxyPicker.exe --selftest 自检.txt     :: 通用 200 + 安全 52 + 流量 19 + 节点 7 + 风控 13 + 侧车 5（共 296 项）
 ProxyPicker.exe --nodecheck 节点体检.txt :: 只读探测当前出口质量、地区、风控与 AI 预检（已脱敏）
 ProxyPicker.exe --delay 测速.txt        :: 只读检测当前出口策略链与真实节点延迟（已脱敏）
 ProxyPicker.exe --dryrun 配置.yaml 输出.yaml whitelist
