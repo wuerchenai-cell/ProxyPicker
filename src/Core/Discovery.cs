@@ -2959,6 +2959,31 @@ namespace ProxyPicker.Core
                 Json.Bool(bomObj, "ok", false),
                 "");
 
+            string failRed227 = Redactor.Apply(
+                "当前节点超时（2x专线-日本-4 (IPv6)），自动切至已验证备选节点：2x专线-日本-3 (高倍)（切后实测 109ms · 清理连接 39 条）\n" +
+                "复检原节点已恢复可用，免切换保留原连接：新加坡 VIP 01（82ms）\n" +
+                "自动切换未成功：美国西雅图 02 切换后实测仍超时（已尝试后续备选）\n" +
+                "异常修复：configPatched=False applyOk=True wrongClosed=1 wrongFailed=0 outbound=香港原生 03\n" +
+                "异常修复：configPatched=False applyOk=True wrongClosed=0 wrongFailed=0 outbound=DIRECT");
+            string redirTag, redirUrl, badTag, badUrl;
+            bool redirOk = Updater.TryParseRedirectRelease(
+                "https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v2.2.7", out redirTag, out redirUrl);
+            bool redirEvil = Updater.TryParseRedirectRelease(
+                "https://evil.com/wuerchenai-cell/ProxyPicker/releases/tag/v9.9.9", out badTag, out badUrl);
+            bool redirNoTag = Updater.TryParseRedirectRelease(
+                "https://github.com/wuerchenai-cell/ProxyPicker/releases", out badTag, out badUrl);
+            check("v2.2.7 全场景 FAILOVER/AUTOFIX 节点脱敏 + 更新 302 限流回退 + 瞬态子工具过滤",
+                failRed227.IndexOf("2x专线", StringComparison.Ordinal) < 0 &&
+                failRed227.IndexOf("新加坡 VIP", StringComparison.Ordinal) < 0 &&
+                failRed227.IndexOf("美国西雅图", StringComparison.Ordinal) < 0 &&
+                failRed227.IndexOf("香港原生", StringComparison.Ordinal) < 0 &&
+                failRed227.IndexOf("outbound=DIRECT", StringComparison.Ordinal) >= 0 &&
+                redirOk && redirTag == "2.2.7" &&
+                redirUrl == "https://github.com/wuerchenai-cell/ProxyPicker/releases/tag/v2.2.7" &&
+                !redirEvil && !redirNoTag &&
+                Catalog.IsNoise("rg.exe") && Catalog.IsNoise("codex-command-runner.exe") && !Catalog.IsNoise("codex.exe"),
+                "");
+
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();
         }

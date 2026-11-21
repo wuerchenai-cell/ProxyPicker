@@ -494,7 +494,9 @@ namespace ProxyPicker.Core
             "amdrssrcext.exe", "cncmd.exe", "crashpad_handler.exe", "appvshnotify.exe",
             "chsime.exe", "securityhealthsystray.exe", "startmenuexperiencehost.exe",
             "lockapp.exe", "betterleaks.exe", "defendersessionhelper.exe", "editor_sdk.exe",
-            "codex-code-mode-host.exe", "codex-computer-use-swift.exe", "crossdeviceresume.exe",
+            "codex-code-mode-host.exe", "codex-computer-use-swift.exe", "codex-command-runner.exe",
+            "rg.exe", "fd.exe", "fzf.exe", "openconsole.exe",
+            "crossdeviceresume.exe",
             "crossdeviceservice.exe", "desktopextension.exe", "appactions.exe",
             "coodesker-x64.exe", "regsvr32.exe", "rundll32.exe", "wscript.exe", "cscript.exe",
             "mshta.exe", "taskmgr.exe", "notepad.exe", "mspaint.exe", "snippingtool.exe",
@@ -537,6 +539,7 @@ namespace ProxyPicker.Core
             "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe",
             "language_server.exe", "language_server_linux", "electron.exe",
             "msedgewebview2.exe", "webviewhost.exe",
+            "rg.exe", "fd.exe", "esbuild.exe", "tsc.exe",
         };
 
         public static bool IsSharedRuntime(string exe)

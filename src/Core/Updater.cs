@@ -138,7 +138,12 @@ namespace ProxyPicker.Core
             }
             catch (WebException wex)
             {
-                info.Error = Describe(wex);
+                int code = ExtractAndCloseStatusCode(wex);
+                // 机场共享代理出口常命中 api.github.com 匿名 60 次/小时限流（403/429），
+                // 自动回退到网页 releases/latest 的 302 Location 头解析最新 tag（不消耗 API 配额且仍过白名单校验）。
+                if ((code == 403 || code == 429) && TryCheckViaReleasesRedirect(timeoutMs, info))
+                    return info;
+                info.Error = Describe(wex, code);
             }
             catch (Exception ex)
             {
@@ -147,20 +152,104 @@ namespace ProxyPicker.Core
             return info;
         }
 
+        /// <summary>解析 github.com/&lt;repo&gt;/releases/latest 的 3xx Location 响应头，提取经过白名单校验的版本 tag 与安全链接。</summary>
+        internal static bool TryParseRedirectRelease(string location, out string tag, out string safeUrl)
+        {
+            tag = "";
+            safeUrl = "";
+            if (string.IsNullOrWhiteSpace(location)) return false;
+            string loc = location.Trim();
+            if (loc.StartsWith("/", StringComparison.Ordinal))
+                loc = "https://github.com" + loc;
+            if (!IsSafeReleaseUrl(loc)) return false;
+
+            Uri uri;
+            if (!Uri.TryCreate(loc, UriKind.Absolute, out uri)) return false;
+            string tagPrefix = "/" + RepoSlug.Trim('/') + "/releases/tag/";
+            string path = uri.AbsolutePath ?? "";
+            if (!path.StartsWith(tagPrefix, StringComparison.OrdinalIgnoreCase)) return false;
+            string rawTag = path.Substring(tagPrefix.Length).Trim('/');
+            if (rawTag.Length == 0 || rawTag.IndexOf('/') >= 0) return false;
+            try { rawTag = Uri.UnescapeDataString(rawTag); } catch { }
+            string cleaned = Clean(rawTag);
+            if (cleaned.Length == 0) return false;
+
+            tag = cleaned;
+            safeUrl = "https://github.com" + path;
+            return true;
+        }
+
+        static bool TryCheckViaReleasesRedirect(int timeoutMs, Info info)
+        {
+            try
+            {
+                string latestUrl = SafeReleasesPageUrl + "/latest";
+                var req = (HttpWebRequest)WebRequest.Create(latestUrl);
+                req.Method = "HEAD";
+                req.Timeout = timeoutMs;
+                req.ReadWriteTimeout = timeoutMs;
+                req.UserAgent = "ProxyPicker/" + CurrentText;
+                req.KeepAlive = false;
+                req.AllowAutoRedirect = false;
+
+                string location = null;
+                try
+                {
+                    using (var resp = (HttpWebResponse)req.GetResponse())
+                    {
+                        int st = (int)resp.StatusCode;
+                        if (st >= 300 && st < 400) location = resp.Headers["Location"];
+                    }
+                }
+                catch (WebException wex)
+                {
+                    using (var errResp = wex.Response as HttpWebResponse)
+                    {
+                        if (errResp != null)
+                        {
+                            int st = (int)errResp.StatusCode;
+                            if (st >= 300 && st < 400) location = errResp.Headers["Location"];
+                        }
+                    }
+                }
+
+                string tag, safeUrl;
+                if (!TryParseRedirectRelease(location, out tag, out safeUrl)) return false;
+                info.Ok = true;
+                info.Latest = tag;
+                info.Url = safeUrl;
+                info.Newer = NewerThan(info.Latest, Current);
+                info.Error = "";
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static int ExtractAndCloseStatusCode(WebException wex)
+        {
+            if (wex == null) return 0;
+            try
+            {
+                using (var resp = wex.Response as HttpWebResponse)
+                {
+                    return resp != null ? (int)resp.StatusCode : 0;
+                }
+            }
+            catch { return 0; }
+        }
+
         /// <summary>
         /// 把失败翻成人话。用户手动点「检查更新」时会看到这一句，
         /// 所以别写「远程服务器返回错误: (403) 已禁止」这种只有开发者看得懂的原文。
         /// </summary>
-        static string Describe(WebException wex)
+        static string Describe(WebException wex, int code)
         {
             try
             {
-                var resp = wex.Response as HttpWebResponse;
-                if (resp != null)
+                if (code > 0)
                 {
-                    int code = (int)resp.StatusCode;
                     if (code == 404) return "仓库里还没有发布版本";
-                    if (code == 403) return "查询次数太多，明天再看";
+                    if (code == 403 || code == 429) return "查询次数太多，明天再看";
                     if (code >= 500) return "GitHub 暂时不可用";
                     return "服务器返回 " + code;
                 }

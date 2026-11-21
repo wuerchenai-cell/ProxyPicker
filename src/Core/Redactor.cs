@@ -63,10 +63,13 @@ namespace ProxyPicker.Core
             s = Regex.Replace(s, @"(?m)^group=(.*)$", m => "group=" + MaskName(m.Groups[1].Value));
             s = Regex.Replace(s, @"(?m)^outbound=(.*)$", m => "outbound=" + MaskExit(m.Groups[1].Value));
             s = Regex.Replace(s, @"(?m)^chain=(.*)$", m => "chain=" + MaskChain(m.Groups[1].Value));
-            // v1.5.0：隐藏 FAILOVER / 测速日志与节点检验记录中的真实节点名称，避免分享日志带出机场节点名。
-            s = Regex.Replace(s, @"(当前节点超时（)[^）\r\n]+(），自动切至备选低延迟节点：)[^\s（\r\n]+", "$1<节点名已隐藏>$2<节点名已隐藏>");
+            // v1.5.0 / v2.2.7：隐藏 FAILOVER / AUTOFIX / 测速日志与节点检验记录中的真实节点名称（含空格与括号），避免分享日志带出机场节点名。
+            s = Regex.Replace(s, @"(当前节点超时（).+?(），自动切至(?:已验证备选节点|备选低延迟节点)：)[^（\r\n]+", "$1<节点名已隐藏>$2<节点名已隐藏>");
+            s = Regex.Replace(s, @"(复检原节点已恢复可用，免切换保留原连接：)[^（\r\n]+", "$1<节点名已隐藏>");
+            s = Regex.Replace(s, @"(自动切换未成功：)[^\r\n]+?( 切换后实测仍超时)", "$1<节点名已隐藏>$2");
             s = Regex.Replace(s, @"(节点测速超时：)[^·\r\n]+", "$1<节点名已隐藏> ");
             s = Regex.Replace(s, @"(节点已恢复可用：)[^·\r\n]+", "$1<节点名已隐藏> ");
+            s = Regex.Replace(s, @"(?m)(\soutbound=)([^\r\n]+)$", m => m.Groups[1].Value + MaskExit(m.Groups[2].Value));
             // v1.3.7：--diag 里「策略组：X · 出口：Y · GLOBAL：Z」是组合行，
             // 以前只盖住独立的「节点：」行，组合行里的组名和节点名照旧带出去。
             // 只隐藏名字，保留 DIRECT / REJECT / 未找到 这类排查必需的状态词。

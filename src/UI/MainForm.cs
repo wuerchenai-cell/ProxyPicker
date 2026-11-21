@@ -1097,7 +1097,7 @@ namespace ProxyPicker.UI
             bool owns = false;
             try
             {
-                if (!UiAlive || _busy) return;
+                if (!UiAlive || _busy || _shuttingDown) return;
                 if (_modeChanged) return;   // 模式切换还没保存，任何自动补回都不能推新模式
                 if (Settings.RepairSuspended) return;   // 上次还原时名单没删掉，别自动接管回去
                 // 推送前最后确认一次意图：托盘还原会删掉名单文件，
@@ -1111,9 +1111,13 @@ namespace ProxyPicker.UI
                 var visible = VisibleExes();
                 var paths = PathMap();
                 var policies = PolicyMapFromRows();
-                var built = ComposeWithHelpers(exes, visible, paths, policies);
-                var res = await Task.Run(() => Profile.Apply(built, true));
-                if (!UiAlive) return;
+                List<Profile.Item> built = null;
+                var res = await Task.Run(() =>
+                {
+                    built = ComposeWithHelpers(exes, visible, paths, policies);
+                    return Profile.Apply(built, true);
+                });
+                if (!UiAlive || _shuttingDown) return;
                 if (!res.Ok)
                 {
                     // 评审 R2：Apply 返回「接管意图已撤销…」= 用户在托盘放过还原，
@@ -1192,20 +1196,8 @@ namespace ProxyPicker.UI
                 if (string.IsNullOrEmpty(r.Path) || string.IsNullOrEmpty(r.Exe)) continue;
                 if (!map.ContainsKey(r.Exe)) map[r.Exe] = r.Path;
             }
-            // 面板从没打开过时 _all 是空的（开机就缩在托盘）。这时不能只补进程名，
-            // 否则目录规则仍缺失、界面却报「已补回」——现扫一次拿路径（复审 F-09）。
-            if (map.Count == 0)
-            {
-                try
-                {
-                    foreach (var kv in Scanner.Scan())
-                    {
-                        if (kv.Value == null || string.IsNullOrEmpty(kv.Value.Path)) continue;
-                        if (!map.ContainsKey(kv.Key)) map[kv.Key] = kv.Value.Path;
-                    }
-                }
-                catch { }
-            }
+            // 仅收集 UI 线程内存快照；托盘冷启动 _all 为空时由后台 ComposeWithHelpers 复用 Scanner.Scan() 补齐，
+            // 避免在 UI 线程同步扫描全系统进程造成界面卡顿。
             return map;
         }
 
@@ -1225,9 +1217,11 @@ namespace ProxyPicker.UI
                                               Dictionary<string, string> policies)
         {
             var peers = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, Scanner.ProcInfo> scanned = null;
             try
             {
-                foreach (var kv in Scanner.Scan())
+                scanned = Scanner.Scan();
+                foreach (var kv in scanned)
                 {
                     var good = new List<string>();
                     foreach (var p in kv.Value.DirPeers)
@@ -1254,6 +1248,18 @@ namespace ProxyPicker.UI
                 }
             }
             catch { }   // 扫描失败退化为只写主 exe，不阻断保存
+
+            // 托盘未打开面板时 paths 为空：直接在后台线程复用本次 Scanner.Scan() 补全可执行文件路径
+            if ((paths == null || paths.Count == 0) && scanned != null && scanned.Count > 0)
+            {
+                var bgPaths = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kv in scanned)
+                {
+                    if (kv.Value == null || string.IsNullOrEmpty(kv.Value.Path)) continue;
+                    if (!bgPaths.ContainsKey(kv.Key)) bgPaths[kv.Key] = kv.Value.Path;
+                }
+                paths = bgPaths;
+            }
 
             // 整树覆盖：只对「能确定是这个软件自己的安装目录」生成目录规则。
             // 公共容器（Program Files / AppData / 桌面 / 下载）会被 AppGroup 拒掉，

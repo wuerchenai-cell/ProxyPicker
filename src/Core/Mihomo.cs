@@ -45,6 +45,7 @@ namespace ProxyPicker.Core
         static string _pipeTrustDetail;
         static string _pipeAmbiguous;     // 多个内核实例、无法绑定同一客户端时失败关闭（评审 R6-2）
         static string _boundConfigPath;   // 通道缓存绑定的服务配置路径；与 Discovery 当前选中不一致时整份 Forget（评审 P1-①）
+        static string _lastAuditedBoundPath;   // 上一次已绑定过的配置路径（不随 Forget 清空，避免断线重连同配置刷屏 BIND）
         static bool _endpointGuessed;     // 控制地址是「猜端口」得来的，没和目标内核建立可验证关联
 
         /// <summary>通道缓存是共享可变状态：流量轮询、看守、保存并发时，
@@ -383,9 +384,12 @@ namespace ProxyPicker.Core
                 if (!BindingStaleFor(current)) return;   // 双检：并发下只让一个线程真正改绑
                 Forget();
                 _boundConfigPath = current;
-                // 评审报告 §15（P3 可观测性）：真的改绑时留一行，路径由 AuditLog 统一脱敏。
-                // 切客户端后第一次保存若重新枚举失败，排障时能看出是缓存被清过。
-                if (!SuppressBindLog)
+                // 评审报告 §15（P3 可观测性）：仅在真正从一份配置切到另一份不同配置时留一行，
+                // 首次绑定或断线 Forget 后重连回同一配置不再重复刷屏 BIND。
+                bool switchedConfig = !string.IsNullOrEmpty(_lastAuditedBoundPath) &&
+                    !string.Equals(_lastAuditedBoundPath, current, StringComparison.OrdinalIgnoreCase);
+                _lastAuditedBoundPath = current;
+                if (switchedConfig && !SuppressBindLog)
                     AuditLog.Record("BIND", "通道缓存改绑到配置 " + (current ?? ""));
             }
         }

@@ -366,6 +366,7 @@ namespace ProxyPicker
             // 自检出口：用三份不同风格的配置验证「规则生成」是否通用。只读、不碰真机配置。
             if (args.Length >= 2 && args[0] == "--selftest")
             {
+                Core.AuditLog.SuppressForTest = true;
                 try
                 {
                     string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest()
@@ -377,6 +378,10 @@ namespace ProxyPicker
                 catch (Exception ex)
                 {
                     CliFailure(args[1], ex);
+                }
+                finally
+                {
+                    Core.AuditLog.SuppressForTest = false;
                 }
                 return;
             }

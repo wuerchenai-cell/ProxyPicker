@@ -22,6 +22,9 @@ namespace ProxyPicker.Core
         static readonly List<string> _recent = new List<string>();
         static readonly UTF8Encoding Utf8 = new UTF8Encoding(false);
 
+        /// <summary>--selftest 离线自检期间置为 true，避免把模拟数据与假端口测试记录写进用户真实 actions.log。</summary>
+        internal static volatile bool SuppressForTest;
+
         public static string FilePath
         {
             get { return Path.Combine(Paths.OwnDir, "actions.log"); }
@@ -30,6 +33,7 @@ namespace ProxyPicker.Core
         /// <summary>记一条。kind 用大写短词：REPAIR / FAIL / IPV6 / SAVE / WATCH。</summary>
         public static void Record(string kind, string text)
         {
+            if (SuppressForTest) return;
             string line = "[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] "
                           + (kind ?? "INFO") + " " + (text ?? "");
             // 记之前先脱敏：失败原因里常带本机路径和用户名，而这个账本是要给人看的
