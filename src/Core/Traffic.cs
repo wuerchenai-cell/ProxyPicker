@@ -24,7 +24,10 @@ namespace ProxyPicker.Core
         public sealed class Route
         {
             public bool Expected;        // 用户勾选策略：true = 应该走代理
-            public int Proxy;            // 实测走代理的连接数
+            public bool ExpectedStatic;  // true = 锁定走独立固定 IP（PP-STATIC-OUT）
+            public int Proxy;            // 实测走代理的连接数（含固定 IP 与普通代理）
+            public int StaticProxy;      // 实测经由 PP-STATIC-OUT 的连接数
+            public int OtherProxy;       // 实测走了非 PP-STATIC-OUT 普通代理的连接数
             public int Direct;           // 实测直连的连接数
             public int Unknown;          // chains 读不出来的连接数
             public int Rejected;         // 被规则 REJECT 的连接：既不是代理也不是直连
@@ -36,6 +39,7 @@ namespace ProxyPicker.Core
         {
             public string Exe = "";
             public bool Expected;
+            public bool StaticDrift;     // true = 预期走独立固定 IP，但实际走偏到普通机场或直连
             public int Proxy;
             public int Direct;
             public string Node = "";
@@ -105,7 +109,7 @@ namespace ProxyPicker.Core
                         bool bad;
                         TryVerdict(rt, out verdict, out bad);
                     }
-                    sb.AppendLine(kv.Key + "  预期 " + (rt.Expected ? "代理" : "直连")
+                    sb.AppendLine(kv.Key + "  预期 " + (rt.ExpectedStatic ? "独立固定IP" : (rt.Expected ? "代理" : "直连"))
                         + " · 实际 " + actual + " · " + verdict);
                 }
                 if (StaleIgnored > 0)
@@ -124,6 +128,16 @@ namespace ProxyPicker.Core
             int known = rt.Proxy + rt.Direct;
             if (known == 0 || rt.Unknown + rt.Rejected > known)
             { verdict = "链路未知"; return false; }
+            if (rt.ExpectedStatic)
+            {
+                int good = rt.StaticProxy;
+                int bad = rt.Direct + rt.OtherProxy;
+                if (good == bad)
+                { verdict = "样本不足，不下结论"; return false; }
+                mismatch = bad > good;
+                verdict = mismatch ? "固定IP通道偏离" : "正常";
+                return true;
+            }
             if (rt.Proxy == rt.Direct)
             { verdict = "样本不足，不下结论"; return false; }
             mismatch = (rt.Proxy > rt.Direct) != rt.Expected;
@@ -192,7 +206,9 @@ namespace ProxyPicker.Core
             catch { return false; }
         }
 
-        public static Sample Poll(ICollection<string> proxyExes, bool judgeMismatch = true, IList<Regex> proxyPathRegexes = null, string knownConfigPath = null)
+        public static Sample Poll(ICollection<string> proxyExes, bool judgeMismatch = true,
+                                  IList<Regex> proxyPathRegexes = null, string knownConfigPath = null,
+                                  ICollection<string> staticProxyExes = null, IList<Regex> staticPathRegexes = null)
         {
             var root = Mihomo.GetJson("/connections", 8000, knownConfigPath);
             if (root == null)
@@ -204,7 +220,8 @@ namespace ProxyPicker.Core
                     Error = "读不到连接表"
                 };
             }
-            return AnalyzeConnections(root, proxyExes, judgeMismatch, BaselineUtc, proxyPathRegexes, DateTime.UtcNow.Ticks, true);
+            return AnalyzeConnections(root, proxyExes, judgeMismatch, BaselineUtc, proxyPathRegexes,
+                DateTime.UtcNow.Ticks, true, staticProxyExes, staticPathRegexes);
         }
 
         /// <summary>
@@ -217,7 +234,9 @@ namespace ProxyPicker.Core
                                                   DateTime baseline,
                                                   IList<Regex> proxyPathRegexes = null,
                                                   long nowTicks = 0,
-                                                  bool updateHistory = true)
+                                                  bool updateHistory = true,
+                                                  ICollection<string> staticProxyExes = null,
+                                                  IList<Regex> staticPathRegexes = null)
         {
             var s = new Sample();
             s.Judged = judgeMismatch;
@@ -272,7 +291,19 @@ namespace ProxyPicker.Core
                     // 新出现在列表里的连接，upload/download 是其从建立起的全部历史累计；首见先记入基线、当秒增量记 0 防止虚假封顶尖峰。
                 }
 
-                bool expected = proxyExes != null && exe.Length > 0 && proxyExes.Contains(exe);
+                bool expectedStatic = staticProxyExes != null && exe.Length > 0 && staticProxyExes.Contains(exe);
+                if (!expectedStatic && staticPathRegexes != null && staticPathRegexes.Count > 0 && procPath.Length > 0)
+                {
+                    for (int i = 0; i < staticPathRegexes.Count; i++)
+                    {
+                        if (SafeRegexMatch(staticPathRegexes[i], procPath))
+                        {
+                            expectedStatic = true;
+                            break;
+                        }
+                    }
+                }
+                bool expected = expectedStatic || (proxyExes != null && exe.Length > 0 && proxyExes.Contains(exe));
                 if (!expected && proxyPathRegexes != null && proxyPathRegexes.Count > 0 && procPath.Length > 0)
                 {
                     for (int i = 0; i < proxyPathRegexes.Count; i++)
@@ -285,6 +316,7 @@ namespace ProxyPicker.Core
                     }
                 }
                 Chain chain = ChainOf(d);
+                bool viaStatic = chain == Chain.Proxy && HasStaticChain(d);
 
                 // 规则只对「新连接」生效：mihomo 不会给已经连上的连接重新匹配。
                 // 推送前建立的长连接（浏览器 WebSocket / 推送 / keep-alive）一直保持旧链路，
@@ -302,17 +334,20 @@ namespace ProxyPicker.Core
                     Route rt;
                     if (!s.Routes.TryGetValue(exe, out rt))
                     {
-                        rt = new Route { Expected = expected };
+                        rt = new Route { Expected = expected, ExpectedStatic = expectedStatic };
                         s.Routes[exe] = rt;
                     }
-                    else if (expected && !rt.Expected)
+                    else
                     {
                         // 同一进程先遇到缺 processPath 的条目、后遇到命中目录规则的条目时，升级预期。
-                        rt.Expected = true;
+                        if (expected && !rt.Expected) rt.Expected = true;
+                        if (expectedStatic && !rt.ExpectedStatic) rt.ExpectedStatic = true;
                     }
                     if (chain == Chain.Proxy)
                     {
                         rt.Proxy++;
+                        if (viaStatic) rt.StaticProxy++;
+                        else rt.OtherProxy++;
                         if (rt.Node.Length == 0) rt.Node = ChainNode(d);
                     }
                     else if (chain == Chain.Direct) rt.Direct++;
@@ -349,17 +384,25 @@ namespace ProxyPicker.Core
                     TryVerdict(kv.Value, out verdict, out bad);
                     if (!bad) continue;
                     var rt = kv.Value;
+                    bool staticDrift = rt.ExpectedStatic;
                     s.Mismatches.Add(new MismatchItem
                     {
                         Exe = kv.Key,
                         Expected = rt.Expected,
+                        StaticDrift = staticDrift,
                         Proxy = rt.Proxy,
                         Direct = rt.Direct,
                         Node = rt.Node,
-                        Reason = rt.Expected ? "勾了走代理，实测多数连接走直连" : "没勾选，实测多数连接走了代理",
-                        Action = rt.Expected
-                            ? "重新保存一次；若仍异常，确认客户端 find-process-mode 不是 off（strict 正常）"
-                            : "检查是否被目录规则或订阅规则接管，必要时取消该目录规则"
+                        Reason = staticDrift
+                            ? (rt.OtherProxy >= rt.Direct
+                                ? "已锁定走独立固定 IP，但实测走偏到了普通代理节点"
+                                : "已锁定走独立固定 IP，但实测多数连接走了直连")
+                            : (rt.Expected ? "勾了走代理，实测多数连接走直连" : "没勾选，实测多数连接走了代理"),
+                        Action = staticDrift
+                            ? "建议立即点「一键修复」断开偏离旧连接并重推固定 IP 规则"
+                            : (rt.Expected
+                                ? "重新保存一次；若仍异常，确认客户端 find-process-mode 不是 off（strict 正常）"
+                                : "检查是否被目录规则或订阅规则接管，必要时取消该目录规则")
                     });
                 }
                 s.Mismatch = s.Mismatches.Count;
@@ -419,6 +462,24 @@ namespace ProxyPicker.Core
             if (kind == Profile.ExitKind.Direct) return Chain.Direct;
             if (kind == Profile.ExitKind.Rejected) return Chain.Rejected;
             return Chain.Proxy;
+        }
+
+        /// <summary>判断连接真实链路是否经由独立固定 IP 托管节点 PP-STATIC-OUT。</summary>
+        internal static bool HasStaticChain(Dictionary<string, object> conn)
+        {
+            if (ChainOf(conn) != Chain.Proxy) return false;
+            object raw;
+            if (conn == null || !conn.TryGetValue("chains", out raw)) return false;
+            var chains = Json.AsArray(raw);
+            if (chains == null) return false;
+            for (int i = 0; i < chains.Count; i++)
+            {
+                string item = chains[i] as string;
+                if (!string.IsNullOrEmpty(item) &&
+                    item.Equals(StaticProxy.NodeName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>代理链路最外层那段通常是节点名，给诊断信息显示「实际走到哪」。</summary>

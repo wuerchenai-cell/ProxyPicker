@@ -127,11 +127,16 @@ namespace ProxyPicker.UI
         {
             public readonly HashSet<string> Exes;
             public readonly List<Regex> PathRegexes;
+            public readonly HashSet<string> StaticExes;
+            public readonly List<Regex> StaticPathRegexes;
 
-            public EffectiveRules(HashSet<string> exes, List<Regex> pathRegexes)
+            public EffectiveRules(HashSet<string> exes, List<Regex> pathRegexes,
+                                  HashSet<string> staticExes = null, List<Regex> staticPathRegexes = null)
             {
                 Exes = exes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 PathRegexes = pathRegexes ?? new List<Regex>();
+                StaticExes = staticExes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                StaticPathRegexes = staticPathRegexes ?? new List<Regex>();
             }
         }
 
@@ -147,6 +152,13 @@ namespace ProxyPicker.UI
         Profile.KernelState _state = new Profile.KernelState();
         List<AppRow> _all = new List<AppRow>();
         HashSet<string> _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, string> _savedPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        bool _autoRefreshing;
+        int _staticDelayMs = -1;
+        bool _staticTimedOut;
+        bool _staticChecking;
+        DateTime _lastStaticAlertAt = DateTime.MinValue;
+        bool _staticWarnShown;
         string _status = "正在准备…";
         Color _statusColor;
 
@@ -282,7 +294,8 @@ namespace ProxyPicker.UI
             }
             catch (Exception ex) { CrashLog.Write(ex, "读取窗口图标失败"); }
 
-            _list.Toggled += (s, e) => ShowDirtyStatus();
+            _list.Toggled += (s, e) => { SyncStaticUiBanner(); ShowDirtyStatus(); };
+            _list.StaticToggled += (s, row) => { SyncStaticUiBanner(); ShowDirtyStatus(); };
             _list.Reordered += OnReordered;
             _list.ContextRequested += (s, e) => ShowRowMenu(e.Row, e.Screen);
             _list.Overlay = (g, area) => { if (_toasts.Any) _toasts.Render(g, area); };
@@ -331,6 +344,8 @@ namespace ProxyPicker.UI
                     ? (c > 0 ? "已开启：当前节点超时自动切备选池最低延迟节点（切完必通知）" : "已开启自动切换（请勾选至少 1 个备选节点）")
                     : "已关闭节点超时自动切换", on && c == 0 ? Theme.Warn : Theme.Accent);
             };
+            _nodesPage.ConfigureStaticProxyRequested += () => OpenStaticProxyDialog();
+            SyncStaticUiBanner();
 
             _qualityPage.Visible = false;
             _qualityPage.Overlay = (g, area) => { if (_toasts.Any) _toasts.Render(g, area); };
@@ -652,8 +667,28 @@ namespace ProxyPicker.UI
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Show(); BringToFront(); Activate();
             if (_page == 0 && !_help) _search.Focus();
-            if (_all.Count == 0 || (DateTime.UtcNow - _lastLoad).TotalSeconds > 20) RefreshAsync();
-            else { ShowDirtyStatus(); RebuildVisible(false); }
+            if (_all.Count == 0)
+            {
+                RefreshAsync();
+            }
+            else if (DirtyCount == 0 && (DateTime.UtcNow - _lastLoad).TotalSeconds > 8)
+            {
+                RefreshAsync();
+            }
+            else
+            {
+                // 有未保存草稿或刚刷新过：走无损增量进程刷新，实时同步新打开/关闭的软件而不冲掉未保存勾选
+                ShowDirtyStatus();
+                RebuildVisible(false);
+                _ = AutoRefreshRunningProcessesAsync();
+                if (_page == 1 || _page == 2) _ = LoadNodesCatalogAsync();
+            }
+            SyncStaticUiBanner();
+            if (!_staticWarnShown && !string.IsNullOrEmpty(StaticProxy.LastLoadWarning))
+            {
+                _staticWarnShown = true;
+                Toast("独立固定 IP 需要重新配置", StaticProxy.LastLoadWarning, Theme.Warn, 3);
+            }
             _trafficTimer.Start();
             _sparkStamp = _watch.ElapsedMilliseconds;   // 重新显示时把旧历史平移到当下，曲线接着走而不是凭空消失
             RebaseTrail(_sparkStamp);
@@ -788,7 +823,10 @@ namespace ProxyPicker.UI
                 // 是两套，手动模式下再拖一次就会把之前的手动顺序覆盖掉。
                 ApplySort(_all, Settings.Current.SortMode);
                 _savedProxy = new HashSet<string>(_all.Where(r => r.Proxy).Select(r => r.Exe), StringComparer.OrdinalIgnoreCase);
+                _savedPolicies = SnapshotSavedPoliciesFromRows();
                 _list.SavedProxy = _savedProxy;
+                _list.SavedPolicies = _savedPolicies;
+                SyncStaticUiBanner();
                 if (_savedProxy.Count > 0)
                 {
                     var savedSnap = new List<string>(_savedProxy);
@@ -947,7 +985,7 @@ namespace ProxyPicker.UI
                 // 只比主 exe 会得出「已生效」，实际登录请求仍然直连（实测就是登录失败）。
                 var visibleForAudit = VisibleExes();
                 var pathsForAudit = PathMap();
-                var auditPolicies = PolicyMapFromRows();
+                var auditPolicies = _all.Count > 0 ? PolicyMapFromRows() : Profile.LoadPolicyMap();
                 var wantedItems = await Task.Run(() => ComposeWithHelpers(exes, visibleForAudit, pathsForAudit, auditPolicies));
                 var wantedAll = wantedItems.Select(i => i.IsPathRule ? i.PathRegex : i.Exe).ToList();
                 var audit = await Task.Run(() => Guard.Audit(wantedAll, auditPolicies, watchCfg));
@@ -1110,7 +1148,7 @@ namespace ProxyPicker.UI
 
                 var visible = VisibleExes();
                 var paths = PathMap();
-                var policies = PolicyMapFromRows();
+                var policies = _all.Count > 0 ? PolicyMapFromRows() : Profile.LoadPolicyMap();
                 List<Profile.Item> built = null;
                 var res = await Task.Run(() =>
                 {
@@ -1265,22 +1303,59 @@ namespace ProxyPicker.UI
             // 公共容器（Program Files / AppData / 桌面 / 下载）会被 AppGroup 拒掉，
             // 不会因为勾了一个软件把整台机器的程序都代理走。
             List<string> roots = null;
+            Dictionary<string, string> rootPolicies = null;
             try
             {
                 if (paths != null && !Profile.PathRulesRejected && AppGroup.KernelSupportsPathRules())
                 {
                     var chosen = new List<string>();
+                    var byRoot = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
                     foreach (var exe in proxy)
                     {
                         string path;
-                        if (paths.TryGetValue(exe, out path)) chosen.Add(path);
+                        if (!paths.TryGetValue(exe, out path) || string.IsNullOrEmpty(path)) continue;
+                        chosen.Add(path);
+                        string normExe = Profile.Normalize(exe);
+                        string pol = "PP-FIXED";
+                        if (policies != null)
+                        {
+                            string custom;
+                            if (policies.TryGetValue(normExe, out custom) && !string.IsNullOrEmpty(custom)) pol = custom;
+                        }
+                        var singleRoot = AppGroup.Roots(new[] { path });
+                        foreach (var r in singleRoot)
+                        {
+                            HashSet<string> polSet;
+                            if (!byRoot.TryGetValue(r, out polSet))
+                            {
+                                polSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                byRoot[r] = polSet;
+                            }
+                            polSet.Add(pol);
+                        }
                     }
-                    roots = AppGroup.Roots(chosen);
+                    var candidateRoots = AppGroup.Roots(chosen);
+                    roots = new List<string>();
+                    rootPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var r in candidateRoots)
+                    {
+                        HashSet<string> polSet;
+                        if (byRoot.TryGetValue(r, out polSet) && polSet.Count > 1)
+                        {
+                            // 同一安装目录下有多个软件绑定了不同通道（如高速 vs 固定IP）：保守跳过整树目录规则，仅走精确进程名防误伤
+                            continue;
+                        }
+                        roots.Add(r);
+                        if (polSet != null && polSet.Count == 1)
+                        {
+                            foreach (var pOnly in polSet) rootPolicies[r] = pOnly;
+                        }
+                    }
                 }
             }
-            catch { roots = null; }
+            catch { roots = null; rootPolicies = null; }
 
-            var items = Profile.Compose(proxy, null, peers, roots, policies);
+            var items = Profile.Compose(proxy, null, peers, roots, policies, rootPolicies);
 
             // 登录窗口例外：ChatGPT 桌面版这类 MSIX 应用把 OAuth / 人机验证放进共享的
             // WebView2 运行时（msedgewebview2.exe），它不在软件目录里、也不在用户勾选名单里。
@@ -1311,28 +1386,59 @@ namespace ProxyPicker.UI
         {
             var eff = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var rxList = new List<Regex>();
+            var staticEff = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var staticRxList = new List<Regex>();
+            bool staticOn = StaticProxy.IsEnabledAndValid;
             if (items != null)
             {
                 foreach (var it in items)
                 {
                     if (it == null) continue;
+                    bool isStatic = staticOn && StaticProxy.IsStaticPolicy(it.Policy);
                     if (it.IsPathRule)
                     {
                         string pat = !string.IsNullOrEmpty(it.PathRegex) ? it.PathRegex : it.Exe;
                         if (string.IsNullOrEmpty(pat)) continue;
                         try
                         {
-                            rxList.Add(new Regex(pat, RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(50)));
+                            var rx = new Regex(pat, RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(50));
+                            rxList.Add(rx);
+                            if (isStatic) staticRxList.Add(rx);
                         }
                         catch { }
                     }
                     else if (!string.IsNullOrEmpty(it.Exe))
                     {
-                        eff.Add(Profile.Normalize(it.Exe));
+                        string norm = Profile.Normalize(it.Exe);
+                        eff.Add(norm);
+                        if (isStatic) staticEff.Add(norm);
                     }
                 }
             }
-            _effective = new EffectiveRules(eff, rxList);
+            _effective = new EffectiveRules(eff, rxList, staticEff, staticRxList);
+        }
+
+        static string NormPolicyKey(string p)
+        {
+            string t = (p ?? "").Trim();
+            if (t.Length == 0 || t.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)) return "PP-FIXED";
+            return t;
+        }
+
+        Dictionary<string, string> SnapshotSavedPoliciesFromRows()
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in _all)
+                if (r.Proxy) map[r.Exe] = NormPolicyKey(r.Policy);
+            return map;
+        }
+
+        bool IsRowPolicyChanged(AppRow r)
+        {
+            if (r == null || !r.Proxy || !_savedProxy.Contains(r.Exe)) return false;
+            string savedPol;
+            _savedPolicies.TryGetValue(r.Exe, out savedPol);
+            return !string.Equals(NormPolicyKey(r.Policy), NormPolicyKey(savedPol), StringComparison.OrdinalIgnoreCase);
         }
 
         Dictionary<string, string> PolicyMapFromRows()
@@ -1435,6 +1541,7 @@ namespace ProxyPicker.UI
                 int n = 0;
                 foreach (var exe in now) if (!_savedProxy.Contains(exe)) n++;
                 foreach (var exe in _savedProxy) if (!now.Contains(exe)) n++;
+                foreach (var r in _all) if (IsRowPolicyChanged(r)) n++;
                 return n;
             }
         }
@@ -1445,7 +1552,7 @@ namespace ProxyPicker.UI
             foreach (var r in _all)
             {
                 bool saved = _savedProxy.Contains(r.Exe);
-                if (r.Proxy != saved) changed.Add(r.Name);
+                if (r.Proxy != saved || IsRowPolicyChanged(r)) changed.Add(r.Name);
             }
             // 订阅兼容模式下「取消勾选」只是不再强制走代理，流量仍按订阅规则走。
             // 用户很容易理解成「关掉就直连」，然后在 IP 检测页反复开关都没变化。
@@ -1520,15 +1627,18 @@ namespace ProxyPicker.UI
                 SetStatus("正在保存并更新分流…", Theme.Dim);
                 var proxy = _all.Where(r => r.Proxy).Select(r => r.Exe).ToList();
                 var now = new HashSet<string>(proxy, StringComparer.OrdinalIgnoreCase);
+                var policyChanged = _all.Where(r => IsRowPolicyChanged(r)).Select(r => r.Exe);
                 var changed = now.Where(x => !_savedProxy.Contains(x))
-                    .Concat(_savedProxy.Where(x => !now.Contains(x))).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    .Concat(_savedProxy.Where(x => !now.Contains(x)))
+                    .Concat(policyChanged)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
                 // 只切换了分流模式、名单没动时，受影响的软件同样要重连：
                 // 白名单→订阅兼容（或反向）会改变未勾选软件的路由语义，旧连接不会自己重匹配。
                 if (modeChanged)
                     foreach (var exe in now) if (!changed.Contains(exe)) changed.Add(exe);
                 var visible = VisibleExes();
                 var paths = PathMap();
-                var policies = PolicyMapFromRows();
+                var policies = _all.Count > 0 ? PolicyMapFromRows() : Profile.LoadPolicyMap();
                 List<Profile.Item> builtItems = null;
                 var pack = await Task.Run(() => Profile.WithApplyLock(() =>
                 {
@@ -1565,7 +1675,10 @@ namespace ProxyPicker.UI
                 if (pack.Apply.Pushed && !pack.Apply.PersistFailed)
                 {
                     _savedProxy = now;
+                    _savedPolicies = SnapshotSavedPoliciesFromRows();
                     _list.SavedProxy = now;
+                    _list.SavedPolicies = _savedPolicies;
+                    SyncStaticUiBanner();
                 }
                 if (pack.Apply.Ok)
                 {
@@ -1585,6 +1698,8 @@ namespace ProxyPicker.UI
                     {
                         if (r.Proxy && !r.Known) Settings.Touch(r.Exe);
                         r.Known = r.Proxy;
+                        // 已保存改为直连的软件清空残留策略（如原 PP-STATIC-OUT），防止日后重新勾选时幽灵复发
+                        if (!r.Proxy) r.Policy = "";
                     }
                     _state.Applied = true; _state.RuleCount = pack.Apply.RuleCount;
                     _state.Policy = pack.Apply.Policy;
@@ -1732,7 +1847,7 @@ namespace ProxyPicker.UI
             });
         }
 
-        void RebuildVisible(bool animate)
+        void RebuildVisible(bool animate, bool preserveScroll = false)
         {
             string q = (_search.Text ?? "").Trim();
             IEnumerable<AppRow> src;
@@ -1758,7 +1873,7 @@ namespace ProxyPicker.UI
 
             var rows = src.Where(r => !Settings.HiddenOf(r.Exe) || r.Proxy).ToList();
             ApplySort(rows, Settings.Current.SortMode);
-            _list.SetRows(rows, animate);
+            _list.SetRows(rows, animate, preserveScroll);
             Invalidate();
         }
 
@@ -1872,9 +1987,27 @@ namespace ProxyPicker.UI
                 if (_busy) return;
                 row.Proxy = !row.Proxy;
                 _list.Invalidate();
+                SyncStaticUiBanner();
                 ShowDirtyStatus();
             };
             menu.Items.Add(toggle);
+
+            if (StaticProxy.IsEnabledAndValid && row.Proxy)
+            {
+                var cfgSp = StaticProxy.Current;
+                var toggleStatic = new ToolStripMenuItem(row.IsStatic
+                    ? "切回普通高速代理"
+                    : ("锁定走「" + cfgSp.DisplayLabel + "」（固定IP）"));
+                toggleStatic.Click += (s, e) =>
+                {
+                    if (_busy) return;
+                    row.Policy = row.IsStatic ? "PP-FIXED" : StaticProxy.NodeName;
+                    _list.Invalidate();
+                    SyncStaticUiBanner();
+                    ShowDirtyStatus();
+                };
+                menu.Items.Add(toggleStatic);
+            }
 
             var only = new ToolStripMenuItem("只代理这一个");
             only.Click += (s, e) =>
@@ -1975,8 +2108,11 @@ namespace ProxyPicker.UI
                 ownsPoll = true;
                 _polling = true;
                 // 流量采样与「刷新软件列表」互不阻塞；否则刷新期间曲线必然断一拍。
-                // 每十次采样顺手检查出口（约 10 秒），两个请求各自防重入。
-                if (++_outTick % 10 == 0) CheckOutbound();
+                // 每 5 秒在应用页无感增量刷新运行中进程（不丢弃未保存勾选），每 10 秒检查出口。
+                int tick = ++_outTick;
+                if (tick % 5 == 0 && _page == 0 && !_help && !_busy && !_shuttingDown)
+                    _ = AutoRefreshRunningProcessesAsync();
+                if (tick % 10 == 0) CheckOutbound();
                 // 「预期」用真正推给内核的名单（含派生规则），不是界面上勾了几个。
                 // 首次保存前还没有下发记录，才退回界面勾选。
                 var effective = _effective;
@@ -1985,12 +2121,14 @@ namespace ProxyPicker.UI
                     ? effective.Exes
                     : new HashSet<string>(_all.Where(r => r.Proxy).Select(r => Profile.Normalize(r.Exe)), StringComparer.OrdinalIgnoreCase);
                 var pathRegexes = effective != null && effective.PathRegexes.Count > 0 ? effective.PathRegexes : null;
+                var staticSet = effective != null && effective.StaticExes.Count > 0 ? effective.StaticExes : null;
+                var staticPathRegexes = effective != null && effective.StaticPathRegexes.Count > 0 ? effective.StaticPathRegexes : null;
                 // 只有「代理白名单 + 内核处于 rule 模式」下预期出口才明确：
                 // 全局模式下所有流量走 GLOBAL，订阅兼容里未勾选走订阅规则，均不能判成分流异常。
                 bool wasTrafficOk = _traffic != null && _traffic.Ok;
                 bool isRule = _state.ConfigOk && Profile.IsRuleMode(_state.Mode);
                 string cfgForTraffic = Paths.ClashYaml;
-                var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly && isRule, pathRegexes, cfgForTraffic));
+                var s = await Task.Run(() => Traffic.Poll(set, !Settings.PatchOnly && isRule, pathRegexes, cfgForTraffic, staticSet, staticPathRegexes));
                 if (!UiAlive || !Visible) return;
                 _traffic = s;
                 if (s.Ok) ApplyCoverage(s);
@@ -2471,6 +2609,7 @@ namespace ProxyPicker.UI
                         SetStatus("当前节点「" + CleanEmoji(node) + "」延迟 " + res.DelayMs + " ms", Theme.Ok);
                         Toast("测速正常", CleanEmoji(node) + " · " + res.DelayMs + " ms", Theme.Accent, 2);
                     }
+                    if (StaticProxy.IsEnabledAndValid) _ = CheckStaticProxyHealthAsync(manual);
                     return;
                 }
 
@@ -4772,7 +4911,7 @@ namespace ProxyPicker.UI
                 }
                 var visible = VisibleExes();
                 var paths = PathMap();
-                var policies = PolicyMapFromRows();
+                var policies = _all.Count > 0 ? PolicyMapFromRows() : Profile.LoadPolicyMap();
                 List<Profile.Item> builtItems = null;
 
                 var outcome = await Task.Run(() => Profile.WithApplyLock(() =>
@@ -4817,7 +4956,10 @@ namespace ProxyPicker.UI
                     if (hadRowsLoaded)
                     {
                         _savedProxy = new HashSet<string>(proxy, StringComparer.OrdinalIgnoreCase);
+                        _savedPolicies = SnapshotSavedPoliciesFromRows();
                         _list.SavedProxy = _savedProxy;
+                        _list.SavedPolicies = _savedPolicies;
+                        SyncStaticUiBanner();
                     }
                 }
 
@@ -5176,11 +5318,14 @@ namespace ProxyPicker.UI
             if (intentCleared)
             {
                 _savedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                _savedPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                 // 独立审阅第二轮：派生名单（含目录正则）也要一起清。以前还原后还留着
                 // 上一次接管的「预期代理名单」，流量采样会拿旧预期去比新直连，误报分流异常。
                 SetEffectiveProxy(null);
                 _list.SavedProxy = _savedProxy;
-                foreach (var r in _all) { r.Proxy = false; r.Known = false; }
+                _list.SavedPolicies = _savedPolicies;
+                foreach (var r in _all) { r.Proxy = false; r.Known = false; r.Policy = ""; }
+                SyncStaticUiBanner();
                 _modeChanged = false;
                 _mismatch = 0;
                 _mismatchItems = new List<Traffic.MismatchItem>();
@@ -5195,6 +5340,256 @@ namespace ProxyPicker.UI
             if (_busy) { _pendingRefresh = true; return; }
             RebuildVisible(true);
             RefreshAsync();
+        }
+
+        // ---------------------------------------------------------------- 无损自动刷新与独立固定 IP 管理
+
+        /// <summary>
+        /// 无损合并后台进程扫描结果：只更新 Running / Path / 同名冲突并增量发现新启动的用户软件，
+        /// 100% 保留用户尚未保存的勾选与固定 IP 策略草稿。返回 true 表示列表发生了可见变化。
+        /// </summary>
+        internal static bool MergeScannedProcesses(List<AppRow> rows, Dictionary<string, Scanner.ProcInfo> procs)
+        {
+            if (rows == null || procs == null) return false;
+            bool changed = false;
+            var byExe = new Dictionary<string, AppRow>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in rows)
+                if (r != null && !string.IsNullOrEmpty(r.Exe)) byExe[r.Exe] = r;
+
+            foreach (var r in rows)
+            {
+                if (r == null || string.IsNullOrEmpty(r.Exe)) continue;
+                Scanner.ProcInfo info;
+                int nextRunning = procs.TryGetValue(r.Exe, out info) && info != null ? info.Count : 0;
+                if (r.Running != nextRunning)
+                {
+                    r.Running = nextRunning;
+                    changed = true;
+                }
+                if (info != null)
+                {
+                    if (string.IsNullOrEmpty(r.Path) && !string.IsNullOrEmpty(info.Path))
+                        r.Path = info.Path;
+                    r.NameConflict = info.NameConflict;
+                    if (info.AllPaths != null && info.AllPaths.Count > 0)
+                        r.AllPaths = new List<string>(info.AllPaths);
+                }
+            }
+
+            foreach (var kv in procs)
+            {
+                if (byExe.ContainsKey(kv.Key)) continue;
+                var info = kv.Value;
+                if (info == null || !Catalog.IsUserApp(kv.Key, info.Path)) continue;
+                var added = new AppRow
+                {
+                    Exe = kv.Key,
+                    Name = Catalog.DisplayName(kv.Key),
+                    Description = Catalog.Description(kv.Key),
+                    NameConflict = info.NameConflict,
+                    AllPaths = info.AllPaths != null ? new List<string>(info.AllPaths) : new List<string>(),
+                    Path = info.Path ?? "",
+                    Running = info.Count,
+                    Proxy = false,
+                    Known = false,
+                    Policy = "",
+                    Common = Catalog.IsCommon(kv.Key) || Settings.UsageOf(kv.Key) > 0 || Settings.IsCustomExe(kv.Key),
+                    Anim = 0f,
+                    Usage = Settings.UsageOf(kv.Key),
+                    LastUsed = Settings.LastUsedOf(kv.Key)
+                };
+                rows.Add(added);
+                byExe[kv.Key] = added;
+                changed = true;
+            }
+            return changed;
+        }
+
+        async Task AutoRefreshRunningProcessesAsync()
+        {
+            if (!UiAlive || !Visible || _busy || _autoRefreshing || _shuttingDown || _all.Count == 0 || _list.IsInteracting) return;
+            _autoRefreshing = true;
+            int rev = _revision;
+            try
+            {
+                var procs = await Task.Run(() => Scanner.Scan());
+                if (!UiAlive || !Visible || _busy || _shuttingDown || rev != _revision || _list.IsInteracting) return;
+                if (MergeScannedProcesses(_all, procs))
+                {
+                    ApplySort(_all, Settings.Current.SortMode);
+                    RebuildVisible(false, true);
+                }
+            }
+            catch { }
+            finally
+            {
+                _autoRefreshing = false;
+            }
+        }
+
+        void SyncStaticUiBanner()
+        {
+            var cfg = StaticProxy.Current;
+            bool active = cfg.IsActive();
+            int boundCount = _all.Count(r => r.Proxy && r.IsStatic);
+            _list.StaticProxyEnabled = active;
+            _nodesPage.SetStaticProxyState(
+                active,
+                cfg.DisplayLabel,
+                cfg.LastVerifiedSummary,
+                boundCount,
+                _staticDelayMs,
+                _staticTimedOut);
+            _list.Invalidate();
+        }
+
+        void OpenStaticProxyDialog()
+        {
+            if (!UiAlive || _busy) return;
+            var current = StaticProxy.Current;
+            var nodes = _nodesPage.SnapshotConcreteNodes().Select(n => n.Name).ToList();
+            if (nodes.Count == 0 && _state.ConfigOk)
+            {
+                try
+                {
+                    var cat = NodeManager.LoadCatalog(Paths.ClashYaml);
+                    if (cat != null && cat.Ok && cat.Nodes != null)
+                        nodes = cat.Nodes.Where(n => !n.IsGroup && !ProbeSidecar.IsInformationalNodeName(n.Name))
+                                         .Select(n => n.Name).ToList();
+                }
+                catch { }
+            }
+            var appChoices = _all.Select(r => new StaticProxyDialog.AppChoice
+            {
+                Exe = r.Exe,
+                Name = r.Name,
+                Proxy = r.Proxy,
+                IsStatic = r.IsStatic,
+                Running = r.Running > 0
+            }).ToList();
+
+            using (var dlg = new StaticProxyDialog(current, nodes, appChoices, Paths.ClashYaml))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK || dlg.ResultConfig == null) return;
+
+                string saveErr;
+                if (!StaticProxy.Save(dlg.ResultConfig, out saveErr))
+                {
+                    Toast("保存独立固定 IP 失败", saveErr, Theme.Danger, 3);
+                    return;
+                }
+
+                _staticDelayMs = -1;
+                _staticTimedOut = false;
+
+                if (dlg.Outcome == StaticProxyDialog.DialogOutcome.SavedAndEnabled)
+                {
+                    var selected = dlg.SelectedStaticExes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    int boundCount = 0;
+                    foreach (var r in _all)
+                    {
+                        if (selected.Contains(r.Exe))
+                        {
+                            // 在弹窗里专门勾选走独立固定 IP 的软件：自动开启代理并锁定到 PP-STATIC-OUT
+                            r.Proxy = true;
+                            r.Anim = 1f;
+                            r.Policy = StaticProxy.NodeName;
+                            boundCount++;
+                        }
+                        else if (r.IsStatic)
+                        {
+                            // 在弹窗里取消了独立 IP 勾选：切回普通高速代理，不改变其代理开关
+                            r.Policy = "PP-FIXED";
+                        }
+                    }
+                    SyncStaticUiBanner();
+                    RebuildVisible(false);
+                    AuditLog.Record("STATIC", "已启用独立固定 IP（hopMode=" + dlg.ResultConfig.HopMode + "，指定软件=" + boundCount + "）");
+                    if (boundCount > 0)
+                    {
+                        Toast("已启用独立固定 IP（" + boundCount + " 个软件已锁定）",
+                            "其余已代理软件继续走原高速节点，未选软件直连；正在更新内核…", Theme.Ok, 3);
+                    }
+                    else
+                    {
+                        Toast("已启用独立固定 IP",
+                            "可在「1. 分流」软件旁一键点切「高速 / 固定IP」，或再次打开此处集中勾选", Theme.Ok, 3);
+                    }
+                    if (_state.ConfigOk && (boundCount > 0 || Profile.HasSavedIntent || _all.Any(r => r.Proxy)))
+                        SaveAsync();
+                }
+                else if (dlg.Outcome == StaticProxyDialog.DialogOutcome.DisabledToDirect ||
+                         dlg.Outcome == StaticProxyDialog.DialogOutcome.DisabledToDefaultProxy)
+                {
+                    bool toDirect = dlg.Outcome == StaticProxyDialog.DialogOutcome.DisabledToDirect;
+                    foreach (var r in _all)
+                    {
+                        if (!r.IsStatic) continue;
+                        if (toDirect) { r.Proxy = false; r.Policy = ""; r.Anim = 0f; }
+                        else { r.Policy = "PP-FIXED"; }
+                    }
+                    SyncStaticUiBanner();
+                    RebuildVisible(false);
+                    AuditLog.Record("STATIC", "已停用独立固定 IP（受影响软件处理：" + (toDirect ? "改为直连" : "切回高速代理") + "）");
+                    Toast("已停用独立固定 IP",
+                        toDirect ? "原绑定固定 IP 的软件已安全改为直连，正在更新内核…" : "原绑定固定 IP 的软件已切回高速代理，正在更新内核…",
+                        Theme.Warn, 3);
+                    if (_state.ConfigOk && (Profile.HasSavedIntent || _all.Any(r => r.Proxy))) SaveAsync();
+                }
+            }
+        }
+
+        async Task CheckStaticProxyHealthAsync(bool manual)
+        {
+            if (!UiAlive || _staticChecking || _shuttingDown) return;
+            var cfg = StaticProxy.Current;
+            if (!cfg.IsActive()) return;
+            // 仅当确实有软件绑定固定 IP 或用户主动点击测速时探测，节省静态节点请求
+            int boundCount = _all.Count(r => r.Proxy && r.IsStatic);
+            if (!manual && boundCount == 0) return;
+
+            _staticChecking = true;
+            try
+            {
+                string cfgPath = Paths.ClashYaml;
+                var res = await Task.Run(() => Profile.MeasureDelayConfirmed(StaticProxy.NodeName, null, 7000, cfgPath));
+                if (!UiAlive || res.KernelUnreachable) return;
+                if (res.Ok)
+                {
+                    bool wasDown = _staticTimedOut;
+                    _staticDelayMs = res.DelayMs;
+                    _staticTimedOut = false;
+                    SyncStaticUiBanner();
+                    if (wasDown)
+                    {
+                        AuditLog.Record("STATIC", "独立固定 IP 已恢复可用 · " + res.DelayMs + " ms");
+                        Toast("独立固定 IP 已恢复", cfg.DisplayLabel + " · " + res.DelayMs + " ms", Theme.Ok, 2);
+                    }
+                }
+                else if (res.TimedOut)
+                {
+                    // 严格遵循宁断不漂（Fail-Closed）：绝不自动把固定 IP 软件漂移到普通共享节点
+                    _staticDelayMs = -1;
+                    _staticTimedOut = true;
+                    SyncStaticUiBanner();
+                    bool alertDue = manual || (DateTime.UtcNow - _lastStaticAlertAt).TotalSeconds >= 120;
+                    if (alertDue)
+                    {
+                        _lastStaticAlertAt = DateTime.UtcNow;
+                        AuditLog.Record("STATIC", "独立固定 IP 不可达（已锁定防漂移）：" + (res.Error ?? "超时"));
+                        Toast("独立固定 IP 不可达（已锁定防漂移）",
+                            "为防止 IP 暴露，已阻断漂移到普通节点；请检查前置跳板或续费静态 IP",
+                            Theme.Danger, 3);
+                        if (!Visible && TrayBalloon != null)
+                            TrayBalloon("独立固定 IP 不可达（已锁定防漂移）", "请检查前置节点或静态 IP 状态");
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                _staticChecking = false;
+            }
         }
 
         public string DiagnosticsText() { return DiagnosticsText(_traffic); }

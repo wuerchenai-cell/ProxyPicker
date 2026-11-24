@@ -778,6 +778,7 @@ namespace ProxyPicker.Core
                 !n.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase) &&
                 !n.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) &&
                 !n.Equals("REJECT", StringComparison.OrdinalIgnoreCase) &&
+                !StaticProxy.IsManagedName(n) &&
                 n.IndexOfAny(new char[] { ',', '#', '\n', '\r', '\'', '"' }) < 0);
             foreach (var n in names)
                 if (n.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)) { reused = true; return n; }
@@ -1071,7 +1072,7 @@ namespace ProxyPicker.Core
         /// v1.3.8：替代原来的 LastIndexOf(']')，它既会把未闭合的输入当合法，
         /// 也会被值里的 ']' 带偏。
         /// </summary>
-        static int FindFlowClose(string s)
+        internal static int FindFlowClose(string s)
         {
             if (string.IsNullOrEmpty(s)) return -1;
             char quote = '\0';

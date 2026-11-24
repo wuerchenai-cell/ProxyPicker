@@ -371,7 +371,8 @@ namespace ProxyPicker
                 {
                     string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest()
                                   + Core.Traffic.SelfTest() + Core.NodeManager.SelfTest()
-                                  + Core.NodeQuality.SelfTest() + Core.ProbeSidecar.SelfTest();
+                                  + Core.NodeQuality.SelfTest() + Core.ProbeSidecar.SelfTest()
+                                  + Core.StaticProxy.SelfTest();
                     System.IO.File.WriteAllText(args[1], result, new System.Text.UTF8Encoding(false));
                     if (result.Contains("FAIL  ")) Environment.ExitCode = 1;
                 }

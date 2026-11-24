@@ -21,8 +21,10 @@ namespace ProxyPicker.UI
         public int Running;
         public bool Proxy;
         public bool Known;
-        /// <summary>名单里手改的策略（DIRECT / 某个组名）；空 = 没写过。保存时要原样带回去。</summary>
+        /// <summary>名单里手改的策略（DIRECT / 某个组名 / PP-STATIC-OUT）；空 = 没写过。保存时要原样带回去。</summary>
         public string Policy = "";
+        /// <summary>是否锁定使用独立固定 IP（PP-STATIC-OUT）。</summary>
+        public bool IsStatic { get { return Core.StaticProxy.IsStaticPolicy(Policy); } }
         public bool Common;
         public float Anim;
         public int Usage;
@@ -98,6 +100,7 @@ namespace ProxyPicker.UI
         Point _pointer;
 
         public event EventHandler Toggled;
+        public event EventHandler<AppRow> StaticToggled;
         public event EventHandler<ReorderEventArgs> Reordered;
         public event EventHandler<RowEventArgs> ContextRequested;
 
@@ -109,6 +112,12 @@ namespace ProxyPicker.UI
 
         /// <summary>已保存的代理名单；用来给「改了但没保存」的行加标记。</summary>
         public HashSet<string> SavedProxy = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>已保存的软件策略映射（exe -> policy），用来识别仅切换「高速 ↔ 固定IP」产生的未保存改动。</summary>
+        public Dictionary<string, string> SavedPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>独立固定 IP 总开关是否启用；关闭时列表内不渲染任何多余胶囊，保持极简。</summary>
+        public bool StaticProxyEnabled;
 
         public AppList()
         {
@@ -123,8 +132,36 @@ namespace ProxyPicker.UI
             _tip.ReshowDelay = 120;
         }
 
-        public void SetRows(List<AppRow> rows, bool animate = true)
+        /// <summary>用户是否正在按住鼠标或拖动排序（自动刷新期间严禁打断）。</summary>
+        public bool IsInteracting { get { return _pressed || _drag; } }
+
+        internal float CurrentScrollOffset { get { return _offset; } }
+
+        internal void SetScrollForTest(float offset)
         {
+            _offset = Math.Max(0f, Math.Min(MaxOffset, offset));
+            _scrollTarget = _offset;
+        }
+
+        public void SetRows(List<AppRow> rows, bool animate = true, bool preserveScroll = false)
+        {
+            if (preserveScroll)
+            {
+                float savedOffset = _offset;
+                float savedTarget = _scrollTarget;
+                string selExe = (_sel >= 0 && _sel < _rows.Count) ? _rows[_sel].Exe : null;
+                _rows.Clear();
+                _rows.AddRange(rows);
+                float max = MaxOffset;
+                _offset = Math.Max(0f, Math.Min(max, savedOffset));
+                _scrollTarget = Math.Max(0f, Math.Min(max, savedTarget));
+                _sel = !string.IsNullOrEmpty(selExe)
+                    ? _rows.FindIndex(r => string.Equals(r.Exe, selExe, StringComparison.OrdinalIgnoreCase))
+                    : -1;
+                _enter = 1f;
+                Invalidate();
+                return;
+            }
             _pressed = false;
             _pressIdx = -1;
             _dragExe = null;
@@ -332,6 +369,29 @@ namespace ProxyPicker.UI
             return Color.FromArgb((int)(255 * a), c);
         }
 
+        static string NormPolicy(string p)
+        {
+            string t = (p ?? "").Trim();
+            if (t.Length == 0 || t.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)) return "PP-FIXED";
+            return t;
+        }
+
+        bool IsRowDirty(AppRow r)
+        {
+            bool saved = SavedProxy.Contains(r.Exe);
+            if (r.Proxy != saved) return true;
+            if (!r.Proxy) return false;
+            string savedPol;
+            SavedPolicies.TryGetValue(r.Exe, out savedPol);
+            return !string.Equals(NormPolicy(r.Policy), NormPolicy(savedPol), StringComparison.OrdinalIgnoreCase);
+        }
+
+        RectangleF StaticPillRect(RectangleF row, bool isStatic)
+        {
+            float w = isStatic ? 66f : 48f;
+            return new RectangleF(row.Right - 24f - w, row.Y + 26.5f, w, 20f);
+        }
+
         void DrawRow(Graphics g, AppRow r, int index, RectangleF row)
         {
             // 入场：整体淡入 + 轻微上移，越靠下的行稍晚一点
@@ -344,9 +404,12 @@ namespace ProxyPicker.UI
                 row = new RectangleF(row.X, row.Y + (1f - t) * 7f, row.Width, row.Height);
             }
 
+            bool dirty = IsRowDirty(r);
+            bool showStaticPill = StaticProxyEnabled && r.Proxy;
             if (r.Proxy)
             {
-                Color baseBg = Theme.Blend(Theme.Card, Theme.AccentSoft, 0.62f * r.Anim);
+                Color tint = (showStaticPill && r.IsStatic) ? Theme.OkSoft : Theme.AccentSoft;
+                Color baseBg = Theme.Blend(Theme.Card, tint, 0.62f * r.Anim);
                 using (var b = new SolidBrush(Alpha(baseBg, enterA)))
                 using (var p = Theme.RoundRect(row, 8f))
                     g.FillPath(b, p);
@@ -358,16 +421,16 @@ namespace ProxyPicker.UI
                 using (var p = Theme.RoundRect(row, 8f))
                     g.FillPath(b, p);
             }
-            if (r.Proxy)
+            if (dirty)
             {
-                var bar = new RectangleF(row.X + 3, row.Y + (RowH - 18) / 2f, 3f, 18f);
-                Theme.Fill(g, Alpha(Theme.Accent, enterA), bar, 1.5f);
-            }
-            else if (r.Proxy != SavedProxy.Contains(r.Exe))
-            {
-                // 改过但还没保存：琥珀色标记，避免「点了却没生效」的困惑
+                // 改过但还没保存（含切换高速/固定IP）：琥珀色标记，避免「点了却没生效」的困惑
                 var bar = new RectangleF(row.X + 3, row.Y + (RowH - 18) / 2f, 3f, 18f);
                 Theme.Fill(g, Alpha(Theme.Warn, enterA), bar, 1.5f);
+            }
+            else if (r.Proxy)
+            {
+                var bar = new RectangleF(row.X + 3, row.Y + (RowH - 18) / 2f, 3f, 18f);
+                Theme.Fill(g, Alpha((showStaticPill && r.IsStatic) ? Theme.Ok : Theme.Accent, enterA), bar, 1.5f);
             }
 
             var sw = new RectangleF(row.X + 12, row.Y + (RowH - 23) / 2f, 42, 23);
@@ -393,11 +456,35 @@ namespace ProxyPicker.UI
                     new RectangleF(row.Right - (blind ? 58 : 46), row.Y + 8, blind ? 56 : 38, 17), Draw.Right);
             }
 
-            var subRect = new RectangleF(x, row.Y + 29, row.Width - (x - row.X) - 30, 17);
+            float subRightReserve = showStaticPill ? (r.IsStatic ? 96f : 78f) : 30f;
+            var subRect = new RectangleF(x, row.Y + 29, Math.Max(40f, row.Width - (x - row.X) - subRightReserve), 17);
             string sub = !string.IsNullOrEmpty(r.Description) ? r.Description
                        : !string.IsNullOrEmpty(r.Alias) ? r.Alias
                        : r.Exe;
             Draw.Text(g, sub, _fSub, Alpha(Theme.Dim, enterA), subRect);
+
+            if (showStaticPill)
+            {
+                var pill = StaticPillRect(row, r.IsStatic);
+                if (r.IsStatic)
+                {
+                    Theme.Fill(g, Alpha(Theme.OkSoft, enterA), pill, 9f);
+                    Theme.Stroke(g, Alpha(Theme.Ok, 0.72f * enterA), pill, 9f);
+                    // 矢量小锁（无 Emoji 乱码风险）
+                    float lx = pill.X + 7f, ly = pill.Y + 5f;
+                    using (var pen = new Pen(Alpha(Theme.Ok, enterA), 1.2f))
+                        g.DrawArc(pen, lx + 1f, ly, 5f, 5f, 180, 180);
+                    Theme.Fill(g, Alpha(Theme.Ok, enterA), new RectangleF(lx, ly + 3.2f, 7f, 5.2f), 1.2f);
+                    Draw.Text(g, "固定IP", _fTag, Alpha(Theme.Ok, enterA),
+                        new RectangleF(pill.X + 15f, pill.Y + 1f, pill.Width - 18f, pill.Height - 2f), Draw.Center);
+                }
+                else
+                {
+                    Theme.Fill(g, Alpha(Theme.Btn, enterA), pill, 9f);
+                    Theme.Stroke(g, Alpha(Theme.Line, enterA), pill, 9f);
+                    Draw.Text(g, "高速", _fTag, Alpha(Theme.Dim, enterA), pill, Draw.Center);
+                }
+            }
 
             if (index == _hover && !_drag)
                 Draw.Grip(g, new RectangleF(row.Right - 20, row.Y + (RowH - 10) / 2f, 10, 10),
@@ -432,6 +519,21 @@ namespace ProxyPicker.UI
             var sw = new RectangleF(row.X + 12, row.Y + (RowH - 23) / 2f, 42, 23);
             sw.Inflate(4f, 4f);
             return lx >= sw.X && lx <= sw.Right && ly >= sw.Y && ly <= sw.Bottom;
+        }
+
+        /// <summary>路线胶囊（高速 / 固定IP）的独立命中区：点一下仅切换出口通道，绝不误关软件总开关。</summary>
+        bool InsideStaticPill(int idx, Point p)
+        {
+            if (!StaticProxyEnabled || idx < 0 || idx >= _rows.Count) return false;
+            var r = _rows[idx];
+            if (!r.Proxy) return false;
+            float lx = p.X / Theme.S, ly = p.Y / Theme.S;
+            var outer = Outer;
+            float y = RowsTop + idx * RowH;
+            var row = new RectangleF(outer.X + 6, y, Math.Max(0f, outer.Width - 12), RowH);
+            var pill = StaticPillRect(row, r.IsStatic);
+            pill.Inflate(3f, 3f);
+            return lx >= pill.X && lx <= pill.Right && ly >= pill.Y && ly <= pill.Bottom;
         }
 
         int DropIndex(Point p)
@@ -515,6 +617,17 @@ namespace ProxyPicker.UI
             // 点在开关上就立刻切换，不再等 MouseUp 的「同索引」判定。
             // 远程桌面 / 触控板常见「按下后指针抖几像素」，旧逻辑会把它当成拖动，
             // 开关永远不亮；先把开关做成独立、立即生效的命中区。
+            if (InsideStaticPill(idx, e.Location))
+            {
+                var tr = _rows[idx];
+                tr.Policy = tr.IsStatic ? "PP-FIXED" : Core.StaticProxy.NodeName;
+                _sel = idx;
+                Wake();
+                Invalidate();
+                if (StaticToggled != null) StaticToggled(this, tr);
+                return;
+            }
+
             if (InsideToggle(idx, e.Location))
             {
                 var tr = _rows[idx];

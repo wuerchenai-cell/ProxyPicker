@@ -56,6 +56,13 @@ namespace ProxyPicker.UI
         string _hoverHit = "";
         int _hoverRow = -1;
 
+        bool _staticEnabled;
+        string _staticLabel = "独立固定IP";
+        string _staticSummary = "";
+        int _staticBoundCount;
+        int _staticDelayMs = -1;
+        bool _staticTimedOut;
+
         public Action<Graphics, RectangleF> Overlay;
 
         public event Action BackRequested;
@@ -66,6 +73,7 @@ namespace ProxyPicker.UI
         public event Action<string, bool> CandidateToggled;
         public event Action<List<string>> CandidateBatchChanged;
         public event Action<bool> AutoFailoverToggled;
+        public event Action ConfigureStaticProxyRequested;
 
         public NodesPage()
         {
@@ -248,6 +256,17 @@ namespace ProxyPicker.UI
             Invalidate();
         }
 
+        public void SetStaticProxyState(bool enabled, string label, string summary, int boundCount, int delayMs = -1, bool timedOut = false)
+        {
+            _staticEnabled = enabled;
+            _staticLabel = string.IsNullOrWhiteSpace(label) ? "独立固定IP" : label.Trim();
+            _staticSummary = summary ?? "";
+            _staticBoundCount = Math.Max(0, boundCount);
+            _staticDelayMs = delayMs;
+            _staticTimedOut = timedOut;
+            Invalidate();
+        }
+
         internal int DebugRiskCacheCount { get { return _riskCache.Count; } }
 
         public void CacheQualityReport(NodeQuality.QualityReport rep)
@@ -342,8 +361,19 @@ namespace ProxyPicker.UI
         float Card1H { get { return Compact ? 74f : 62f; } }
         float Card2Top { get { return Card1Top + Card1H + 8f; } }
         float Card2H { get { return Compact ? 100f : 68f; } }
-        float ListTop { get { return Card2Top + Card2H + 8f; } }
+        float StaticBarTop { get { return Card2Top + Card2H + 8f; } }
+        float StaticBarH { get { return 38f; } }
+        float ListTop { get { return StaticBarTop + StaticBarH + 8f; } }
         float RowH { get { return Compact ? 54f : 46f; } }
+        RectangleF StaticBarRect { get { return new RectangleF(0f, StaticBarTop, LogicalW, StaticBarH); } }
+        RectangleF StaticBtnRect
+        {
+            get
+            {
+                float bw = Compact ? 68f : 86f;
+                return new RectangleF(LogicalW - bw - 10f, StaticBarTop + 7f, bw, 24f);
+            }
+        }
 
         /// <summary>统一计算顶部与筛选快速条几何布局，供绘制、命中测试与自检共用同一份规则。</summary>
         internal static void ComputeLayoutBounds(
@@ -523,8 +553,53 @@ namespace ProxyPicker.UI
             if (HasBack) DrawBackStrip(g);
             DrawTopCard(g);
             DrawFailoverAndFilterCard(g);
+            DrawStaticProxyBar(g);
             DrawNodeList(g);
             Overlay?.Invoke(g, ListAreaRect);
+        }
+
+        void DrawStaticProxyBar(Graphics g)
+        {
+            var bar = StaticBarRect;
+            Theme.Fill(g, _staticEnabled ? Theme.Blend(Theme.Card, Theme.OkSoft, 0.45f) : Theme.Card, bar, 10f);
+            Theme.Stroke(g, _staticEnabled ? Theme.Blend(Theme.Line, Theme.Ok, 0.45f) : Theme.Line, bar, 10f);
+
+            Color dotCol = !_staticEnabled ? Theme.Dim : (_staticTimedOut ? Theme.Danger : Theme.Ok);
+            using (var b = new SolidBrush(dotCol))
+                g.FillEllipse(b, 14f, bar.Y + 15f, 8f, 8f);
+
+            var btn = StaticBtnRect;
+            float textMaxW = Math.Max(80f, btn.Left - 34f);
+            string text;
+            Color textCol;
+            if (!_staticEnabled)
+            {
+                text = Compact
+                    ? "独立固定 IP（可选）· 未启用"
+                    : "独立固定 IP（可选）· 未启用（可为指定软件锁定独享静态出口）";
+                textCol = Theme.Dim;
+            }
+            else
+            {
+                string statusPart = _staticTimedOut
+                    ? "不可达(已锁定防漂移)"
+                    : (_staticDelayMs > 0
+                        ? (_staticDelayMs + "ms")
+                        : (!string.IsNullOrEmpty(_staticSummary) ? _staticSummary : "已启用"));
+                string boundPart = _staticBoundCount > 0 ? (" · " + _staticBoundCount + " 个软件") : " · 尚未绑定软件";
+                text = Compact
+                    ? ("固定 IP · " + _staticLabel + " (" + statusPart + ")")
+                    : ("独立固定 IP · " + _staticLabel + " · " + statusPart + boundPart);
+                textCol = _staticTimedOut ? Theme.Danger : Theme.Fg;
+            }
+            Draw.Text(g, TrimText(g, text, _staticEnabled ? _fSmall : _fSmall, textMaxW), _fSmall, textCol,
+                new RectangleF(28f, bar.Y + 9f, textMaxW, 20f));
+
+            bool hs = _hoverHit == "staticBtn";
+            Theme.Fill(g, hs ? Theme.BtnHover : (_staticEnabled ? Theme.Card : Theme.Btn), btn, 7f);
+            Theme.Stroke(g, hs ? Theme.Accent : (_staticEnabled ? Theme.Ok : Theme.Line), btn, 7f);
+            Draw.Text(g, _staticEnabled ? "管理" : (Compact ? "配置" : "配置 / 启用"), _fTiny,
+                _staticEnabled ? Theme.Ok : (hs ? Theme.Accent : Theme.Fg), btn, Draw.Center);
         }
 
         void DrawBackStrip(Graphics g)
@@ -884,6 +959,7 @@ namespace ProxyPicker.UI
             if (QuickFastRect.Contains(x, y)) { hit = "qFast"; return; }
             if (QuickRegRect.Contains(x, y)) { hit = "qReg"; return; }
             if (QuickClearRect.Contains(x, y)) { hit = "qClear"; return; }
+            if (StaticBtnRect.Contains(x, y) || StaticBarRect.Contains(x, y)) { hit = "staticBtn"; return; }
 
             if (!ListAreaRect.Contains(x, y) || _viewNodes.Count == 0) return;
             if (MaxScroll > 0 && x >= LogicalW - 10f) { hit = "scrollbar"; return; }
@@ -984,6 +1060,7 @@ namespace ProxyPicker.UI
             if (hit == "qFast") { SelectFastCandidates(); return; }
             if (hit == "qReg") { SelectSameRegionCandidates(); return; }
             if (hit == "qClear") { ClearCandidates(); return; }
+            if (hit == "staticBtn") { ConfigureStaticProxyRequested?.Invoke(); return; }
 
             if (row >= 0 && row < _viewNodes.Count)
             {

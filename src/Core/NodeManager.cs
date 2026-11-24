@@ -445,6 +445,8 @@ namespace ProxyPicker.Core
                 {
                     string name = item as string;
                     if (string.IsNullOrEmpty(name) || !seenNames.Add(name)) continue;
+                    // 独立固定 IP 托管节点与前置跳板组绝不混入普通节点列表及备选故障切换池
+                    if (StaticProxy.IsManagedName(name)) continue;
                     var entry = Json.Obj(proxies, name);
                     string type = entry != null ? (Json.Str(entry, "type") ?? "") : "";
                     if (Profile.IsBuiltinVirtualPolicy(name, type)) continue;

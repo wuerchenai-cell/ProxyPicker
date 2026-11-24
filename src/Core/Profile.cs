@@ -659,6 +659,18 @@ namespace ProxyPicker.Core
                                          Dictionary<string, List<string>> peers, IEnumerable<string> roots,
                                          Dictionary<string, string> policies)
         {
+            return Compose(proxy, direct, peers, roots, policies, null);
+        }
+
+        /// <summary>
+        /// rootPolicies：安装目录根路径 → 该目录整树规则应继承的策略名（如 PP-STATIC-OUT）。
+        /// 防止主软件绑定了独立固定 IP 时，同目录子进程仍落回普通代理组导致 IP 分裂。
+        /// </summary>
+        public static List<Item> Compose(IEnumerable<string> proxy, IEnumerable<string> direct,
+                                         Dictionary<string, List<string>> peers, IEnumerable<string> roots,
+                                         Dictionary<string, string> policies,
+                                         Dictionary<string, string> rootPolicies)
+        {
             var items = new List<Item>();
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var name in proxy)
@@ -697,7 +709,14 @@ namespace ProxyPicker.Core
                     string pattern = AppGroup.PatternFor(root);
                     if (string.IsNullOrEmpty(pattern)) continue;
                     if (!seenRoots.Add(pattern)) continue;
-                    items.Add(new Item(pattern, "PP-FIXED", true) { Derived = true });
+                    string rPol = "PP-FIXED";
+                    if (rootPolicies != null)
+                    {
+                        string customRootPol;
+                        if (rootPolicies.TryGetValue(root, out customRootPol) && !string.IsNullOrEmpty(customRootPol))
+                            rPol = customRootPol;
+                    }
+                    items.Add(new Item(pattern, rPol, true) { Derived = true });
                 }
             }
             // direct 项不写入：MATCH,DIRECT 已经是兜底，显式写 DIRECT 只会让名单变长。
@@ -736,14 +755,28 @@ namespace ProxyPicker.Core
             string text = File.ReadAllText(baselinePath, Encoding.UTF8).Replace("\r\n", "\n");
             bool reused;
             string policy = Discovery.FindPolicy(text, out reused);
-            // 失败关闭：有勾选规则却找不到可证明的代理组时，绝不能拿空/GLOBAL 去凑。
-            // 以前会生成 `PROCESS-NAME,x,GLOBAL`，GLOBAL 在规则模式下常是 DIRECT，
-            // 推送还成功、界面显示「已生效」——用户看到的就是「勾了也直连」。
-            if (policy.Length == 0 && items != null && items.Count > 0)
+            // 独立固定 IP（可选链式代理）：未启用时绝不注入任何节点且自动过滤孤儿 PP-STATIC-OUT 规则，
+            // 保证普通用户与 --dryrun 基线零差异、且绝不推给 mihomo 引用不存在节点的坏配置。
+            var staticCfg = StaticProxy.Current;
+            IList<Item> effectiveItems = items ?? new List<Item>();
+            if (!staticCfg.IsActive())
+                effectiveItems = StaticProxy.SanitizeItemsForInactiveStatic(effectiveItems, "DIRECT");
+
+            bool directStatic = staticCfg.IsActive() &&
+                                string.Equals(staticCfg.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase);
+            bool needMainPolicy = false;
+            foreach (var it in effectiveItems)
+                if (it != null && !StaticProxy.IsStaticPolicy(it.Policy) && !IsDirectPolicy(it.Policy)) { needMainPolicy = true; break; }
+            if (staticCfg.IsActive() && !directStatic) needMainPolicy = true;
+
+            // 失败关闭：有勾选规则或链式跳板需要主策略组、却找不到可证明的代理组时，绝不能拿空/GLOBAL 去凑。
+            if (policy.Length == 0 && needMainPolicy)
                 throw new InvalidOperationException(
                     "找不到可用的代理策略组（订阅的 proxy-groups 为空或无法识别）；" +
                     "为免规则指向 GLOBAL/DIRECT，已停止保存。请检查订阅配置里的策略组名称。");
-            string payload = Discovery.BuildPayload(text, items ?? new List<Item>(), policy, Settings.PatchOnly);
+            string payload = Discovery.BuildPayload(text, effectiveItems, policy, Settings.PatchOnly);
+            if (staticCfg.IsActive())
+                payload = StaticProxy.InjectIntoYaml(payload, staticCfg, policy);
             if (forceRuleMode) payload = Discovery.EnsureRuleMode(payload);
 
             // IPv6 归客户端自己管，默认一个字都不碰。
@@ -1048,6 +1081,12 @@ namespace ProxyPicker.Core
                 result.Ms = sw.ElapsedMilliseconds;
                 return result;
             }
+            // 推送已经生效：若启用了链式独立固定 IP，立刻显式对齐内核 PP-STATIC-HOP 选择项，
+            // 消除 store-selected: true 从 cache.db 恢复旧跳板的记忆残留（如 follow <-> pin 切换）。
+            var activeStaticAfterPush = StaticProxy.Current;
+            if (activeStaticAfterPush.IsActive())
+                StaticProxy.SyncHopSelectionInKernel(activeStaticAfterPush, result.Policy, cfg);
+
             // 推送已经生效：后面无论名单写入还是回读校验是否成功，都不能让界面
             // 继续拿旧名单去对账（否则看守会把用户刚取消勾选的软件又补回来，外部评审 F4）。
             result.Pushed = true;
@@ -1190,6 +1229,13 @@ namespace ProxyPicker.Core
                     // 用户手写 DIRECT / REJECT 是明确的意图，不算故障；只校验代理组。
                     if (IsBlockedPolicy(p)) continue;
                     if (!checks.Contains(p, StringComparer.OrdinalIgnoreCase)) checks.Add(p);
+                    // 链式独立固定 IP 除校验落地节点自身存在外，还必须同时校验第一跳前置跳板组出口不为 DIRECT/REJECT
+                    if (StaticProxy.IsStaticPolicy(p) && activeStaticAfterPush.IsActive() &&
+                        !string.Equals(activeStaticAfterPush.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase) &&
+                        !checks.Contains(StaticProxy.HopGroupName, StringComparer.OrdinalIgnoreCase))
+                    {
+                        checks.Add(StaticProxy.HopGroupName);
+                    }
                 }
                 if (checks.Count > 0)
                 {
@@ -2447,13 +2493,18 @@ namespace ProxyPicker.Core
         {
             var snap = new ConnectionSnapshot();
             var expectedByExe = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var staticDriftExes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (mismatches != null)
             {
                 foreach (var m in mismatches)
                 {
                     if (m == null) continue;
                     string exe = Normalize(m.Exe);
-                    if (exe.Length > 0) expectedByExe[exe] = m.Expected;
+                    if (exe.Length > 0)
+                    {
+                        expectedByExe[exe] = m.Expected;
+                        if (m.StaticDrift) staticDriftExes.Add(exe);
+                    }
                 }
             }
             if (expectedByExe.Count == 0 || connData == null) return snap;
@@ -2482,8 +2533,10 @@ namespace ProxyPicker.Core
 
                 var chain = Traffic.ChainOf(d);
                 if (chain == Traffic.Chain.Unknown || chain == Traffic.Chain.Rejected) continue;
-                bool wrong = (expected && chain == Traffic.Chain.Direct) ||
-                             (!expected && chain == Traffic.Chain.Proxy);
+                bool wrong = staticDriftExes.Contains(exe)
+                    ? !Traffic.HasStaticChain(d)
+                    : ((expected && chain == Traffic.Chain.Direct) ||
+                       (!expected && chain == Traffic.Chain.Proxy));
                 if (!wrong) continue;
 
                 string id = Json.Str(d, "id");

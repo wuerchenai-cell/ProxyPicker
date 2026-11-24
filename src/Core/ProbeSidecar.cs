@@ -260,6 +260,19 @@ namespace ProxyPicker.Core
                 Process = null;
                 if (!string.IsNullOrEmpty(TempDir) && Directory.Exists(TempDir))
                 {
+                    // 先清空覆写临时探针配置，避免静态代理账密在磁盘临时文件残留
+                    try
+                    {
+                        string yamlFile = Path.Combine(TempDir, "probe.yaml");
+                        if (File.Exists(yamlFile))
+                        {
+                            long len = new FileInfo(yamlFile).Length;
+                            if (len > 0 && len < 2 * 1024 * 1024)
+                                File.WriteAllBytes(yamlFile, new byte[len]);
+                            File.Delete(yamlFile);
+                        }
+                    }
+                    catch { }
                     for (int i = 0; i < 3; i++)
                     {
                         try { Directory.Delete(TempDir, true); break; }
@@ -454,6 +467,20 @@ namespace ProxyPicker.Core
             string secret,
             string origDataDir)
         {
+            return BuildSidecarConfigText(origYamlLines, proxyPort, apiPort, secret, origDataDir, null, null);
+        }
+
+        /// <summary>支持在纯本地旁路配置上叠加待测独立固定 IP 链式节点，用于零干扰体检与验证。</summary>
+        internal static string BuildSidecarConfigText(
+            string[] origYamlLines,
+            int proxyPort,
+            int apiPort,
+            string secret,
+            string origDataDir,
+            StaticProxy.StaticProxyConfig staticOverlay,
+            string mainPolicy,
+            string preferredFollowNode = null)
+        {
             var sb = new StringBuilder();
             sb.Append("mixed-port: ").Append(proxyPort).Append('\n');
             sb.Append("bind-address: 127.0.0.1\n");
@@ -516,7 +543,12 @@ namespace ProxyPicker.Core
                     sb.Append(ln).Append('\n');
                 }
             }
-            return sb.ToString();
+            string built = sb.ToString();
+            if (staticOverlay != null && staticOverlay.Enabled &&
+                (string.Equals(staticOverlay.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase) ||
+                 !string.IsNullOrWhiteSpace(mainPolicy)))
+                built = StaticProxy.InjectIntoYaml(built, staticOverlay, mainPolicy, preferredFollowNode);
+            return built;
         }
 
         static int AllocateFreeLoopbackPort()
@@ -595,7 +627,83 @@ namespace ProxyPicker.Core
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 bool earlyExit;
-                var session = TryStartOnce(origLines, origDataDir, kernelExe, out earlyExit, out error);
+                var session = TryStartOnce(origLines, origDataDir, kernelExe, null, null, null, out earlyExit, out error);
+                if (session != null) return session;
+                if (!earlyExit) return null;
+            }
+            return null;
+        }
+
+        /// <summary>为「独立固定 IP」零干扰体检启动叠加了链式静态节点的沙箱内核实例。</summary>
+        public static SidecarSession TryStartForStaticTest(
+            string knownConfigPath,
+            StaticProxy.StaticProxyConfig staticOverlay,
+            out string mainPolicy,
+            out string error)
+        {
+            mainPolicy = "";
+            error = "";
+            EnsureProcessExitCleanup();
+            SweepStaleTempDirs();
+
+            string cfgPath = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
+            if (string.IsNullOrEmpty(cfgPath) || !File.Exists(cfgPath))
+            {
+                error = "未找到有效的客户端配置文件，请先启动 Clash / mihomo 客户端";
+                return null;
+            }
+
+            string kernelExe = FindKernelExePath();
+            if (string.IsNullOrEmpty(kernelExe) || !File.Exists(kernelExe))
+            {
+                error = "未找到同源 mihomo 内核程序";
+                return null;
+            }
+
+            string rawText;
+            try { rawText = File.ReadAllText(cfgPath, Encoding.UTF8); }
+            catch (Exception ex) { error = ex.Message; return null; }
+
+            bool _;
+            mainPolicy = Discovery.FindPolicy(rawText, out _);
+            bool directHop = staticOverlay != null &&
+                             string.Equals(staticOverlay.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase);
+            if (!directHop && string.IsNullOrEmpty(mainPolicy))
+            {
+                error = "当前订阅未识别到可用的主策略组，无法建立前置跳板链路（如节点可直连，请在高级设置选「直连该节点」）";
+                return null;
+            }
+
+            // 若为链式自动跟随模式，读取主内核当前真实活跃物理节点置顶于旁路跳板首位，
+            // 避免沙箱无 cache.db 时落到订阅默认首行（可能是流量公告行或失效节点）导致误报前置不通。
+            string liveFollowNode = null;
+            if (!directHop && staticOverlay != null &&
+                string.Equals(staticOverlay.HopMode, StaticProxy.HopFollow, StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var pxRes = Mihomo.FetchJson("/proxies", 3000, cfgPath);
+                    if (pxRes.Ok && pxRes.Data != null)
+                    {
+                        var proxies = Json.Obj(pxRes.Data, "proxies");
+                        var detail = Profile.ResolveOutboundDetail(proxies, mainPolicy);
+                        if (!string.IsNullOrWhiteSpace(detail.Outbound) &&
+                            Profile.ClassifyExit(detail.Outbound) == Profile.ExitKind.Proxy &&
+                            !StaticProxy.IsManagedName(detail.Outbound))
+                        {
+                            liveFollowNode = detail.Outbound;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            string[] origLines = rawText.Replace("\r\n", "\n").Split('\n');
+            string origDataDir = Path.GetDirectoryName(cfgPath) ?? "";
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                bool earlyExit;
+                var session = TryStartOnce(origLines, origDataDir, kernelExe, staticOverlay, mainPolicy, liveFollowNode, out earlyExit, out error);
                 if (session != null) return session;
                 if (!earlyExit) return null;
             }
@@ -604,6 +712,7 @@ namespace ProxyPicker.Core
 
         static SidecarSession TryStartOnce(
             string[] origLines, string origDataDir, string kernelExe,
+            StaticProxy.StaticProxyConfig staticOverlay, string mainPolicy, string preferredFollowNode,
             out bool earlyExit, out string error)
         {
             earlyExit = false;
@@ -619,7 +728,7 @@ namespace ProxyPicker.Core
                 if (apiPort == proxyPort) apiPort = AllocateFreeLoopbackPort();
                 string secret = Guid.NewGuid().ToString("N").Substring(0, 20);
 
-                string probeYaml = BuildSidecarConfigText(origLines, proxyPort, apiPort, secret, origDataDir);
+                string probeYaml = BuildSidecarConfigText(origLines, proxyPort, apiPort, secret, origDataDir, staticOverlay, mainPolicy, preferredFollowNode);
                 string probeYamlPath = Path.Combine(tempDir, "probe.yaml");
                 File.WriteAllText(probeYamlPath, probeYaml, new UTF8Encoding(false));
 

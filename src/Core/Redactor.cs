@@ -14,10 +14,59 @@ namespace ProxyPicker.Core
     /// </summary>
     internal static class Redactor
     {
+        static readonly object SecretGate = new object();
+        static string[] _runtimeSecrets = new string[0];
+
+        /// <summary>登记运行期需要脱敏的敏感字面量（如独立固定 IP 的服务器地址/用户名/密码），按长度降序优先遮盖。</summary>
+        public static void RegisterRuntimeSecrets(params string[] values)
+        {
+            var list = new System.Collections.Generic.List<string>();
+            if (values != null)
+            {
+                var seen = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+                foreach (var raw in values)
+                {
+                    string t = (raw ?? "").Trim();
+                    // 跳过过短字符或本机回环地址，防止把普通日志词句搅成乱码
+                    if (t.Length < 4) continue;
+                    if (t.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                        t.Equals("localhost", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (seen.Add(t)) list.Add(t);
+                }
+            }
+            list.Sort((a, b) => b.Length.CompareTo(a.Length));
+            lock (SecretGate) _runtimeSecrets = list.ToArray();
+        }
+
+        public static void ClearRuntimeSecrets()
+        {
+            lock (SecretGate) _runtimeSecrets = new string[0];
+        }
+
+        internal static string[] SnapshotRuntimeSecrets()
+        {
+            lock (SecretGate) return (string[])_runtimeSecrets.Clone();
+        }
+
+        internal static void RestoreRuntimeSecrets(string[] snapshot)
+        {
+            lock (SecretGate) _runtimeSecrets = snapshot != null ? (string[])snapshot.Clone() : new string[0];
+        }
+
         public static string Apply(string text)
         {
             if (string.IsNullOrEmpty(text)) return text ?? "";
             string s = text;
+
+            // 先遮盖运行期登记的静态代理凭据（主机/账号/密码），确保任何日志与诊断出口均零泄漏
+            string[] secrets;
+            lock (SecretGate) secrets = _runtimeSecrets;
+            for (int i = 0; i < secrets.Length; i++)
+            {
+                string sec = secrets[i];
+                if (!string.IsNullOrEmpty(sec) && s.IndexOf(sec, StringComparison.Ordinal) >= 0)
+                    s = s.Replace(sec, "<凭据已隐藏>");
+            }
 
             // 整词边界：短用户名（a / li / user）不能把堆栈里的类名搅成乱码（复审 P2）。
             string user = Environment.UserName;
