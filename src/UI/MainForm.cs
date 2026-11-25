@@ -172,8 +172,11 @@ namespace ProxyPicker.UI
         int _staticDelayMs = -1;
         bool _staticTimedOut;
         bool _staticChecking;
+        bool _staticOptimizing;
+        string _staticLiveHop = "";
         int _staticTimeoutStreak;
         DateTime _lastStaticAlertAt = DateTime.MinValue;
+        DateTime _lastAutoHopOptimizeAt = DateTime.MinValue;
         bool _staticWarnShown;
         string _status = "正在准备…";
         Color _statusColor;
@@ -363,6 +366,7 @@ namespace ProxyPicker.UI
                     : "已关闭节点超时自动切换", on && c == 0 ? Theme.Warn : Theme.Accent);
             };
             _nodesPage.ConfigureStaticProxyRequested += () => OpenStaticProxyDialog();
+            _nodesPage.OptimizeStaticHopRequested += () => _ = OptimizeStaticHopAsync(true, false);
             SyncStaticUiBanner();
 
             _qualityPage.Visible = false;
@@ -5538,6 +5542,16 @@ namespace ProxyPicker.UI
             var cfg = StaticProxy.Current;
             bool active = cfg.IsActive();
             int boundCount = _all.Count(r => r.Proxy && r.IsStatic);
+            string hopDisplay = "";
+            if (active)
+            {
+                if (!string.IsNullOrWhiteSpace(_staticLiveHop) && !StaticProxy.IsManagedName(_staticLiveHop))
+                    hopDisplay = _staticLiveHop;
+                else if (string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase))
+                    hopDisplay = cfg.AutoBestHopNode ?? "";
+                else if (string.Equals(cfg.HopMode, StaticProxy.HopPin, StringComparison.OrdinalIgnoreCase))
+                    hopDisplay = cfg.PinnedHopNode ?? "";
+            }
             _list.StaticProxyEnabled = active;
             _nodesPage.SetStaticProxyState(
                 active,
@@ -5545,7 +5559,10 @@ namespace ProxyPicker.UI
                 cfg.LastVerifiedSummary,
                 boundCount,
                 _staticDelayMs,
-                _staticTimedOut);
+                _staticTimedOut,
+                cfg.HopMode,
+                hopDisplay,
+                _staticOptimizing);
             if (active != _lastShowStaticRow)
             {
                 _lastShowStaticRow = active;
@@ -5630,6 +5647,13 @@ namespace ProxyPicker.UI
                     }
                     if (_state.ConfigOk && (boundCount > 0 || Profile.HasSavedIntent || _all.Any(r => r.Proxy)))
                         SaveAsync();
+                    if (_state.ConfigOk &&
+                        string.Equals(dlg.ResultConfig.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase) &&
+                        string.IsNullOrWhiteSpace(dlg.ResultConfig.AutoBestHopNode))
+                    {
+                        // 首次切到「智能优选最低延迟跳板」且尚未测过最优前置时，后台零干扰自动优选并热切
+                        _ = OptimizeStaticHopAfterSaveAsync();
+                    }
                 }
                 else if (dlg.Outcome == StaticProxyDialog.DialogOutcome.DisabledToDirect ||
                          dlg.Outcome == StaticProxyDialog.DialogOutcome.DisabledToDefaultProxy)
@@ -5674,11 +5698,28 @@ namespace ProxyPicker.UI
                     _staticTimeoutStreak = 0;
                     _staticDelayMs = res.DelayMs;
                     _staticTimedOut = false;
+                    if (!string.Equals(cfg.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string liveHop = await Task.Run(() => StaticProxy.ReadLiveHopNode(cfgPath));
+                        if (!string.IsNullOrEmpty(liveHop)) _staticLiveHop = liveHop;
+                    }
                     SyncStaticUiBanner();
                     if (wasDown)
                     {
                         AuditLog.Record("STATIC", "独立固定 IP 已恢复可用 · " + res.DelayMs + " ms");
                         Toast("独立固定 IP 已恢复", cfg.DisplayLabel + " · " + res.DelayMs + " ms", Theme.Ok, 2);
+                    }
+                    // 智能优选模式下的低频后台平滑复优（每 25 分钟最多一次，且须满足 >=15% 与 >=60ms 防抖门槛）
+                    if (!manual && boundCount > 0 && !_staticOptimizing &&
+                        string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var nowUtc = DateTime.UtcNow;
+                        bool sessionDue = _lastAutoHopOptimizeAt == DateTime.MinValue ||
+                                          (nowUtc - _lastAutoHopOptimizeAt).TotalMinutes >= 25.0;
+                        bool savedDue = cfg.AutoBestUpdatedAtTicks <= 0 ||
+                                        (nowUtc - new DateTime(cfg.AutoBestUpdatedAtTicks, DateTimeKind.Utc)).TotalMinutes >= 25.0;
+                        if (sessionDue && savedDue)
+                            _ = OptimizeStaticHopAsync(false, false);
                     }
                 }
                 else if (res.TimedOut)
@@ -5695,12 +5736,21 @@ namespace ProxyPicker.UI
                     _staticDelayMs = -1;
                     _staticTimedOut = true;
                     SyncStaticUiBanner();
+                    // 智能优选模式下超时：自动触发一次零干扰端到端重优急救切换前置跳板（外部固定 IP 保持绝对不变）
+                    if (string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase) &&
+                        !_staticOptimizing &&
+                        (_lastAutoHopOptimizeAt == DateTime.MinValue || (DateTime.UtcNow - _lastAutoHopOptimizeAt).TotalSeconds >= 180))
+                    {
+                        _ = OptimizeStaticHopAsync(false, true);
+                    }
                     if (StaticProxy.ShouldAlertStaticTimeout(manual, _staticTimeoutStreak, _lastStaticAlertAt, DateTime.UtcNow))
                     {
                         _lastStaticAlertAt = DateTime.UtcNow;
                         AuditLog.Record("STATIC", "独立固定 IP 不可达（已锁定防漂移）：" + (res.Error ?? "超时"));
                         Toast("独立固定 IP 不可达（已锁定防漂移）",
-                            "为防止 IP 暴露，已阻断漂移到普通节点；请检查前置跳板或静态 IP 状态",
+                            string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase)
+                                ? "已锁定固定 IP 防泄漏，正在后台自动重测优选可用前置跳板…"
+                                : "为防止 IP 暴露，已阻断漂移到普通节点；请检查前置跳板或静态 IP 状态",
                             Theme.Danger, 3);
                         if (!Visible && TrayBalloon != null)
                             TrayBalloon("独立固定 IP 不可达（已锁定防漂移）", "请检查前置跳板或静态 IP 状态");
@@ -5711,6 +5761,137 @@ namespace ProxyPicker.UI
             finally
             {
                 _staticChecking = false;
+            }
+        }
+
+        async Task OptimizeStaticHopAfterSaveAsync()
+        {
+            try
+            {
+                // 等待刚触发的 SaveAsync 推送内核完成，再立刻零干扰优选并热切
+                for (int i = 0; i < 30 && _busy; i++) await Task.Delay(250);
+                if (!UiAlive || _shuttingDown || !StaticProxy.IsEnabledAndValid) return;
+                await OptimizeStaticHopAsync(true, false);
+            }
+            catch { }
+        }
+
+        async Task OptimizeStaticHopAsync(bool manual, bool emergencyRecovery)
+        {
+            if (!UiAlive || _staticOptimizing || _shuttingDown) return;
+            var cfg = StaticProxy.Current;
+            if (!cfg.IsActive()) return;
+            if (string.Equals(cfg.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+            {
+                if (manual) Toast("当前为直连模式", "直连落地不经前置跳板，无需优选；如需优选请先在固定 IP 设置中选择「智能优选」", Theme.Warn, 2);
+                return;
+            }
+
+            _staticOptimizing = true;
+            _lastAutoHopOptimizeAt = DateTime.UtcNow;
+            SyncStaticUiBanner();
+            if (manual)
+                SetStatus("正在通过零干扰旁路实测全部前置跳板的固定 IP 端到端延迟…", Theme.Accent);
+
+            try
+            {
+                string cfgPath = Paths.ClashYaml;
+                var bench = await Task.Run(() => StaticProxy.BenchmarkBestHopsThroughSidecar(
+                    cfg, cfgPath,
+                    msg =>
+                    {
+                        if (manual && UiAlive && IsHandleCreated)
+                        {
+                            try { BeginInvoke(new Action(() => SetStatus(msg, Theme.Accent))); }
+                            catch { }
+                        }
+                    }));
+                if (!UiAlive || _shuttingDown) return;
+                if (bench == null || !bench.Ok || string.IsNullOrEmpty(bench.BestNode))
+                {
+                    if (manual)
+                    {
+                        string why = bench != null && !string.IsNullOrEmpty(bench.Error) ? bench.Error : "未找到可用跳板";
+                        SetStatus("跳板优选未完成：" + why, Theme.Warn);
+                        Toast("固定 IP 跳板优选失败", why, Theme.Warn, 3);
+                    }
+                    return;
+                }
+
+                string curHop = await Task.Run(() => StaticProxy.ReadLiveHopNode(cfgPath));
+                int curBenchMs = _staticDelayMs;
+                if (!string.IsNullOrEmpty(curHop))
+                {
+                    var matchCur = bench.TopCandidates.FirstOrDefault(x =>
+                        x != null && string.Equals(x.NodeName, curHop, StringComparison.OrdinalIgnoreCase));
+                    if (matchCur != null && matchCur.DelayMs > 0) curBenchMs = matchCur.DelayMs;
+                }
+
+                bool wasAuto = string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                bool switchIt = !wasAuto || StaticProxy.ShouldSwitchAutoHop(
+                    curHop, curBenchMs, bench.BestNode, bench.BestDelayMs,
+                    emergencyRecovery || _staticTimedOut, manual);
+
+                var updated = cfg.Clone();
+                if (manual) updated.HopMode = StaticProxy.HopAuto;
+                updated.AutoBestUpdatedAtTicks = DateTime.UtcNow.Ticks;
+                updated.AutoBestHopPool = bench.TopCandidates
+                    .Where(x => x != null && !string.IsNullOrEmpty(x.NodeName))
+                    .Select(x => x.NodeName)
+                    .ToList();
+
+                if (switchIt)
+                {
+                    updated.AutoBestHopNode = bench.BestNode;
+                    updated.AutoBestDelayMs = bench.BestDelayMs;
+                    string saveErr;
+                    StaticProxy.Save(updated, out saveErr);
+
+                    string swErr = "";
+                    bool hotSwitched = wasAuto && await Task.Run(() => StaticProxy.SwitchHopNodeInKernel(bench.BestNode, cfgPath, out swErr));
+                    if (!hotSwitched)
+                    {
+                        // 首次由 follow/pin 切至 auto，或新节点尚未在 PP-STATIC-HOP 成员表中：重推一次完整配置立即生效
+                        if (_state.ConfigOk && !_busy) SaveAsync();
+                    }
+                    _staticLiveHop = bench.BestNode;
+                    _staticDelayMs = bench.BestDelayMs;
+                    _staticTimedOut = false;
+                    _staticTimeoutStreak = 0;
+
+                    string cleanBest = CleanEmoji(bench.BestNode);
+                    AuditLog.Record("STATIC",
+                        (emergencyRecovery ? "固定 IP 前置故障自愈切换至：" : "固定 IP 智能优选前置跳板：") +
+                        bench.BestNode + "（" + bench.BestDelayMs + "ms，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）");
+                    SetStatus("固定 IP 已切至独立最快跳板「" + cleanBest + "」（" + bench.BestDelayMs + "ms，外部 IP 不变）", Theme.Ok);
+                    Toast(emergencyRecovery ? "固定 IP 跳板已自愈切换" : "固定 IP 已切换最快跳板",
+                        "独立前置：" + cleanBest + "（" + bench.BestDelayMs + "ms · " + bench.ReachableCount + "/" + bench.TestedCount + " 可达），主 VPN 节点不受影响",
+                        Theme.Ok, 3);
+                }
+                else
+                {
+                    if (string.IsNullOrEmpty(updated.AutoBestHopNode))
+                        updated.AutoBestHopNode = string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop;
+                    string saveErr;
+                    StaticProxy.Save(updated, out saveErr);
+                    if (!string.IsNullOrEmpty(curHop)) _staticLiveHop = curHop;
+                    if (manual)
+                    {
+                        string cleanCur = CleanEmoji(string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop);
+                        SetStatus("当前固定 IP 跳板「" + cleanCur + "」已是最优（" + bench.BestDelayMs + "ms，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）", Theme.Ok);
+                        Toast("当前固定 IP 跳板已是最优", cleanCur + " · " + bench.BestDelayMs + "ms（主 VPN 节点互不干扰）", Theme.Ok, 2);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (manual && UiAlive)
+                    Toast("固定 IP 跳板优选异常", ex.Message, Theme.Warn, 2);
+            }
+            finally
+            {
+                _staticOptimizing = false;
+                if (UiAlive) SyncStaticUiBanner();
             }
         }
 

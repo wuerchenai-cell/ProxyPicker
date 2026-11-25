@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Runtime.InteropServices;
@@ -7,6 +8,8 @@ using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace ProxyPicker.Core
 {
@@ -27,10 +30,15 @@ namespace ProxyPicker.Core
         /// <summary>内核层固定纯 ASCII 前置跳板策略组名。</summary>
         public const string HopGroupName = "PP-STATIC-HOP";
 
+        /// <summary>独立智能优选前置跳板模式：全量端到端测速自动挑选最低延迟前置，与主 VPN 节点完全解耦。</summary>
+        public const string HopAuto = "auto";
         public const string HopFollow = "follow";
         public const string HopPin = "pin";
         /// <summary>直连落地模式（不经前置跳板）：适用于海外网络、自带中转或内网直达的 SOCKS5 节点。</summary>
         public const string HopDirect = "direct";
+
+        /// <summary>旁路端到端测速临时节点前缀。</summary>
+        internal const string BenchNodePrefix = "PP-BENCH-";
 
         /// <summary>双跳跨洋静态 SOCKS5 健康检查单次超时上限（毫秒）。</summary>
         public const int HealthTimeoutMs = 10000;
@@ -71,10 +79,18 @@ namespace ProxyPicker.Core
             public int Port;
             public string Username = "";
             public string Password = "";
-            /// <summary>follow = 自动跟随当前高速主出口组（默认）；pin = 锁定单条指定节点；direct = 直连落地不经前置跳板。</summary>
+            /// <summary>auto = 独立自动优选最低延迟跳板；follow = 自动跟随当前高速主出口组；pin = 锁定单条指定节点；direct = 直连落地。</summary>
             public string HopMode = HopFollow;
             public string PinnedHopNode = "";
-            /// <summary>多数静态 SOCKS5 节点不支持 UDP Associate，默认关闭避免浏览器 QUIC 卡顿；需要时可手动开启。</summary>
+            /// <summary>智能优选模式下当前端到端实测最快的前置节点名。</summary>
+            public string AutoBestHopNode = "";
+            /// <summary>智能优选模式下当前最快跳板的实测端到端延迟（ms，&lt;=0 表示尚未实测）。</summary>
+            public int AutoBestDelayMs = -1;
+            /// <summary>智能优选模式下的 Top 候选高速前置池（按端到端延迟从低到高排序）。</summary>
+            public List<string> AutoBestHopPool = new List<string>();
+            /// <summary>上次端到端优选完成时间（UTC Ticks）。</summary>
+            public long AutoBestUpdatedAtTicks;
+            /// <summary>多数静态 SOCKS5 节点不支持 UDP Associate，默认关闭并在规则层自动 REJECT UDP/QUIC 防止穿透回直连。</summary>
             public bool AllowUdp;
             /// <summary>写入 ip-version: ipv4，防止双栈环境下 IPv6 退化或泄漏。</summary>
             public bool ForceIpv4 = true;
@@ -96,6 +112,10 @@ namespace ProxyPicker.Core
                     Password = Password ?? "",
                     HopMode = string.IsNullOrEmpty(HopMode) ? HopFollow : HopMode,
                     PinnedHopNode = PinnedHopNode ?? "",
+                    AutoBestHopNode = AutoBestHopNode ?? "",
+                    AutoBestDelayMs = AutoBestDelayMs,
+                    AutoBestHopPool = AutoBestHopPool != null ? new List<string>(AutoBestHopPool) : new List<string>(),
+                    AutoBestUpdatedAtTicks = AutoBestUpdatedAtTicks,
                     AllowUdp = AllowUdp,
                     ForceIpv4 = ForceIpv4,
                     FailClosed = FailClosed,
@@ -140,6 +160,24 @@ namespace ProxyPicker.Core
             public string DetectedFormat = "";
         }
 
+        public sealed class HopCandidateResult
+        {
+            public string NodeName = "";
+            public int DelayMs = -1;
+        }
+
+        public sealed class AutoHopBenchmarkResult
+        {
+            public bool Ok;
+            public string Error = "";
+            public string BestNode = "";
+            public int BestDelayMs = -1;
+            public int TestedCount;
+            public int ReachableCount;
+            public long ElapsedMs;
+            public List<HopCandidateResult> TopCandidates = new List<HopCandidateResult>();
+        }
+
         public sealed class StaticProbeResult
         {
             public bool Ok;
@@ -149,6 +187,8 @@ namespace ProxyPicker.Core
             public int HopDelayMs = -1;
             public int StaticDelayMs = -1;
             public string MainPolicy = "";
+            public string SelectedHopNode = "";
+            public AutoHopBenchmarkResult AutoBench;
             public NodeQuality.QualityReport Quality;
         }
 
@@ -158,7 +198,8 @@ namespace ProxyPicker.Core
             if (string.IsNullOrWhiteSpace(name)) return false;
             string t = name.Trim();
             return t.Equals(NodeName, StringComparison.OrdinalIgnoreCase) ||
-                   t.Equals(HopGroupName, StringComparison.OrdinalIgnoreCase);
+                   t.Equals(HopGroupName, StringComparison.OrdinalIgnoreCase) ||
+                   t.StartsWith(BenchNodePrefix, StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>判断策略名是否指向独立固定 IP 通道。</summary>
@@ -166,6 +207,101 @@ namespace ProxyPicker.Core
         {
             return !string.IsNullOrWhiteSpace(policy) &&
                    policy.Trim().Equals(NodeName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// 启用独立固定 IP 且未勾选 AllowUdp 时，必须在规则层显式拦截该进程的 UDP（含 HTTP/3 QUIC 与 WebRTC）：
+        /// mihomo 遇到指向 udp:false 代理的规则会跳过该规则，导致浏览器 QUIC UDP:443 穿透到 MATCH,DIRECT 泄漏本地真实 IP。
+        /// </summary>
+        public static bool ShouldBlockStaticUdp(StaticProxyConfig cfg)
+        {
+            return cfg != null && cfg.IsActive() && !cfg.AllowUdp;
+        }
+
+        /// <summary>生成指向 REJECT 的进程 UDP 防穿透规则文本。</summary>
+        public static string BuildUdpGuardRule(bool isPathRule, string target)
+        {
+            return "AND,((NETWORK,UDP),(" +
+                   (isPathRule ? "PROCESS-PATH-REGEX," : "PROCESS-NAME,") +
+                   target + ")),REJECT";
+        }
+
+        /// <summary>判断 YAML 规则行文本是否为本工具生成的固定 IP UDP 防穿透规则。</summary>
+        public static bool IsStaticUdpGuardRuleLine(string ruleText)
+        {
+            if (string.IsNullOrWhiteSpace(ruleText)) return false;
+            string s = ruleText.Trim();
+            if (!s.StartsWith("AND,", StringComparison.OrdinalIgnoreCase)) return false;
+            if (!s.EndsWith(",REJECT", StringComparison.OrdinalIgnoreCase)) return false;
+            return s.IndexOf("(NETWORK,UDP)", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                   (s.IndexOf("(PROCESS-NAME,", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    s.IndexOf("(PROCESS-PATH-REGEX,", StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        /// <summary>
+        /// 识别内核 /rules 返回的固定 IP UDP 防穿透规则并提取目标（exe 名或目录正则）。
+        /// mihomo /rules 返回格式：type="AND", proxy="REJECT",
+        /// payload="((Network,udp) &amp;&amp; (ProcessName,chrome.exe))" 或 "((Network,udp) &amp;&amp; (ProcessPathRegex,...))"。
+        /// </summary>
+        public static bool IsStaticUdpGuardKernelRule(Profile.RuleInfo r, out string extractedTarget)
+        {
+            extractedTarget = "";
+            if (r == null) return false;
+            if (!(r.Type ?? "").Equals("AND", StringComparison.OrdinalIgnoreCase)) return false;
+            if (!Profile.IsBlockedPolicy(r.Proxy ?? "")) return false;
+            string payload = (r.Payload ?? "").Trim();
+            if (payload.Length == 0) return false;
+            if (payload.IndexOf("Network,udp", StringComparison.OrdinalIgnoreCase) < 0 &&
+                payload.IndexOf("NETWORK,UDP", StringComparison.OrdinalIgnoreCase) < 0)
+                return false;
+
+            string[] markers = { "(ProcessName,", "(PROCESS-NAME,", "(ProcessPathRegex,", "(PROCESS-PATH-REGEX," };
+            foreach (var mk in markers)
+            {
+                int idx = payload.IndexOf(mk, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0) continue;
+                int valStart = idx + mk.Length;
+                // 找到与 '(' 配对的 ')'（目录正则中本身可能包含括号如 (?i) 与 \(x86\)）
+                int depth = 1;
+                int valEnd = -1;
+                for (int i = valStart; i < payload.Length; i++)
+                {
+                    char c = payload[i];
+                    if (c == '\\' && i + 1 < payload.Length) { i++; continue; }
+                    if (c == '(') depth++;
+                    else if (c == ')')
+                    {
+                        depth--;
+                        if (depth == 0) { valEnd = i; break; }
+                    }
+                }
+                if (valEnd > valStart)
+                {
+                    extractedTarget = payload.Substring(valStart, valEnd - valStart).Trim();
+                    return extractedTarget.Length > 0;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 自动优选前置跳板切换防抖判据：
+        /// 手动触发 / 当前跳板不可达 / 尚无前置节点时立即切换；
+        /// 后台平滑周期重测时，新跳板须比当前延迟至少快 60ms 且降幅 &gt;= 15% 才热切，避免相近节点来回横跳。
+        /// </summary>
+        public static bool ShouldSwitchAutoHop(
+            string currentHop, int currentMs,
+            string candidateHop, int candidateMs,
+            bool currentBroken, bool manual)
+        {
+            if (string.IsNullOrWhiteSpace(candidateHop) || candidateMs <= 0) return false;
+            if (IsManagedName(candidateHop)) return false;
+            string cur = (currentHop ?? "").Trim();
+            string cand = candidateHop.Trim();
+            if (cur.Equals(cand, StringComparison.OrdinalIgnoreCase)) return false;
+            if (manual || currentBroken || cur.Length == 0 || currentMs <= 0) return true;
+            int gain = currentMs - candidateMs;
+            return gain >= 60 && gain * 100 >= currentMs * 15;
         }
 
         /// <summary>物理隔离的凭据文件路径（永不落在 exe 旁的便携 settings.json）。</summary>
@@ -233,6 +369,23 @@ namespace ProxyPicker.Core
             if (clean.Label.Length > 24) clean.Label = clean.Label.Substring(0, 24);
             clean.HopMode = NormalizeHopMode(clean.HopMode);
             clean.PinnedHopNode = (clean.PinnedHopNode ?? "").Trim();
+            clean.AutoBestHopNode = (clean.AutoBestHopNode ?? "").Trim();
+            if (clean.AutoBestHopPool == null) clean.AutoBestHopPool = new List<string>();
+            else
+            {
+                var dedupPool = new List<string>();
+                var seenPool = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var n in clean.AutoBestHopPool)
+                {
+                    string tn = (n ?? "").Trim();
+                    if (tn.Length > 0 && !IsManagedName(tn) && seenPool.Add(tn))
+                    {
+                        dedupPool.Add(tn);
+                        if (dedupPool.Count >= 12) break;
+                    }
+                }
+                clean.AutoBestHopPool = dedupPool;
+            }
 
             if (clean.Enabled)
             {
@@ -276,6 +429,7 @@ namespace ProxyPicker.Core
 
         static string NormalizeHopMode(string mode)
         {
+            if (string.Equals(mode, HopAuto, StringComparison.OrdinalIgnoreCase)) return HopAuto;
             if (string.Equals(mode, HopPin, StringComparison.OrdinalIgnoreCase)) return HopPin;
             if (string.Equals(mode, HopDirect, StringComparison.OrdinalIgnoreCase)) return HopDirect;
             return HopFollow;
@@ -721,6 +875,19 @@ namespace ProxyPicker.Core
             sb.Append("  \"password\": ").Append(Json.Quote(c.Password ?? "")).Append(",\n");
             sb.Append("  \"hopMode\": ").Append(Json.Quote(c.HopMode ?? HopFollow)).Append(",\n");
             sb.Append("  \"pinnedHopNode\": ").Append(Json.Quote(c.PinnedHopNode ?? "")).Append(",\n");
+            sb.Append("  \"autoBestHopNode\": ").Append(Json.Quote(c.AutoBestHopNode ?? "")).Append(",\n");
+            sb.Append("  \"autoBestDelayMs\": ").Append(c.AutoBestDelayMs).Append(",\n");
+            sb.Append("  \"autoBestHopPool\": [");
+            if (c.AutoBestHopPool != null && c.AutoBestHopPool.Count > 0)
+            {
+                for (int i = 0; i < c.AutoBestHopPool.Count; i++)
+                {
+                    if (i > 0) sb.Append(", ");
+                    sb.Append(Json.Quote(c.AutoBestHopPool[i] ?? ""));
+                }
+            }
+            sb.Append("],\n");
+            sb.Append("  \"autoBestUpdatedAtTicks\": ").Append(c.AutoBestUpdatedAtTicks).Append(",\n");
             sb.Append("  \"allowUdp\": ").Append(c.AllowUdp ? "true" : "false").Append(",\n");
             sb.Append("  \"forceIpv4\": ").Append(c.ForceIpv4 ? "true" : "false").Append(",\n");
             sb.Append("  \"failClosed\": ").Append(c.FailClosed ? "true" : "false").Append(",\n");
@@ -757,6 +924,9 @@ namespace ProxyPicker.Core
                 Password = Json.Str(root, "password") ?? "",
                 HopMode = NormalizeHopMode(Json.Str(root, "hopMode")),
                 PinnedHopNode = Json.Str(root, "pinnedHopNode") ?? "",
+                AutoBestHopNode = Json.Str(root, "autoBestHopNode") ?? "",
+                AutoBestDelayMs = Json.Int(root, "autoBestDelayMs", -1),
+                AutoBestUpdatedAtTicks = JsonLong(root, "autoBestUpdatedAtTicks", 0),
                 AllowUdp = Json.Bool(root, "allowUdp", false),
                 ForceIpv4 = Json.Bool(root, "forceIpv4", true),
                 FailClosed = Json.Bool(root, "failClosed", true),
@@ -764,6 +934,21 @@ namespace ProxyPicker.Core
                 LastVerifiedOk = Json.Bool(root, "lastVerifiedOk", false),
                 LastVerifiedSummary = Json.Str(root, "lastVerifiedSummary") ?? ""
             };
+            object poolRaw;
+            if (root.TryGetValue("autoBestHopPool", out poolRaw))
+            {
+                var poolArr = Json.AsArray(poolRaw);
+                if (poolArr != null)
+                {
+                    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var item in poolArr)
+                    {
+                        string s = (item as string ?? "").Trim();
+                        if (s.Length > 0 && !IsManagedName(s) && seen.Add(s))
+                            c.AutoBestHopPool.Add(s);
+                    }
+                }
+            }
             return c;
         }
 
@@ -931,35 +1116,51 @@ namespace ProxyPicker.Core
             {
                 // 3. 决定前置跳板组成员列表（绝不包含 PP-STATIC-OUT / PP-STATIC-HOP，防环路）
                 var hopMembers = new List<string>();
-                if (string.Equals(cfg.HopMode, HopPin, StringComparison.OrdinalIgnoreCase) &&
-                    !string.IsNullOrWhiteSpace(cfg.PinnedHopNode))
+                var hopSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                Action<string> tryAddHop = cand =>
                 {
-                    string pinned = cfg.PinnedHopNode.Trim();
-                    if (!IsManagedName(pinned) &&
-                        !pinned.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) &&
-                        !pinned.Equals("REJECT", StringComparison.OrdinalIgnoreCase) &&
-                        !pinned.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase) &&
-                        YamlContainsProxyOrGroupName(text, pinned))
+                    string n = (cand ?? "").Trim();
+                    if (n.Length == 0 ||
+                        IsManagedName(n) ||
+                        n.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                        n.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                        n.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase) ||
+                        n.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase))
+                        return;
+                    if (!hopSeen.Contains(n) && YamlContainsProxyOrGroupName(text, n))
                     {
-                        hopMembers.Add(pinned);
+                        hopSeen.Add(n);
+                        hopMembers.Add(n);
                     }
+                };
+
+                if (string.Equals(cfg.HopMode, HopAuto, StringComparison.OrdinalIgnoreCase))
+                {
+                    // 智能优选模式：将实测最快跳板与 Top 备选池置顶，并把订阅内有效物理节点全量纳入 PP-STATIC-HOP，
+                    // 这样后台/手动随时优选出更快跳板时，只需 PUT /proxies/PP-STATIC-HOP 毫秒热切，无需重载内核不断连。
+                    tryAddHop(preferredFollowNode);
+                    tryAddHop(cfg.AutoBestHopNode);
+                    if (cfg.AutoBestHopPool != null)
+                        foreach (var pNode in cfg.AutoBestHopPool) tryAddHop(pNode);
+                    foreach (var concrete in ExtractConcreteNodeNamesFromYaml(text, 200))
+                        tryAddHop(concrete);
+                }
+                else if (string.Equals(cfg.HopMode, HopPin, StringComparison.OrdinalIgnoreCase) &&
+                         !string.IsNullOrWhiteSpace(cfg.PinnedHopNode))
+                {
+                    tryAddHop(cfg.PinnedHopNode);
                 }
                 else if (string.Equals(cfg.HopMode, HopFollow, StringComparison.OrdinalIgnoreCase) &&
                          !string.IsNullOrWhiteSpace(preferredFollowNode))
                 {
                     // 旁路沙箱无 cache.db：把主内核当前真实活跃物理节点置顶，防止默认命中订阅首行公告/失效节点
-                    string pref = preferredFollowNode.Trim();
-                    if (!IsManagedName(pref) &&
-                        !pref.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) &&
-                        !pref.Equals("REJECT", StringComparison.OrdinalIgnoreCase) &&
-                        !pref.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase) &&
-                        YamlContainsProxyOrGroupName(text, pref))
-                    {
-                        hopMembers.Add(pref);
-                    }
+                    tryAddHop(preferredFollowNode);
                 }
-                if (!hopMembers.Exists(x => x.Equals(hopTarget, StringComparison.OrdinalIgnoreCase)))
+                if (!hopSeen.Contains(hopTarget))
+                {
+                    hopSeen.Add(hopTarget);
                     hopMembers.Add(hopTarget);
+                }
 
                 var groupEntry = BuildHopGroupBlock(hopMembers);
                 text = InjectIntoTopListSection(text, "proxy-groups", groupEntry);
@@ -969,26 +1170,229 @@ namespace ProxyPicker.Core
 
         /// <summary>
         /// 推送新配置后主动对齐内核中 PP-STATIC-HOP 的当前选中项：
-        /// 消除 mihomo 在 store-selected: true 下从 cache.db 恢复旧选择的记忆残留（如从 follow 改成 pin 后仍粘在旧跳板）。
+        /// 消除 mihomo 在 store-selected: true 下从 cache.db 恢复旧选择的记忆残留（如从 follow 改成 pin/auto 后仍粘在旧跳板）。
         /// </summary>
         public static void SyncHopSelectionInKernel(StaticProxyConfig cfg, string mainPolicy, string knownConfigPath)
         {
             if (cfg == null || !cfg.IsActive()) return;
             if (string.Equals(cfg.HopMode, HopDirect, StringComparison.OrdinalIgnoreCase)) return;
             string desired = (mainPolicy ?? "").Trim();
-            if (string.Equals(cfg.HopMode, HopPin, StringComparison.OrdinalIgnoreCase) &&
-                !string.IsNullOrWhiteSpace(cfg.PinnedHopNode) &&
-                !IsManagedName(cfg.PinnedHopNode))
+            if (string.Equals(cfg.HopMode, HopAuto, StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(cfg.AutoBestHopNode) && !IsManagedName(cfg.AutoBestHopNode))
+                    desired = cfg.AutoBestHopNode.Trim();
+                else if (cfg.AutoBestHopPool != null && cfg.AutoBestHopPool.Count > 0 && !string.IsNullOrWhiteSpace(cfg.AutoBestHopPool[0]))
+                    desired = cfg.AutoBestHopPool[0].Trim();
+            }
+            else if (string.Equals(cfg.HopMode, HopPin, StringComparison.OrdinalIgnoreCase) &&
+                     !string.IsNullOrWhiteSpace(cfg.PinnedHopNode) &&
+                     !IsManagedName(cfg.PinnedHopNode))
             {
                 desired = cfg.PinnedHopNode.Trim();
             }
             if (string.IsNullOrEmpty(desired)) return;
+            string _;
+            if (!SwitchHopNodeInKernel(desired, knownConfigPath, out _) &&
+                !desired.Equals(mainPolicy ?? "", StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrEmpty(mainPolicy))
+            {
+                SwitchHopNodeInKernel(mainPolicy.Trim(), knownConfigPath, out _);
+            }
+        }
+
+        /// <summary>不重载配置、不断连：直接热切主内核中 PP-STATIC-HOP 的当前前置跳板节点。</summary>
+        public static bool SwitchHopNodeInKernel(string nodeName, string knownConfigPath, out string error)
+        {
+            error = "";
+            string target = (nodeName ?? "").Trim();
+            if (target.Length == 0 || IsManagedName(target))
+            {
+                error = "无效的前置跳板节点名";
+                return false;
+            }
             try
             {
-                string body = "{\"name\":" + Json.Quote(desired) + "}";
-                Mihomo.Request("PUT", "/proxies/" + Uri.EscapeDataString(HopGroupName), body, 3500, knownConfigPath);
+                string body = "{\"name\":" + Json.Quote(target) + "}";
+                var res = Mihomo.Request("PUT", "/proxies/" + Uri.EscapeDataString(HopGroupName), body, 3500, knownConfigPath);
+                if (res != null && res.Ok) return true;
+                error = res != null ? (string.IsNullOrEmpty(res.Error) ? ("HTTP " + res.Status) : res.Error) : "内核无响应";
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>读取主内核中 PP-STATIC-HOP 当前真实选中的前置节点名。</summary>
+        public static string ReadLiveHopNode(string knownConfigPath)
+        {
+            try
+            {
+                var res = Mihomo.FetchJson("/proxies/" + Uri.EscapeDataString(HopGroupName), 2500, knownConfigPath);
+                if (res != null && res.Ok && res.Data != null)
+                    return (Json.Str(res.Data, "now") ?? "").Trim();
             }
             catch { }
+            return "";
+        }
+
+        /// <summary>从订阅 YAML 的顶层 proxies 段安全抽取物理节点名称列表（兼容块式与行内流式，过滤公告与托管节点）。</summary>
+        internal static List<string> ExtractConcreteNodeNamesFromYaml(string yaml, int maxCount = 120)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrEmpty(yaml) || maxCount <= 0) return result;
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string[] lines = yaml.Replace("\r\n", "\n").Split('\n');
+            bool inProxies = false;
+
+            Action<string> tryAccept = rawName =>
+            {
+                if (result.Count >= maxCount) return;
+                string n = UnquoteYamlScalar(rawName);
+                if (n.Length == 0) return;
+                if (IsManagedName(n) ||
+                    n.Equals("DIRECT", StringComparison.OrdinalIgnoreCase) ||
+                    n.Equals("REJECT", StringComparison.OrdinalIgnoreCase) ||
+                    n.Equals("REJECT-DROP", StringComparison.OrdinalIgnoreCase) ||
+                    n.Equals("GLOBAL", StringComparison.OrdinalIgnoreCase) ||
+                    ProbeSidecar.IsInformationalNodeName(n))
+                    return;
+                if (seen.Add(n)) result.Add(n);
+            };
+
+            for (int i = 0; i < lines.Length && result.Count < maxCount; i++)
+            {
+                string raw = lines[i].TrimEnd();
+                int indent = raw.Length - raw.TrimStart().Length;
+                string t = raw.TrimStart();
+                if (!inProxies)
+                {
+                    if (indent == 0 && (t == "proxies:" || (t.StartsWith("proxies:", StringComparison.Ordinal) &&
+                        (t.Length == 8 || t[8] == ' ' || t[8] == '\t' || t[8] == '#'))))
+                    {
+                        inProxies = true;
+                        string rest = t.Substring(8).Trim();
+                        if (rest.StartsWith("[", StringComparison.Ordinal))
+                        {
+                            foreach (var flowObj in SplitTopLevelFlow(rest.Trim('[', ']')))
+                                TryExtractNameFromInlineMap(flowObj, tryAccept);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if (t.Length == 0 || t.StartsWith("#", StringComparison.Ordinal)) continue;
+                if (indent == 0 && !t.StartsWith("-", StringComparison.Ordinal)) break;
+
+                if (t.StartsWith("-", StringComparison.Ordinal))
+                {
+                    string afterDash = t.Substring(1).TrimStart();
+                    if (afterDash.StartsWith("{", StringComparison.Ordinal))
+                    {
+                        TryExtractNameFromInlineMap(afterDash, tryAccept);
+                        continue;
+                    }
+                    if (afterDash.StartsWith("name:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        tryAccept(afterDash.Substring(5));
+                        continue;
+                    }
+                }
+                else if (t.StartsWith("name:", StringComparison.OrdinalIgnoreCase))
+                {
+                    tryAccept(t.Substring(5));
+                }
+            }
+            return result;
+        }
+
+        static void TryExtractNameFromInlineMap(string mapText, Action<string> onName)
+        {
+            if (string.IsNullOrEmpty(mapText)) return;
+            string s = mapText.Trim();
+            if (s.StartsWith("{", StringComparison.Ordinal)) s = s.Substring(1);
+            int close = s.LastIndexOf('}');
+            if (close >= 0) s = s.Substring(0, close);
+            foreach (var kv in SplitTopLevelFlow(s))
+            {
+                int col = kv.IndexOf(':');
+                if (col <= 0) continue;
+                string k = kv.Substring(0, col).Trim().Trim('"', '\'');
+                if (k.Equals("name", StringComparison.OrdinalIgnoreCase))
+                {
+                    onName(kv.Substring(col + 1));
+                    return;
+                }
+            }
+        }
+
+        static string UnquoteYamlScalar(string raw)
+        {
+            string s = (raw ?? "").Trim();
+            if (s.Length == 0) return "";
+            if (s.StartsWith("\"", StringComparison.Ordinal))
+            {
+                var sb = new StringBuilder(s.Length);
+                for (int i = 1; i < s.Length; i++)
+                {
+                    char c = s[i];
+                    if (c == '\\' && i + 1 < s.Length) { sb.Append(s[++i]); continue; }
+                    if (c == '"') break;
+                    sb.Append(c);
+                }
+                return sb.ToString().Trim();
+            }
+            if (s.StartsWith("'", StringComparison.Ordinal))
+            {
+                var sb = new StringBuilder(s.Length);
+                for (int i = 1; i < s.Length; i++)
+                {
+                    char c = s[i];
+                    if (c == '\'' && i + 1 < s.Length && s[i + 1] == '\'') { sb.Append('\''); i++; continue; }
+                    if (c == '\'') break;
+                    sb.Append(c);
+                }
+                return sb.ToString().Trim();
+            }
+            int hash = s.IndexOf(" #", StringComparison.Ordinal);
+            if (hash >= 0) s = s.Substring(0, hash);
+            return s.Trim();
+        }
+
+        /// <summary>为旁路端到端测速构造一批指向不同候选跳板的临时静态 SOCKS5 节点块。</summary>
+        internal static List<string> BuildBenchmarkProxyBlocks(StaticProxyConfig cfg, IList<string> candidateHops)
+        {
+            var lines = new List<string>();
+            if (cfg == null || candidateHops == null || candidateHops.Count == 0) return lines;
+            for (int i = 0; i < candidateHops.Count; i++)
+            {
+                string hop = (candidateHops[i] ?? "").Trim();
+                if (hop.Length == 0 || IsManagedName(hop)) continue;
+                lines.Add("- name: " + Json.Quote(BenchNodePrefix + i));
+                lines.Add("  type: socks5");
+                lines.Add("  server: " + Json.Quote(cfg.Host.Trim()));
+                lines.Add("  port: " + cfg.Port);
+                if (!string.IsNullOrEmpty(cfg.Username))
+                {
+                    lines.Add("  username: " + Json.Quote(cfg.Username));
+                    lines.Add("  password: " + Json.Quote(cfg.Password ?? ""));
+                }
+                lines.Add("  udp: false");
+                if (cfg.ForceIpv4)
+                    lines.Add("  ip-version: ipv4");
+                lines.Add("  dialer-proxy: " + Json.Quote(hop));
+            }
+            return lines;
+        }
+
+        /// <summary>将一批临时测速节点注入旁路 YAML 的 proxies 段首（供 ProbeSidecar 调用）。</summary>
+        internal static string InjectBenchmarkProxiesIntoYaml(string yaml, StaticProxyConfig cfg, IList<string> candidateHops)
+        {
+            var block = BuildBenchmarkProxyBlocks(cfg, candidateHops);
+            if (block.Count == 0) return yaml;
+            return InjectIntoTopListSection(yaml.Replace("\r\n", "\n"), "proxies", block);
         }
 
         static List<string> BuildProxyNodeBlock(StaticProxyConfig cfg, bool useDialerProxy)
@@ -1264,6 +1668,128 @@ namespace ProxyPicker.Core
             return s.Length > 60 ? s.Substring(0, 60) + "…" : s;
         }
 
+        /// <summary>
+        /// 在零干扰旁路 mihomo 中并发实测订阅内所有物理候选节点经由固定 IP 的端到端真实双跳延迟，
+        /// 自动挑出最快跳板与 Top 12 备选池（绝不修改主网络节点或规则）。
+        /// </summary>
+        public static AutoHopBenchmarkResult BenchmarkBestHopsThroughSidecar(
+            StaticProxyConfig candidate,
+            string knownConfigPath = null,
+            Action<string> progress = null,
+            CancellationToken cancel = default(CancellationToken))
+        {
+            var res = new AutoHopBenchmarkResult();
+            if (candidate == null)
+            {
+                res.Error = "未填写独立固定 IP 参数";
+                return res;
+            }
+            string valErr;
+            if (!candidate.IsValid(out valErr))
+            {
+                res.Error = valErr;
+                return res;
+            }
+            if (string.Equals(candidate.HopMode, HopDirect, StringComparison.OrdinalIgnoreCase))
+            {
+                res.Error = "直连模式不需要前置跳板优选";
+                return res;
+            }
+
+            var testCfg = candidate.Clone();
+            testCfg.Enabled = true;
+
+            var sw = Stopwatch.StartNew();
+            List<string> candidateHops;
+            string startErr;
+            if (progress != null) progress("正在启动零干扰旁路引擎准备全量端到端优选…");
+            using (var session = ProbeSidecar.TryStartForAutoHopBenchmark(knownConfigPath, testCfg, out candidateHops, out startErr))
+            {
+                if (session == null || candidateHops == null || candidateHops.Count == 0)
+                {
+                    res.Error = string.IsNullOrEmpty(startErr) ? "订阅中未发现可用候选跳板节点" : startErr;
+                    return res;
+                }
+
+                int total = candidateHops.Count;
+                res.TestedCount = total;
+                var results = new HopCandidateResult[total];
+                int done = 0;
+                using (var sem = new SemaphoreSlim(16))
+                {
+                    var tasks = new List<Task>(total);
+                    for (int i = 0; i < total; i++)
+                    {
+                        int idx = i;
+                        string hopName = candidateHops[idx];
+                        tasks.Add(Task.Run(() =>
+                        {
+                            if (cancel.IsCancellationRequested)
+                            {
+                                results[idx] = new HopCandidateResult { NodeName = hopName, DelayMs = -1 };
+                                return;
+                            }
+                            sem.Wait();
+                            try
+                            {
+                                int ms = -1;
+                                if (!cancel.IsCancellationRequested)
+                                {
+                                    string _;
+                                    ms = session.MeasureDelay(BenchNodePrefix + idx, 4500, out _);
+                                }
+                                results[idx] = new HopCandidateResult { NodeName = hopName, DelayMs = ms };
+                            }
+                            catch
+                            {
+                                results[idx] = new HopCandidateResult { NodeName = hopName, DelayMs = -1 };
+                            }
+                            finally
+                            {
+                                sem.Release();
+                                int curDone = Interlocked.Increment(ref done);
+                                if (progress != null && (curDone == total || curDone % 4 == 0))
+                                    progress("正在端到端实测最快跳板（" + curDone + "/" + total + "）…");
+                            }
+                        }));
+                    }
+                    Task.WaitAll(tasks.ToArray());
+                }
+
+                sw.Stop();
+                res.ElapsedMs = sw.ElapsedMilliseconds;
+                if (cancel.IsCancellationRequested)
+                {
+                    res.Error = "已取消跳板优选";
+                    return res;
+                }
+
+                var okList = new List<HopCandidateResult>();
+                for (int i = 0; i < results.Length; i++)
+                    if (results[i] != null && results[i].DelayMs > 0) okList.Add(results[i]);
+
+                okList.Sort((a, b) =>
+                {
+                    int cmp = a.DelayMs.CompareTo(b.DelayMs);
+                    return cmp != 0 ? cmp : string.Compare(a.NodeName, b.NodeName, StringComparison.OrdinalIgnoreCase);
+                });
+
+                res.ReachableCount = okList.Count;
+                if (okList.Count == 0)
+                {
+                    res.Error = "全量 " + total + " 个候选跳板均无法连通该固定 IP，请检查 SOCKS5 参数或机场节点状态";
+                    return res;
+                }
+
+                for (int i = 0; i < okList.Count && i < 12; i++)
+                    res.TopCandidates.Add(okList[i]);
+                res.BestNode = okList[0].NodeName;
+                res.BestDelayMs = okList[0].DelayMs;
+                res.Ok = true;
+                return res;
+            }
+        }
+
         public static StaticProbeResult ProbeThroughSidecar(
             StaticProxyConfig candidate,
             string knownConfigPath = null,
@@ -1288,6 +1814,28 @@ namespace ProxyPicker.Core
             var testCfg = candidate.Clone();
             testCfg.Enabled = true;
 
+            // 智能优选模式：先并发端到端测出当前最快前置跳板，再用该冠军跳板跑完整出口与风控体检
+            if (string.Equals(testCfg.HopMode, HopAuto, StringComparison.OrdinalIgnoreCase))
+            {
+                var bench = BenchmarkBestHopsThroughSidecar(testCfg, knownConfigPath, progress);
+                res.AutoBench = bench;
+                if (!bench.Ok || string.IsNullOrEmpty(bench.BestNode))
+                {
+                    res.Stage = "hop";
+                    res.Error = string.IsNullOrEmpty(bench.Error) ? "未能自动优选出可用前置跳板" : bench.Error;
+                    return res;
+                }
+                testCfg.AutoBestHopNode = bench.BestNode;
+                testCfg.AutoBestDelayMs = bench.BestDelayMs;
+                testCfg.AutoBestUpdatedAtTicks = DateTime.UtcNow.Ticks;
+                testCfg.AutoBestHopPool = new List<string>();
+                foreach (var tc in bench.TopCandidates)
+                    if (!string.IsNullOrEmpty(tc.NodeName)) testCfg.AutoBestHopPool.Add(tc.NodeName);
+                res.SelectedHopNode = bench.BestNode;
+                if (progress != null)
+                    progress("已优选最快跳板「" + bench.BestNode + "」（" + bench.BestDelayMs + "ms），正在核验出口纯净度…");
+            }
+
             string mainPolicy;
             string startErr;
             if (progress != null) progress("正在启动零干扰旁路检测引擎…");
@@ -1302,6 +1850,11 @@ namespace ProxyPicker.Core
                 }
 
                 bool directHop = string.Equals(testCfg.HopMode, HopDirect, StringComparison.OrdinalIgnoreCase);
+                if (!directHop && string.IsNullOrEmpty(res.SelectedHopNode))
+                {
+                    if (string.Equals(testCfg.HopMode, HopPin, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(testCfg.PinnedHopNode))
+                        res.SelectedHopNode = testCfg.PinnedHopNode.Trim();
+                }
                 int hopMs = -1;
                 if (!directHop)
                 {
@@ -1935,6 +2488,173 @@ namespace ProxyPicker.Core
             check("SP36 开启独立固定 IP 后摘要卡三通道速率与三色曲线全断点无碰撞（466–880px）",
                 staticLayoutOk,
                 "staticLayoutOk=" + staticLayoutOk);
+
+            // SP37：固定 IP 未开启 AllowUdp 时，自动生成 AND,((NETWORK,UDP),...),REJECT 防穿透规则（禁止 QUIC/WebRTC 落入 MATCH,DIRECT）
+            string chromePathRx = @"(?i)^C:\\Program\ Files\\Google\\Chrome\\Application\\";
+            var udpTestItems = new List<Profile.Item>
+            {
+                new Profile.Item("chrome.exe", NodeName),
+                new Profile.Item("cursor.exe", "PP-FIXED"),
+                new Profile.Item(chromePathRx, NodeName, true) { Derived = true }
+            };
+            string payUdpGuard = Discovery.BuildPayload(baseBlockYaml, udpTestItems, "PP-FIXED", false, null, true);
+            string payNoUdpGuard = Discovery.BuildPayload(baseBlockYaml, udpTestItems, "PP-FIXED", false, null, false);
+            int idxGuardName = payUdpGuard.IndexOf("- AND,((NETWORK,UDP),(PROCESS-NAME,chrome.exe)),REJECT", StringComparison.Ordinal);
+            int idxGuardPath = payUdpGuard.IndexOf("- AND,((NETWORK,UDP),(PROCESS-PATH-REGEX," + chromePathRx + ")),REJECT", StringComparison.Ordinal);
+            int idxMatchDir = payUdpGuard.IndexOf("- MATCH,DIRECT", StringComparison.Ordinal);
+            string parsedExe, parsedRx;
+            bool parseNameOk = IsStaticUdpGuardKernelRule(new Profile.RuleInfo
+            {
+                Type = "AND",
+                Payload = "((Network,udp) && (ProcessName,chrome.exe))",
+                Proxy = "REJECT"
+            }, out parsedExe) && parsedExe == "chrome.exe";
+            bool parsePathOk = IsStaticUdpGuardKernelRule(new Profile.RuleInfo
+            {
+                Type = "AND",
+                Payload = "((Network,udp) && (ProcessPathRegex," + chromePathRx + "))",
+                Proxy = "REJECT"
+            }, out parsedRx) && parsedRx == chromePathRx;
+            check("SP37 固定 IP 默认自动注入 AND/UDP/REJECT 防穿透规则且位于 MATCH,DIRECT 之前（开启 UDP 时不注入）",
+                idxGuardName > 0 && idxGuardPath > idxGuardName && idxMatchDir > idxGuardPath &&
+                !payUdpGuard.Contains("cursor.exe)),REJECT") &&
+                !payNoUdpGuard.Contains("NETWORK,UDP") &&
+                parseNameOk && parsePathOk &&
+                IsStaticUdpGuardRuleLine(BuildUdpGuardRule(false, "chrome.exe")) &&
+                IsStaticUdpGuardRuleLine(BuildUdpGuardRule(true, chromePathRx)),
+                "idxN=" + idxGuardName + " idxP=" + idxGuardPath + " idxM=" + idxMatchDir + " pN=" + parseNameOk + " pP=" + parsePathOk);
+
+            // SP38：Guard.AuditRules + Judge 审计固定 IP 防 UDP 穿透规则缺失与 MATCH 越位
+            var udpPolicies = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["chrome.exe"] = NodeName };
+            var rulesMissingUdp = new List<Profile.RuleInfo>
+            {
+                new Profile.RuleInfo { Type = "ProcessName", Payload = "chrome.exe", Proxy = NodeName },
+                new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" }
+            };
+            var rulesWithUdp = new List<Profile.RuleInfo>
+            {
+                new Profile.RuleInfo { Type = "ProcessName", Payload = "chrome.exe", Proxy = NodeName },
+                new Profile.RuleInfo { Type = "AND", Payload = "((Network,udp) && (ProcessName,chrome.exe))", Proxy = "REJECT" },
+                new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" }
+            };
+            var rulesMatchBeforeUdp = new List<Profile.RuleInfo>
+            {
+                new Profile.RuleInfo { Type = "ProcessName", Payload = "chrome.exe", Proxy = NodeName },
+                new Profile.RuleInfo { Type = "Match", Payload = "", Proxy = "DIRECT" },
+                new Profile.RuleInfo { Type = "AND", Payload = "((Network,udp) && (ProcessName,chrome.exe))", Proxy = "REJECT" }
+            };
+            var audMiss = Guard.AuditRules(rulesMissingUdp, new[] { "chrome.exe" }, udpPolicies, null, true);
+            var audGood = Guard.AuditRules(rulesWithUdp, new[] { "chrome.exe" }, udpPolicies, null, true);
+            var audBadOrder = Guard.AuditRules(rulesMatchBeforeUdp, new[] { "chrome.exe" }, udpPolicies, null, true);
+            check("SP38 Guard 精准揪出固定 IP 缺失 UDP 防穿透规则及 MATCH 越位并在规则齐全时判定通过",
+                audMiss.MissingStaticUdpGuards == 1 &&
+                !string.IsNullOrEmpty(Guard.Judge(audMiss, 1, false)) &&
+                audGood.MissingStaticUdpGuards == 0 &&
+                Guard.Judge(audGood, 1, false) == null &&
+                !string.IsNullOrEmpty(Guard.Judge(audBadOrder, 1, false)),
+                "miss=" + audMiss.MissingStaticUdpGuards + " good=" + audGood.MissingStaticUdpGuards);
+
+            // SP39：Traffic 对账在固定 IP 有大量预期 UDP REJECT 拦截时仍准确判「正常」（不误报链路未知或偏离）
+            var mockStaticRejConns = new Dictionary<string, object>
+            {
+                ["connections"] = new List<object>
+                {
+                    new Dictionary<string, object>
+                    {
+                        ["id"] = "s-tcp-1",
+                        ["chains"] = new List<object> { NodeName },
+                        ["upload"] = 1000.0,
+                        ["download"] = 5000.0,
+                        ["metadata"] = new Dictionary<string, object> { ["process"] = "chrome.exe" }
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["id"] = "s-udp-r1",
+                        ["chains"] = new List<object> { "REJECT" },
+                        ["upload"] = 0.0,
+                        ["download"] = 0.0,
+                        ["metadata"] = new Dictionary<string, object> { ["process"] = "chrome.exe" }
+                    },
+                    new Dictionary<string, object>
+                    {
+                        ["id"] = "s-udp-r2",
+                        ["chains"] = new List<object> { "REJECT" },
+                        ["upload"] = 0.0,
+                        ["download"] = 0.0,
+                        ["metadata"] = new Dictionary<string, object> { ["process"] = "chrome.exe" }
+                    }
+                }
+            };
+            var sampStaticRej = Traffic.AnalyzeConnections(
+                mockStaticRejConns,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "chrome.exe" },
+                true, DateTime.MinValue, null, 0, false,
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "chrome.exe" }, null);
+            check("SP39 Traffic 固定 IP 进程含多条预期 UDP REJECT 拦截时仍判正常且不计偏离",
+                sampStaticRej.Ok && sampStaticRej.Mismatch == 0 &&
+                sampStaticRej.DescribeOutbound().Contains("正常"),
+                "mismatch=" + sampStaticRej.Mismatch);
+
+            // SP40：HopAuto（智能优选最低延迟跳板）DPAPI 持久化、物理节点提取与全量热切注入（严格 DAG 无环）
+            var autoCfg = activeCfg.Clone();
+            autoCfg.HopMode = HopAuto;
+            autoCfg.AutoBestHopNode = "Node-US-01";
+            autoCfg.AutoBestDelayMs = 198;
+            autoCfg.AutoBestHopPool = new List<string> { "Node-US-01", "Node-JP-02" };
+            autoCfg.AutoBestUpdatedAtTicks = t0.Ticks;
+            string autoJson = SerializeConfig(autoCfg);
+            var autoBack = DeserializeConfig(autoJson);
+            string multiNodeYaml =
+                "mode: rule\nproxies:\n" +
+                "- name: 剩余流量：99GB\n  type: ss\n  server: 1.1.1.1\n  port: 443\n" +
+                "- name: Node-JP-02\n  type: vless\n  server: 2.2.2.2\n  port: 443\n" +
+                "- {name: \"Node-US-01\", type: trojan, server: 3.3.3.3, port: 443}\n" +
+                "proxy-groups:\n" +
+                "- name: PP-FIXED\n  type: select\n  proxies:\n    - Node-JP-02\n    - Node-US-01\n" +
+                "rules:\n- MATCH,DIRECT\n";
+            var extracted = ExtractConcreteNodeNamesFromYaml(multiNodeYaml, 20);
+            string injAuto = InjectIntoYaml(multiNodeYaml, autoCfg, "PP-FIXED");
+            int posUs = injAuto.IndexOf("- \"Node-US-01\"", StringComparison.Ordinal);
+            int posJp = injAuto.IndexOf("- \"Node-JP-02\"", StringComparison.Ordinal);
+            int posFb = injAuto.IndexOf("- \"PP-FIXED\"", StringComparison.Ordinal);
+            check("SP40 HopAuto 序列化、物理节点提取与 PP-STATIC-HOP 优选置顶+热切全量成员注入（过滤公告且无环）",
+                autoBack.HopMode == HopAuto && autoBack.AutoBestHopNode == "Node-US-01" &&
+                autoBack.AutoBestDelayMs == 198 && autoBack.AutoBestHopPool.Count == 2 &&
+                extracted.Count == 2 && extracted.Contains("Node-JP-02") && extracted.Contains("Node-US-01") &&
+                posUs > 0 && posJp > posUs && posFb > posJp &&
+                !injAuto.Contains("剩余流量：99GB\"\n"),
+                "ext=" + extracted.Count + " us=" + posUs + " jp=" + posJp + " fb=" + posFb);
+
+            // SP41：ShouldSwitchAutoHop 防抖决策（故障/手动/降幅>=15%且>=60ms 切；微小波动不横跳）
+            check("SP41 ShouldSwitchAutoHop 防抖阈值（>=15% 且 >=60ms 切换；轻微波动不横跳；故障/手动立即切）",
+                !ShouldSwitchAutoHop("A", 300, "A", 180, false, false) &&
+                !ShouldSwitchAutoHop("A", 300, "B", 260, false, false) &&
+                !ShouldSwitchAutoHop("A", 200, "B", 160, false, false) &&
+                ShouldSwitchAutoHop("A", 400, "B", 310, false, false) &&
+                ShouldSwitchAutoHop("A", 400, "B", 390, true, false) &&
+                ShouldSwitchAutoHop("A", 400, "B", 395, false, true) &&
+                !ShouldSwitchAutoHop("A", 400, NodeName, 100, true, true),
+                "debounce");
+
+            // SP42：旁路端到端测速配置生成（unified-delay + PP-BENCH-*）与节点页双按钮全断点无重叠
+            string benchYaml = ProbeSidecar.BuildAutoHopBenchmarkConfigText(
+                multiNodeYaml.Split('\n'), 55101, 55102, "sec", @"C:\Data", autoCfg, extracted);
+            bool barBtnsOk = true;
+            foreach (float tw in new[] { 466f, 520f, 639f, 640f, 880f })
+            {
+                System.Drawing.RectangleF optR, manR;
+                UI.NodesPage.ComputeStaticBarButtons(tw, 180f, true, out optR, out manR);
+                if (optR.IsEmpty || manR.IsEmpty || optR.Right >= manR.Left || manR.Right > tw || optR.Left < 180f)
+                    barBtnsOk = false;
+            }
+            check("SP42 旁路端到端测速配置正确叠加 unified-delay 与 PP-BENCH-* 节点且节点页优选按钮全断点无碰撞",
+                benchYaml.Contains("unified-delay: true") &&
+                benchYaml.Contains("- name: \"PP-BENCH-0\"") &&
+                benchYaml.Contains("- name: \"PP-BENCH-1\"") &&
+                benchYaml.Contains("dialer-proxy: \"Node-JP-02\"") &&
+                benchYaml.Contains("dialer-proxy: \"Node-US-01\"") &&
+                barBtnsOk,
+                "barBtnsOk=" + barBtnsOk);
 
             sb.Insert(0, "\n[独立固定 IP StaticProxy 自检] " + pass + " PASS / " + fail + " FAIL\n");
             return sb.ToString();

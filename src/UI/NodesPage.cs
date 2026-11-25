@@ -62,6 +62,9 @@ namespace ProxyPicker.UI
         int _staticBoundCount;
         int _staticDelayMs = -1;
         bool _staticTimedOut;
+        string _staticHopMode = "";
+        string _staticHopNode = "";
+        bool _staticOptimizing;
 
         public Action<Graphics, RectangleF> Overlay;
 
@@ -74,6 +77,7 @@ namespace ProxyPicker.UI
         public event Action<List<string>> CandidateBatchChanged;
         public event Action<bool> AutoFailoverToggled;
         public event Action ConfigureStaticProxyRequested;
+        public event Action OptimizeStaticHopRequested;
 
         public NodesPage()
         {
@@ -256,7 +260,8 @@ namespace ProxyPicker.UI
             Invalidate();
         }
 
-        public void SetStaticProxyState(bool enabled, string label, string summary, int boundCount, int delayMs = -1, bool timedOut = false)
+        public void SetStaticProxyState(bool enabled, string label, string summary, int boundCount,
+            int delayMs = -1, bool timedOut = false, string hopMode = "", string hopNode = "", bool optimizing = false)
         {
             _staticEnabled = enabled;
             _staticLabel = string.IsNullOrWhiteSpace(label) ? "独立固定IP" : label.Trim();
@@ -264,6 +269,9 @@ namespace ProxyPicker.UI
             _staticBoundCount = Math.Max(0, boundCount);
             _staticDelayMs = delayMs;
             _staticTimedOut = timedOut;
+            _staticHopMode = hopMode ?? "";
+            _staticHopNode = hopNode ?? "";
+            _staticOptimizing = optimizing;
             Invalidate();
         }
 
@@ -366,12 +374,46 @@ namespace ProxyPicker.UI
         float ListTop { get { return StaticBarTop + StaticBarH + 8f; } }
         float RowH { get { return Compact ? 54f : 46f; } }
         RectangleF StaticBarRect { get { return new RectangleF(0f, StaticBarTop, LogicalW, StaticBarH); } }
+        bool ShowStaticOptBtn
+        {
+            get
+            {
+                return _staticEnabled &&
+                       !string.Equals(_staticHopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        internal static void ComputeStaticBarButtons(float lw, float barTop, bool showOptBtn,
+            out RectangleF optRect, out RectangleF manageRect)
+        {
+            bool compact = lw < 640f;
+            float bw = compact ? 54f : 72f;
+            manageRect = new RectangleF(lw - bw - 10f, barTop + 7f, bw, 24f);
+            if (showOptBtn)
+            {
+                float ow = compact ? 64f : 82f;
+                optRect = new RectangleF(manageRect.Left - ow - 6f, barTop + 7f, ow, 24f);
+            }
+            else
+            {
+                optRect = RectangleF.Empty;
+            }
+        }
         RectangleF StaticBtnRect
         {
             get
             {
-                float bw = Compact ? 68f : 86f;
-                return new RectangleF(LogicalW - bw - 10f, StaticBarTop + 7f, bw, 24f);
+                RectangleF opt, man;
+                ComputeStaticBarButtons(LogicalW, StaticBarTop, ShowStaticOptBtn, out opt, out man);
+                return man;
+            }
+        }
+        RectangleF StaticOptBtnRect
+        {
+            get
+            {
+                RectangleF opt, man;
+                ComputeStaticBarButtons(LogicalW, StaticBarTop, ShowStaticOptBtn, out opt, out man);
+                return opt;
             }
         }
 
@@ -568,8 +610,10 @@ namespace ProxyPicker.UI
             using (var b = new SolidBrush(dotCol))
                 g.FillEllipse(b, 14f, bar.Y + 15f, 8f, 8f);
 
-            var btn = StaticBtnRect;
-            float textMaxW = Math.Max(80f, btn.Left - 34f);
+            RectangleF optBtn, btn;
+            ComputeStaticBarButtons(LogicalW, StaticBarTop, ShowStaticOptBtn, out optBtn, out btn);
+            float rightLimit = !optBtn.IsEmpty ? optBtn.Left : btn.Left;
+            float textMaxW = Math.Max(80f, rightLimit - 34f);
             string text;
             Color textCol;
             if (!_staticEnabled)
@@ -581,19 +625,43 @@ namespace ProxyPicker.UI
             }
             else
             {
-                string statusPart = _staticTimedOut
-                    ? "不可达(已锁定防漂移)"
-                    : (_staticDelayMs > 0
-                        ? (_staticDelayMs + "ms")
-                        : (!string.IsNullOrEmpty(_staticSummary) ? _staticSummary : "已启用"));
-                string boundPart = _staticBoundCount > 0 ? (" · " + _staticBoundCount + " 个软件") : " · 尚未绑定软件";
+                string statusPart = _staticOptimizing
+                    ? "优选跳板中…"
+                    : (_staticTimedOut
+                        ? "不可达(已锁定防漂移)"
+                        : (_staticDelayMs > 0
+                            ? (_staticDelayMs + "ms")
+                            : (!string.IsNullOrEmpty(_staticSummary) ? _staticSummary : "已启用")));
+                string hopClean = string.IsNullOrWhiteSpace(_staticHopNode) ? "" : Draw.CleanEmoji(_staticHopNode);
+                bool isAutoHop = string.Equals(_staticHopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                string hopPart = "";
+                if (isAutoHop)
+                    hopPart = string.IsNullOrEmpty(hopClean) ? " · 独立优选" : (" · 优选:" + hopClean);
+                else if (string.Equals(_staticHopMode, StaticProxy.HopPin, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(hopClean))
+                    hopPart = " · 跳板:" + hopClean;
+                else if (string.Equals(_staticHopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+                    hopPart = " · 直连";
+                string boundPart = _staticBoundCount > 0 ? (" · " + _staticBoundCount + " 软件") : " · 未绑软件";
+                string labelSeg = string.Equals(_staticLabel.Replace(" ", ""), "独立固定IP", StringComparison.OrdinalIgnoreCase)
+                    ? "" : (" · " + _staticLabel);
                 text = Compact
-                    ? ("固定 IP · " + _staticLabel + " (" + statusPart + ")")
-                    : ("独立固定 IP · " + _staticLabel + " · " + statusPart + boundPart);
+                    ? ("固定 IP · " + statusPart + hopPart)
+                    : ("独立固定 IP" + labelSeg + " · " + statusPart + hopPart + boundPart);
                 textCol = _staticTimedOut ? Theme.Danger : Theme.Fg;
             }
-            Draw.Text(g, TrimText(g, text, _staticEnabled ? _fSmall : _fSmall, textMaxW), _fSmall, textCol,
+            Draw.Text(g, TrimText(g, text, _fSmall, textMaxW), _fSmall, textCol,
                 new RectangleF(28f, bar.Y + 9f, textMaxW, 20f));
+
+            if (!optBtn.IsEmpty)
+            {
+                bool ho = _hoverHit == "staticOpt";
+                Color optBg = _staticOptimizing ? Theme.AccentSoft : (ho ? Theme.BtnHover : Theme.Card);
+                Color optBorder = (_staticOptimizing || ho) ? Theme.Accent : Theme.Line;
+                Color optFg = (_staticOptimizing || ho) ? Theme.Accent : Theme.Fg;
+                Theme.Fill(g, optBg, optBtn, 7f);
+                Theme.Stroke(g, optBorder, optBtn, 7f);
+                Draw.Text(g, _staticOptimizing ? "优选中…" : (Compact ? "优选" : "优选跳板"), _fTiny, optFg, optBtn, Draw.Center);
+            }
 
             bool hs = _hoverHit == "staticBtn";
             Theme.Fill(g, hs ? Theme.BtnHover : (_staticEnabled ? Theme.Card : Theme.Btn), btn, 7f);
@@ -959,6 +1027,7 @@ namespace ProxyPicker.UI
             if (QuickFastRect.Contains(x, y)) { hit = "qFast"; return; }
             if (QuickRegRect.Contains(x, y)) { hit = "qReg"; return; }
             if (QuickClearRect.Contains(x, y)) { hit = "qClear"; return; }
+            if (ShowStaticOptBtn && StaticOptBtnRect.Contains(x, y)) { hit = "staticOpt"; return; }
             if (StaticBtnRect.Contains(x, y) || StaticBarRect.Contains(x, y)) { hit = "staticBtn"; return; }
 
             if (!ListAreaRect.Contains(x, y) || _viewNodes.Count == 0) return;
@@ -1060,6 +1129,7 @@ namespace ProxyPicker.UI
             if (hit == "qFast") { SelectFastCandidates(); return; }
             if (hit == "qReg") { SelectSameRegionCandidates(); return; }
             if (hit == "qClear") { ClearCandidates(); return; }
+            if (hit == "staticOpt") { OptimizeStaticHopRequested?.Invoke(); return; }
             if (hit == "staticBtn") { ConfigureStaticProxyRequested?.Invoke(); return; }
 
             if (row >= 0 && row < _viewNodes.Count)

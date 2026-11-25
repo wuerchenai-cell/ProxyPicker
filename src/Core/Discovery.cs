@@ -1108,7 +1108,7 @@ namespace ProxyPicker.Core
         /// </summary>
         public static string BuildPayload(string yaml, IList<Profile.Item> items, string policy, bool patchOnly)
         {
-            return BuildPayload(yaml, items, policy, patchOnly, null);
+            return BuildPayload(yaml, items, policy, patchOnly, null, false);
         }
 
         /// <param name="findProcessMode">
@@ -1116,6 +1116,16 @@ namespace ProxyPicker.Core
         /// </param>
         public static string BuildPayload(string yaml, IList<Profile.Item> items, string policy, bool patchOnly,
                                           string findProcessMode)
+        {
+            return BuildPayload(yaml, items, policy, patchOnly, findProcessMode, false);
+        }
+
+        /// <param name="blockUdpForStatic">
+        /// true = 对策略指向独立固定 IP（PP-STATIC-OUT）的每条进程/目录规则，在兜底 MATCH 之前自动追加
+        /// AND,((NETWORK,UDP),...),REJECT 防穿透拦截，防止浏览器 HTTP/3 QUIC 与 WebRTC UDP 跳过 udp:false 节点落入 DIRECT。
+        /// </param>
+        public static string BuildPayload(string yaml, IList<Profile.Item> items, string policy, bool patchOnly,
+                                          string findProcessMode, bool blockUdpForStatic)
         {
             if (string.IsNullOrEmpty(yaml))
                 throw new InvalidOperationException("配置内容为空");
@@ -1220,6 +1230,8 @@ namespace ProxyPicker.Core
             if (items.Count > 0)
             {
                 fresh.Add(indent + "# PP-BEGIN  ProxyPicker 维护的规则块；本块之外的规则一律保留");
+                var staticUdpSeen = blockUdpForStatic ? new HashSet<string>(StringComparer.OrdinalIgnoreCase) : null;
+                var staticUdpRules = blockUdpForStatic ? new List<string>() : null;
                 for (int i = 0; i < items.Count; i++)
                 {
                     bool pathRule = items[i].IsPathRule;
@@ -1229,6 +1241,17 @@ namespace ProxyPicker.Core
                     AssertRuleToken(pol, "策略名");
                     string rule = (pathRule ? "PROCESS-PATH-REGEX," : "PROCESS-NAME,") + target + "," + pol;
                     fresh.Add(indent + "- " + YamlScalar(rule));
+                    if (blockUdpForStatic && StaticProxy.IsStaticPolicy(pol))
+                    {
+                        string key = (pathRule ? "P:" : "N:") + target;
+                        if (staticUdpSeen.Add(key))
+                            staticUdpRules.Add(StaticProxy.BuildUdpGuardRule(pathRule, target));
+                    }
+                }
+                if (staticUdpRules != null)
+                {
+                    foreach (var ur in staticUdpRules)
+                        fresh.Add(indent + "- " + YamlScalar(ur));
                 }
                 if (!patchOnly) fresh.Add(indent + "- MATCH,DIRECT");
                 fresh.Add(indent + "# PP-END");
@@ -1394,16 +1417,19 @@ namespace ProxyPicker.Core
             return res;
         }
 
-        /// <summary>本工具写出的规则行：进程名/目录正则 + PP-FIXED 策略。</summary>
+        /// <summary>本工具写出的规则行：进程名/目录正则 + PP-FIXED / PP-STATIC-OUT 策略，或固定 IP UDP 防穿透规则。</summary>
         static bool IsOwnRuleLine(string line)
         {
             string r = RuleText(line);
+            if (StaticProxy.IsStaticUdpGuardRuleLine(r)) return true;
             if (!r.StartsWith("PROCESS-NAME,", StringComparison.OrdinalIgnoreCase) &&
                 !r.StartsWith("PROCESS-PATH-REGEX,", StringComparison.OrdinalIgnoreCase))
                 return false;
             int comma = r.LastIndexOf(',');
             if (comma <= 0) return false;
-            return r.Substring(comma + 1).Trim().Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase);
+            string pol = r.Substring(comma + 1).Trim();
+            return pol.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase) ||
+                   StaticProxy.IsStaticPolicy(pol);
         }
 
         /// <summary>只认本工具写出的两种 BEGIN：无注释的旧标记，以及带说明的新标记。</summary>

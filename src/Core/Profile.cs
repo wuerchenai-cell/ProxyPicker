@@ -318,11 +318,34 @@ namespace ProxyPicker.Core
         /// <summary>本次会话里内核明确拒绝过目录规则；之后不再尝试，避免每次保存都多推一遍。</summary>
         public static bool PathRulesRejected;
 
+        /// <summary>本次会话里极老内核明确拒绝过 AND 复合规则；之后不再重复触发 400。</summary>
+        public static bool AndRulesRejected;
+
         static bool HasPathRule(List<Item> items)
         {
             if (items == null) return false;
             foreach (var it in items) if (it.IsPathRule) return true;
             return false;
+        }
+
+        static bool HasStaticRule(IList<Item> items)
+        {
+            if (items == null) return false;
+            foreach (var it in items) if (it != null && StaticProxy.IsStaticPolicy(it.Policy)) return true;
+            return false;
+        }
+
+        /// <summary>只有 400 且响应明确指向 AND 复合规则不被旧内核支持时才允许单独降级。</summary>
+        static bool IsAndRuleUnsupported(ApiResult push)
+        {
+            if (push == null || push.Status != 400) return false;
+            string body = ((push.Body ?? "") + " " + (push.Error ?? "")).ToLowerInvariant();
+            if (body.IndexOf("and,((", StringComparison.Ordinal) >= 0) return true;
+            if (body.IndexOf("rule type [and]", StringComparison.Ordinal) >= 0) return true;
+            return body.IndexOf("network,udp", StringComparison.Ordinal) >= 0 &&
+                   (body.IndexOf("unsupported", StringComparison.Ordinal) >= 0 ||
+                    body.IndexOf("invalid", StringComparison.Ordinal) >= 0 ||
+                    body.IndexOf("parse", StringComparison.Ordinal) >= 0);
         }
 
         /// <summary>只有 400 且响应明确指向规则类型/解析失败，才算「旧内核不支持」，才允许降级。</summary>
@@ -748,6 +771,11 @@ namespace ProxyPicker.Core
         /// </summary>
         public static string BuildPayload(string baselinePath, IList<Item> items, bool forceRuleMode = false)
         {
+            return BuildPayloadCore(baselinePath, items, forceRuleMode, !AndRulesRejected);
+        }
+
+        static string BuildPayloadCore(string baselinePath, IList<Item> items, bool forceRuleMode, bool allowStaticUdpGuard)
+        {
             if (string.IsNullOrEmpty(baselinePath) || !File.Exists(baselinePath))
                 throw new FileNotFoundException("没有找到 Clash / mihomo 的配置文件；请先启动客户端");
 
@@ -774,7 +802,8 @@ namespace ProxyPicker.Core
                 throw new InvalidOperationException(
                     "找不到可用的代理策略组（订阅的 proxy-groups 为空或无法识别）；" +
                     "为免规则指向 GLOBAL/DIRECT，已停止保存。请检查订阅配置里的策略组名称。");
-            string payload = Discovery.BuildPayload(text, effectiveItems, policy, Settings.PatchOnly);
+            bool blockStaticUdp = allowStaticUdpGuard && StaticProxy.ShouldBlockStaticUdp(staticCfg);
+            string payload = Discovery.BuildPayload(text, effectiveItems, policy, Settings.PatchOnly, null, blockStaticUdp);
             if (staticCfg.IsActive())
                 payload = StaticProxy.InjectIntoYaml(payload, staticCfg, policy);
             if (forceRuleMode) payload = Discovery.EnsureRuleMode(payload);
@@ -1049,6 +1078,27 @@ namespace ProxyPicker.Core
             // 生成 payload 用的同一份配置——不允许通道绑定再猜一次导致错配。
             var push = Mihomo.PushConfig(payload, 15000, cfg);
 
+            // 若极老非 mihomo 内核不识别 AND 复合防穿透规则，仅剥离 AND 规则重试而不丢失目录规则
+            bool usedStaticUdpGuard = !AndRulesRejected && StaticProxy.ShouldBlockStaticUdp(StaticProxy.Current) && HasStaticRule(items);
+            if (!push.Ok && usedStaticUdpGuard && IsAndRuleUnsupported(push))
+            {
+                string fallbackAnd;
+                try { fallbackAnd = BuildPayloadCore(cfg, items, forceRuleMode, false); }
+                catch { fallbackAnd = null; }
+                if (fallbackAnd != null)
+                {
+                    var retryAnd = Mihomo.PushConfig(fallbackAnd, 15000, cfg);
+                    if (retryAnd.Ok)
+                    {
+                        AndRulesRejected = true;
+                        usedStaticUdpGuard = false;
+                        payload = fallbackAnd;
+                        push = retryAnd;
+                        result.Degraded = true;
+                    }
+                }
+            }
+
             // 只有内核「明确不认识 PROCESS-PATH-REGEX」时才降级。
             // 复审 F-07：以前超时/401/网络中断也会走这里，重试一旦成功就把目录规则
             // 从名单里永久删掉，还谎报「内核不支持」——用户既丢了 helper 覆盖，也查不出原因。
@@ -1057,7 +1107,7 @@ namespace ProxyPicker.Core
                 var onlyNames = new List<Item>();
                 foreach (var it in items) if (!it.IsPathRule) onlyNames.Add(it);
                 string fallback;
-                try { fallback = BuildPayload(cfg, onlyNames, forceRuleMode); }
+                try { fallback = BuildPayloadCore(cfg, onlyNames, forceRuleMode, !AndRulesRejected); }
                 catch { fallback = null; }
                 if (fallback != null)
                 {
@@ -1067,6 +1117,7 @@ namespace ProxyPicker.Core
                     {
                         PathRulesRejected = true;   // 本次会话不再尝试，避免每次保存都白推一遍
                         items = onlyNames;
+                        usedStaticUdpGuard = !AndRulesRejected && StaticProxy.ShouldBlockStaticUdp(StaticProxy.Current) && HasStaticRule(items);
                         payload = fallback;
                         push = retry;
                         result.Degraded = true;
@@ -1121,7 +1172,20 @@ namespace ProxyPicker.Core
             result.RuleCount = rules.Count;
             bool good = rulesOk;
             string whyBad = rulesOk ? "" : "内核规则回读失败（/rules 不可用或鉴权失败），无法确认规则已生效";
-            if (good && rules.Count < items.Count) { good = false; whyBad = "内核规则条数不足"; }
+            var expectedUdpGuards = new List<string>();
+            if (usedStaticUdpGuard && StaticProxy.ShouldBlockStaticUdp(activeStaticAfterPush))
+            {
+                var seenUdp = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var it in items)
+                {
+                    if (it == null || !StaticProxy.IsStaticPolicy(it.Policy)) continue;
+                    string tgt = it.IsPathRule ? it.PathRegex : (it.Exe ?? "");
+                    string key = (it.IsPathRule ? "P:" : "N:") + tgt;
+                    if (tgt.Length > 0 && seenUdp.Add(key)) expectedUdpGuards.Add(tgt);
+                }
+            }
+            int expectedTotalRules = items.Count + expectedUdpGuards.Count;
+            if (good && rules.Count < expectedTotalRules) { good = false; whyBad = "内核规则条数不足"; }
             if (good)
             {
                 for (int i = 0; i < items.Count; i++)
@@ -1144,6 +1208,18 @@ namespace ProxyPicker.Core
                     if (want.Length > 0 && !proxy.Equals(want, StringComparison.OrdinalIgnoreCase))
                     { good = false; whyBad = "第 " + (i + 1) + " 条策略被改成 " + proxy; break; }
                 }
+                for (int j = 0; good && j < expectedUdpGuards.Count; j++)
+                {
+                    int idx = items.Count + j;
+                    string gotUdpTarget;
+                    if (!StaticProxy.IsStaticUdpGuardKernelRule(rules[idx], out gotUdpTarget) ||
+                        !gotUdpTarget.Equals(expectedUdpGuards[j], StringComparison.OrdinalIgnoreCase))
+                    {
+                        good = false;
+                        whyBad = "第 " + (idx + 1) + " 条固定 IP 防 UDP/QUIC 穿透规则未生效";
+                        break;
+                    }
+                }
             }
             // 独立审阅第二轮：默认「代理白名单」的硬约束——兜底 MATCH 必须存在、
             // 策略必须是 DIRECT、位置必须在勾选规则之后。以前只在「恰好找到 MATCH」
@@ -1165,8 +1241,8 @@ namespace ProxyPicker.Core
                 { good = false; whyBad = "兜底 MATCH 的策略是 " + (matchProxy.Length > 0 ? matchProxy : "空") + "，不是 DIRECT，白名单承诺不成立"; }
                 else if (items.Count == 0 && firstMatch != 0)
                 { good = false; whyBad = "空名单下缺少段首直连兜底"; }
-                else if (items.Count > 0 && firstMatch < items.Count)
-                { good = false; whyBad = "直连兜底排在勾选规则前面"; }
+                else if (expectedTotalRules > 0 && firstMatch < expectedTotalRules)
+                { good = false; whyBad = "直连兜底排在勾选或防穿透规则前面"; }
             }
             if (good)
             {
@@ -1538,11 +1614,14 @@ namespace ProxyPicker.Core
             return ipv6Restore || fpmRestore;
         }
 
-        /// <summary>内核里的这一条是不是本工具写的：策略是 PP-FIXED，或 payload 与名单里的条目一致。</summary>
+        /// <summary>内核里的这一条是不是本工具写的：策略是 PP-FIXED / PP-STATIC-OUT，或静态 UDP 防穿透规则，或 payload 与名单条目一致。</summary>
         static bool IsOwnRule(RuleInfo r, HashSet<string> mine)
         {
             if (r == null) return false;
             if ((r.Proxy ?? "").Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase)) return true;
+            if (StaticProxy.IsStaticPolicy(r.Proxy)) return true;
+            string _;
+            if (StaticProxy.IsStaticUdpGuardKernelRule(r, out _)) return true;
             if (!string.IsNullOrEmpty(r.Payload) && mine != null && mine.Contains(r.Payload)) return true;
             return false;
         }

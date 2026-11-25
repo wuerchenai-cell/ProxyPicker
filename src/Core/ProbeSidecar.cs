@@ -710,9 +710,118 @@ namespace ProxyPicker.Core
             return null;
         }
 
+        /// <summary>生成用于「独立固定 IP 全量前置跳板并发测速」的零干扰旁路配置。</summary>
+        internal static string BuildAutoHopBenchmarkConfigText(
+            string[] origYamlLines,
+            int proxyPort,
+            int apiPort,
+            string secret,
+            string origDataDir,
+            StaticProxy.StaticProxyConfig staticOverlay,
+            IList<string> candidateHops)
+        {
+            string baseYaml = BuildSidecarConfigText(origYamlLines, proxyPort, apiPort, secret, origDataDir, null, null, null);
+            baseYaml = "unified-delay: true\n" + baseYaml;
+            if (staticOverlay != null && candidateHops != null && candidateHops.Count > 0)
+                baseYaml = StaticProxy.InjectBenchmarkProxiesIntoYaml(baseYaml, staticOverlay, candidateHops);
+            return baseYaml;
+        }
+
+        /// <summary>为「独立固定 IP 端到端全量跳板优选」启动隔离旁路内核实例（绝不触碰主网络与主规则）。</summary>
+        public static SidecarSession TryStartForAutoHopBenchmark(
+            string knownConfigPath,
+            StaticProxy.StaticProxyConfig staticOverlay,
+            out List<string> candidateHops,
+            out string error)
+        {
+            candidateHops = new List<string>();
+            error = "";
+            EnsureProcessExitCleanup();
+            SweepStaleTempDirs();
+
+            if (staticOverlay == null || !staticOverlay.IsValid(out error))
+            {
+                if (string.IsNullOrEmpty(error)) error = "独立固定 IP 参数无效";
+                return null;
+            }
+
+            string cfgPath = !string.IsNullOrEmpty(knownConfigPath) ? knownConfigPath : Paths.ClashYaml;
+            if (string.IsNullOrEmpty(cfgPath) || !File.Exists(cfgPath))
+            {
+                error = "未找到有效的客户端配置文件，请先启动 Clash / mihomo 客户端";
+                return null;
+            }
+
+            string kernelExe = FindKernelExePath();
+            if (string.IsNullOrEmpty(kernelExe) || !File.Exists(kernelExe))
+            {
+                error = "未找到同源 mihomo 内核程序";
+                return null;
+            }
+
+            string rawText;
+            try { rawText = File.ReadAllText(cfgPath, Encoding.UTF8); }
+            catch (Exception ex) { error = ex.Message; return null; }
+
+            candidateHops = StaticProxy.ExtractConcreteNodeNamesFromYaml(rawText, 120);
+            if (candidateHops.Count == 0)
+            {
+                // 兼容纯 proxy-providers 订阅（顶层无内联 proxies）：回退读取主内核已加载的物理节点列表
+                try
+                {
+                    var cat = NodeManager.LoadCatalog(cfgPath);
+                    if (cat != null && cat.Ok && cat.Nodes != null)
+                    {
+                        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var n in cat.Nodes)
+                        {
+                            if (n == null || n.IsGroup || string.IsNullOrWhiteSpace(n.Name)) continue;
+                            if (StaticProxy.IsManagedName(n.Name) || IsInformationalNodeName(n.Name)) continue;
+                            if (seen.Add(n.Name))
+                            {
+                                candidateHops.Add(n.Name);
+                                if (candidateHops.Count >= 120) break;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (candidateHops.Count == 0)
+            {
+                error = "当前订阅未找到可用物理节点，无法自动优选跳板";
+                return null;
+            }
+
+            string[] origLines = rawText.Replace("\r\n", "\n").Split('\n');
+            string origDataDir = Path.GetDirectoryName(cfgPath) ?? "";
+            var hopsSnapshot = candidateHops;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                bool earlyExit;
+                var session = TryStartCustomOnce(
+                    (proxyPort, apiPort, secret) => BuildAutoHopBenchmarkConfigText(
+                        origLines, proxyPort, apiPort, secret, origDataDir, staticOverlay, hopsSnapshot),
+                    kernelExe, out earlyExit, out error);
+                if (session != null) return session;
+                if (!earlyExit) return null;
+            }
+            return null;
+        }
+
         static SidecarSession TryStartOnce(
             string[] origLines, string origDataDir, string kernelExe,
             StaticProxy.StaticProxyConfig staticOverlay, string mainPolicy, string preferredFollowNode,
+            out bool earlyExit, out string error)
+        {
+            return TryStartCustomOnce(
+                (proxyPort, apiPort, secret) => BuildSidecarConfigText(
+                    origLines, proxyPort, apiPort, secret, origDataDir, staticOverlay, mainPolicy, preferredFollowNode),
+                kernelExe, out earlyExit, out error);
+        }
+
+        static SidecarSession TryStartCustomOnce(
+            Func<int, int, string, string> yamlBuilder, string kernelExe,
             out bool earlyExit, out string error)
         {
             earlyExit = false;
@@ -728,7 +837,7 @@ namespace ProxyPicker.Core
                 if (apiPort == proxyPort) apiPort = AllocateFreeLoopbackPort();
                 string secret = Guid.NewGuid().ToString("N").Substring(0, 20);
 
-                string probeYaml = BuildSidecarConfigText(origLines, proxyPort, apiPort, secret, origDataDir, staticOverlay, mainPolicy, preferredFollowNode);
+                string probeYaml = yamlBuilder(proxyPort, apiPort, secret);
                 string probeYamlPath = Path.Combine(tempDir, "probe.yaml");
                 File.WriteAllText(probeYamlPath, probeYaml, new UTF8Encoding(false));
 

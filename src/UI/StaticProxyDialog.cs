@@ -89,6 +89,10 @@ namespace ProxyPicker.UI
         bool _lastVerifyOk;
         string _lastVerifySummary = "";
         long _lastVerifyTicks;
+        string _autoBestHopNode = "";
+        int _autoBestDelayMs = -1;
+        List<string> _autoBestHopPool = new List<string>();
+        long _autoBestUpdatedTicks;
 
         public StaticProxyDialog(
             StaticProxy.StaticProxyConfig current,
@@ -107,6 +111,10 @@ namespace ProxyPicker.UI
             _lastVerifyOk = _initial.LastVerifiedOk;
             _lastVerifySummary = _initial.LastVerifiedSummary ?? "";
             _lastVerifyTicks = _initial.LastVerifiedAtTicks;
+            _autoBestHopNode = _initial.AutoBestHopNode ?? "";
+            _autoBestDelayMs = _initial.AutoBestDelayMs;
+            _autoBestHopPool = _initial.AutoBestHopPool != null ? new List<string>(_initial.AutoBestHopPool) : new List<string>();
+            _autoBestUpdatedTicks = _initial.AutoBestUpdatedAtTicks;
 
             AutoScaleMode = AutoScaleMode.None;
             Text = "独立固定 IP（可选 · 按软件单独指定）";
@@ -157,10 +165,10 @@ namespace ProxyPicker.UI
                 Left = pad,
                 Top = S(14),
                 Width = innerW,
-                Height = S(42),
+                Height = S(44),
                 ForeColor = Theme.Dim,
                 Font = F(12f),
-                Text = "只让下方勾中的软件单独走该固定 IP；其余已代理软件仍走高速节点，未勾软件仍直连。\n默认经由现有高速节点链式加速，不修改原订阅，凭据仅在本机 DPAPI 加密保存。"
+                Text = "仅让勾中软件走固定 IP，自动拦截 UDP/QUIC 防泄漏国内 IP；其余代理仍走主 VPN。\n支持「智能优选最低延迟跳板」独立加速，不改原订阅，凭据本机 DPAPI 加密保存。"
             };
             Controls.Add(lblIntro);
 
@@ -292,7 +300,7 @@ namespace ProxyPicker.UI
 
             int ap = S(12);
             int aw = _advPanel.Width - ap * 2;
-            int hopW = S(296);
+            int hopW = S(340);
             _advPanel.Controls.Add(MakeFieldLabel("连接方式 / 第一跳前置通道", ap, S(8), hopW));
             _advPanel.Controls.Add(MakeFieldLabel("界面别名", ap + hopW + S(12), S(8), aw - hopW - S(12)));
 
@@ -306,7 +314,8 @@ namespace ProxyPicker.UI
                 ForeColor = Theme.Fg,
                 Font = F(12f)
             };
-            _cmbHop.Items.Add("链式：自动跟随当前高速节点（推荐）");
+            _cmbHop.Items.Add("链式：智能优选最低延迟跳板（独立，推荐）");
+            _cmbHop.Items.Add("链式：自动跟随当前高速主节点");
             _cmbHop.Items.Add("直连：直接连接该 SOCKS5（不经前置跳板）");
             foreach (var n in _availableNodes)
             {
@@ -341,7 +350,7 @@ namespace ProxyPicker.UI
                 Height = S(24),
                 ForeColor = Theme.Dim,
                 Font = F(11.5f),
-                Text = "允许 SOCKS5 UDP（默认关闭防 QUIC 卡顿；仅服务商明确支持时开启）",
+                Text = "允许 SOCKS5 UDP（默认关闭：自动拦截 UDP/QUIC 防泄漏国内 IP）",
                 Checked = false
             };
             _advPanel.Controls.Add(_chkUdp);
@@ -517,10 +526,19 @@ namespace ProxyPicker.UI
             _chkIpv4.Checked = _initial.ForceIpv4;
             _chkUdp.Checked = _initial.AllowUdp;
 
-            int hopIdx = 0;
-            if (string.Equals(_initial.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+            bool isBrandNew = !_initial.Enabled && string.IsNullOrWhiteSpace(_initial.Host);
+            int hopIdx = isBrandNew ? 0 : 1;
+            if (string.Equals(_initial.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase))
+            {
+                hopIdx = 0;
+            }
+            else if (string.Equals(_initial.HopMode, StaticProxy.HopFollow, StringComparison.OrdinalIgnoreCase) && !isBrandNew)
             {
                 hopIdx = 1;
+            }
+            else if (string.Equals(_initial.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+            {
+                hopIdx = 2;
             }
             else if (string.Equals(_initial.HopMode, StaticProxy.HopPin, StringComparison.OrdinalIgnoreCase) &&
                      !string.IsNullOrEmpty(_initial.PinnedHopNode))
@@ -538,7 +556,11 @@ namespace ProxyPicker.UI
 
             if (_initial.Enabled && !string.IsNullOrEmpty(_initial.LastVerifiedSummary))
             {
-                SetStatusText((_initial.LastVerifiedOk ? "上次体检通过：" : "上次体检提示：") + _initial.LastVerifiedSummary,
+                string hopNote = "";
+                if (string.Equals(_initial.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrEmpty(_initial.AutoBestHopNode))
+                    hopNote = " · 优选跳板：" + Draw.CleanEmoji(_initial.AutoBestHopNode);
+                SetStatusText((_initial.LastVerifiedOk ? "上次体检通过：" : "上次体检提示：") + _initial.LastVerifiedSummary + hopNote,
                     _initial.LastVerifiedOk ? Theme.Ok : Theme.Warn);
             }
             _suppressQuickParse = false;
@@ -695,7 +717,11 @@ namespace ProxyPicker.UI
             string hopMode = StaticProxy.HopFollow;
             string pinned = "";
             string selHop = _cmbHop.SelectedItem as string ?? "";
-            if (_cmbHop.SelectedIndex == 1 || selHop.StartsWith("直连：", StringComparison.Ordinal))
+            if (_cmbHop.SelectedIndex == 0 || selHop.StartsWith("链式：智能优选", StringComparison.Ordinal))
+            {
+                hopMode = StaticProxy.HopAuto;
+            }
+            else if (_cmbHop.SelectedIndex == 2 || selHop.StartsWith("直连：", StringComparison.Ordinal))
             {
                 hopMode = StaticProxy.HopDirect;
             }
@@ -715,6 +741,10 @@ namespace ProxyPicker.UI
                 Password = _txtPass.Text ?? "",
                 HopMode = hopMode,
                 PinnedHopNode = pinned,
+                AutoBestHopNode = _autoBestHopNode ?? "",
+                AutoBestDelayMs = _autoBestDelayMs,
+                AutoBestHopPool = _autoBestHopPool != null ? new List<string>(_autoBestHopPool) : new List<string>(),
+                AutoBestUpdatedAtTicks = _autoBestUpdatedTicks,
                 AllowUdp = _chkUdp.Checked,
                 ForceIpv4 = _chkIpv4.Checked,
                 FailClosed = true,
@@ -778,9 +808,24 @@ namespace ProxyPicker.UI
                 _lastVerifyTicks = DateTime.UtcNow.Ticks;
                 _lastVerifyOk = res.Ok;
                 _lastVerifySummary = res.Ok ? res.Summary : res.Error;
+                if (res.AutoBench != null && res.AutoBench.Ok && !string.IsNullOrEmpty(res.AutoBench.BestNode))
+                {
+                    _autoBestHopNode = res.AutoBench.BestNode;
+                    _autoBestDelayMs = res.AutoBench.BestDelayMs;
+                    _autoBestUpdatedTicks = DateTime.UtcNow.Ticks;
+                    _autoBestHopPool = res.AutoBench.TopCandidates
+                        .Where(x => x != null && !string.IsNullOrEmpty(x.NodeName))
+                        .Select(x => x.NodeName)
+                        .ToList();
+                }
                 if (res.Ok)
                 {
-                    string hopHint = res.HopDelayMs > 0 ? ("（第一跳 " + res.HopDelayMs + "ms）") : "（直连模式）";
+                    string hopHint;
+                    if (res.AutoBench != null && res.AutoBench.Ok && !string.IsNullOrEmpty(res.AutoBench.BestNode))
+                        hopHint = "（已优选跳板：" + Draw.CleanEmoji(res.AutoBench.BestNode) + " · " +
+                                  res.AutoBench.BestDelayMs + "ms，" + res.AutoBench.ReachableCount + "/" + res.AutoBench.TestedCount + " 可达）";
+                    else
+                        hopHint = res.HopDelayMs > 0 ? ("（第一跳 " + res.HopDelayMs + "ms）") : "（直连模式）";
                     SetStatusText("检测通过：" + res.Summary + hopHint, Theme.Ok);
                 }
                 else

@@ -45,6 +45,8 @@ namespace ProxyPicker.Core
             /// <summary>内核里的规则存在、但策略与名单不一致的条数。</summary>
             public int WrongPolicy;
             public readonly List<string> WrongPolicyNames = new List<string>();
+            /// <summary>固定 IP 未允许 UDP 时，内核中缺失的防 UDP/QUIC 穿透规则条数。</summary>
+            public int MissingStaticUdpGuards;
         }
 
         public static Intent Audit(IEnumerable<string> wanted)
@@ -79,12 +81,14 @@ namespace ProxyPicker.Core
             bool rulesOk;
             var rules = Profile.ReadRules(out rulesOk, knownConfigPath);
             if (!rulesOk) { it.Error = "内核规则表读取失败（/rules 不可用或鉴权失败）"; return it; }
-            return AuditRules(rules, wanted, policies, it);
+            bool needStaticUdpGuard = !Profile.AndRulesRejected && StaticProxy.ShouldBlockStaticUdp(StaticProxy.Current);
+            return AuditRules(rules, wanted, policies, it, needStaticUdpGuard);
         }
 
         /// <summary>纯规则审计（遵循 mihomo 自上而下首次命中优先）：同 payload 后续重复项不覆盖首条索引与策略。</summary>
         internal static Intent AuditRules(List<Profile.RuleInfo> rules, IEnumerable<string> wanted,
-                                          Dictionary<string, string> policies, Intent into = null)
+                                          Dictionary<string, string> policies, Intent into = null,
+                                          bool requireStaticUdpGuard = false)
         {
             var it = into ?? new Intent();
             rules = rules ?? new List<Profile.RuleInfo>();
@@ -97,10 +101,12 @@ namespace ProxyPicker.Core
             var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var presentPolicy = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             var presentIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            var udpGuardIndex = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < rules.Count; i++)
             {
                 var r = rules[i];
                 string type = r.Type ?? "";
+                string udpTarget;
                 // PROCESS-NAME / PROCESS-PATH / PROCESS-PATH-REGEX 都算「按进程分流」，
                 // 目录规则的目的是把辅助进程一起包含进来，不能在对账时被当成不存在。
                 if (type.StartsWith("Process", StringComparison.OrdinalIgnoreCase))
@@ -115,6 +121,10 @@ namespace ProxyPicker.Core
                             presentPolicy[r.Payload] = r.Proxy;
                     }
                     if (!string.IsNullOrEmpty(r.Proxy)) it.Policy = r.Proxy;
+                }
+                else if (StaticProxy.IsStaticUdpGuardKernelRule(r, out udpTarget))
+                {
+                    if (!udpGuardIndex.ContainsKey(udpTarget)) udpGuardIndex[udpTarget] = i;
                 }
                 else if (type.Equals("RuleSet", StringComparison.OrdinalIgnoreCase) &&
                          (r.Payload ?? "").IndexOf("pp-whitelist", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -147,6 +157,17 @@ namespace ProxyPicker.Core
                             int atPath;
                             if (presentIndex.TryGetValue(raw, out atPath) && atPath > it.LastWantedIndex)
                                 it.LastWantedIndex = atPath;
+                            int atUdpPath;
+                            if (udpGuardIndex.TryGetValue(raw, out atUdpPath) && atUdpPath > it.LastWantedIndex)
+                                it.LastWantedIndex = atUdpPath;
+                            string actualPathPol;
+                            if (requireStaticUdpGuard &&
+                                presentPolicy.TryGetValue(raw, out actualPathPol) &&
+                                StaticProxy.IsStaticPolicy(actualPathPol) &&
+                                !udpGuardIndex.ContainsKey(raw))
+                            {
+                                it.MissingStaticUdpGuards++;
+                            }
                         }
                         continue;
                     }
@@ -155,12 +176,16 @@ namespace ProxyPicker.Core
                     if (!present.Contains(name)) { it.Missing.Add(name); continue; }
                     int at;
                     if (presentIndex.TryGetValue(name, out at) && at > it.LastWantedIndex) it.LastWantedIndex = at;
+                    int atUdp;
+                    if (udpGuardIndex.TryGetValue(name, out atUdp) && atUdp > it.LastWantedIndex) it.LastWantedIndex = atUdp;
                     // 规则在，但策略被改成了别的（例如期望 DIRECT，实际走了代理组）。
                     string expect;
+                    bool expectStatic = false;
                     if (policies != null && policies.TryGetValue(name, out expect) &&
                         !string.IsNullOrEmpty(expect) &&
                         !expect.Equals("PP-FIXED", StringComparison.OrdinalIgnoreCase))
                     {
+                        expectStatic = StaticProxy.IsStaticPolicy(expect);
                         string actual;
                         if (presentPolicy.TryGetValue(name, out actual) &&
                             !actual.Equals(expect, StringComparison.OrdinalIgnoreCase))
@@ -169,6 +194,8 @@ namespace ProxyPicker.Core
                             if (it.WrongPolicyNames.Count < 5) it.WrongPolicyNames.Add(name);
                         }
                     }
+                    if (requireStaticUdpGuard && expectStatic && !udpGuardIndex.ContainsKey(name))
+                        it.MissingStaticUdpGuards++;
                 }
             }
             return it;
@@ -209,6 +236,8 @@ namespace ProxyPicker.Core
                     return "有 " + it.WrongPolicy + " 条规则的策略被改了：" + Sample(it.WrongPolicyNames);
                 if (it.MissingPathRules > 0)
                     return "有 " + it.MissingPathRules + " 条软件目录规则没生效";
+                if (it.MissingStaticUdpGuards > 0)
+                    return "有 " + it.MissingStaticUdpGuards + " 条固定 IP 防 UDP/QUIC 穿透规则缺失";
                 return null;
             }
 
@@ -220,6 +249,8 @@ namespace ProxyPicker.Core
             if (it.WrongPolicy > 0)
                 return "有 " + it.WrongPolicy + " 条规则的策略被改了：" + Sample(it.WrongPolicyNames);
             if (it.MissingPathRules > 0) return "有 " + it.MissingPathRules + " 条软件目录规则没生效";
+            if (it.MissingStaticUdpGuards > 0)
+                return "有 " + it.MissingStaticUdpGuards + " 条固定 IP 防 UDP/QUIC 穿透规则缺失";
             // 独立审阅第二轮 P1：白名单的兜底 MATCH 是硬约束——必须存在、策略必须 DIRECT、
             // 位置必须在所有勾选规则之后。以前只在「恰好找到 MATCH」时查位置，
             // MATCH 消失或被改成 MATCH,PROXY 都会漏检，界面仍显示「名单已生效」。

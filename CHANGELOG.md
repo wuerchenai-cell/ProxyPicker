@@ -4,6 +4,18 @@
 程序里的「检查更新」读的是 GitHub Releases API 的 `tag_name`，不是本文件里的条目；
 本文件只是给人看的变更记录。
 
+## v2.5.0 — 2026-11-25（彻底封死固定 IP UDP/QUIC 穿透直连 + 独立端到端最低延迟前置跳板自动优选）
+
+- **修复：彻底封死固定 IP 绑定进程的 UDP / HTTP/3 QUIC / WebRTC 穿透直连漏洞（Core/Discovery.cs、Core/Profile.cs、Core/Guard.cs、Core/Traffic.cs）**
+  - 修复在静态 SOCKS5 节点默认 udp: false 时，mihomo 遇到浏览器 HTTP/3（QUIC UDP:443）或 WebRTC UDP 请求会跳过 PROCESS-NAME 规则、直接穿透至 MATCH,DIRECT 导致暴露本地真实 IP 的问题。
+  - 启用固定 IP 且未勾选「允许 SOCKS5 UDP」时，自动在所有进程/目录规则之后、兜底 MATCH,DIRECT 之前为每个固定 IP 目标注入 AND,((NETWORK,UDP),(PROCESS-NAME/PROCESS-PATH-REGEX,...)),REJECT 防穿透规则，强迫浏览器毫秒级无感回落 HTTP/2 TCP 继续走固定 IP，并同步封堵 WebRTC UDP 直连。
+  - 完整接入推送回读校验、看守缺失自动补回（MissingStaticUdpGuards）、老内核精准降级安全网（AndRulesRejected）、退出干净还原（IsOwnRule）及固定 IP 预期 REJECT 连接不误报链路未知（Traffic.TryVerdict）。
+- **新增：独立固定 IP「智能优选最低延迟跳板」模式（与主 VPN 完全解耦）（Core/StaticProxy.cs、Core/ProbeSidecar.cs、UI/StaticProxyDialog.cs、UI/NodesPage.cs、UI/MainForm.cs）**
+  - 新增 HopAuto（「智能优选最低延迟跳板」）连接方式：在零干扰旁路内核（unified-delay: true）中 16 路并发实测订阅全量物理节点经由固定 IP 的**端到端真实双跳延迟**，自动选出最快前置跳板与 Top 12 备选池；支持纯 proxy-providers 订阅自动回退读取。
+  - PP-STATIC-HOP 独立维护优选跳板并与主 VPN 节点（PP-FIXED）完全分离：主 VPN 手动选任何地区均不影响固定 IP 的最快通道；支持通过 PUT /proxies/PP-STATIC-HOP 毫秒热切跳板不断连、节点页「优选跳板」一键实测、后台超时自动急救换跳板以及 25 分钟周期低频平滑复优（>=15% 且 >=60ms 防抖门槛），外部出口 IP 始终保持不变。
+- **自检扩展**
+  - 新增 SP37–SP42 覆盖 UDP 防穿透规则生成与内核解析、Guard 审计与越位拦截、Traffic 预期 REJECT 判定、HopAuto DPAPI 持久化与 DAG 注入、切换防抖阈值及旁路测速/节点页双按钮全断点几何边界，离线自检扩展至 **340 项**（通用 201 + 安全 52 + 流量 20 + 节点 7 + 风控 13 + 侧车 5 + 独立固定 IP 42，全部 0 失败）；同步升级版本号至 2.5.0。
+
 ## v2.4.0 — 2026-11-25（独立固定 IP 实时上下行网速与三色实时流量曲线）
 
 - **新增：三通道实时流量独立统计（Core/Traffic.cs）**

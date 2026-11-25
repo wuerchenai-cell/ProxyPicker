@@ -129,7 +129,9 @@ namespace ProxyPicker.Core
         {
             mismatch = false;
             int known = rt.Proxy + rt.Direct;
-            if (known == 0 || rt.Unknown + rt.Rejected > known)
+            if (known == 0 ||
+                (!rt.ExpectedStatic && rt.Unknown + rt.Rejected > known) ||
+                (rt.ExpectedStatic && rt.Unknown > known))
             { verdict = "链路未知"; return false; }
             if (rt.ExpectedStatic)
             {
