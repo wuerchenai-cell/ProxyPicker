@@ -32,6 +32,21 @@ namespace ProxyPicker.Core
         /// <summary>直连落地模式（不经前置跳板）：适用于海外网络、自带中转或内网直达的 SOCKS5 节点。</summary>
         public const string HopDirect = "direct";
 
+        /// <summary>双跳跨洋静态 SOCKS5 健康检查单次超时上限（毫秒）。</summary>
+        public const int HealthTimeoutMs = 10000;
+
+        /// <summary>
+        /// 静态 IP 健康检查防抖动判据：
+        /// 手动测速失败立即提示；后台巡检首次超时先静默复检（底层规则依然锁定防漂移），
+        /// 连续两轮仍超时且距上次报警 &gt;= 120 秒才触发告警，避免 10 秒瞬间抖动误吓唬用户。
+        /// </summary>
+        public static bool ShouldAlertStaticTimeout(bool manual, int timeoutStreak, DateTime lastAlertUtc, DateTime nowUtc)
+        {
+            if (manual) return true;
+            if (timeoutStreak < 2) return false;
+            return lastAlertUtc == DateTime.MinValue || (nowUtc - lastAlertUtc).TotalSeconds >= 120;
+        }
+
         const string BeginMarker = "# PP-STATIC-BEGIN";
         const string EndMarker = "# PP-STATIC-END";
 
@@ -1873,6 +1888,29 @@ namespace ProxyPicker.Core
             check("SP33 旁路沙箱 follow 模式将主内核真实活跃节点置顶于 PP-STATIC-HOP 首位",
                 idxPref > 0 && idxFallback > idxPref,
                 "pref=" + idxPref + " fb=" + idxFallback);
+
+            // SP34：健康检查防瞬态抖动判据（单次后台超时不误弹窗，连续两轮才触发报警，并遵守 120s 冷却）
+            DateTime t0 = new DateTime(2026, 11, 25, 10, 0, 0, DateTimeKind.Utc);
+            check("SP34 后台单次超时抖动不误报不可达（手动或连续两轮才告警且守 120s 冷却）",
+                !ShouldAlertStaticTimeout(false, 1, DateTime.MinValue, t0) &&
+                ShouldAlertStaticTimeout(true, 1, t0, t0.AddSeconds(5)) &&
+                ShouldAlertStaticTimeout(false, 2, DateTime.MinValue, t0) &&
+                !ShouldAlertStaticTimeout(false, 2, t0, t0.AddSeconds(60)) &&
+                ShouldAlertStaticTimeout(false, 2, t0, t0.AddSeconds(121)),
+                "alertPolicy");
+
+            // SP35：停用确认窗默认主按钮必须为「切回高速代理」，防止误关闭原本的高速代理开关
+            bool disablePromptOk = false;
+            using (var prompt = new UI.StaticProxyDialog.DisableConfirmPrompt(new List<string> { "Chrome", "Edge" }))
+            {
+                var acceptBtn = prompt.AcceptButton as System.Windows.Forms.Button;
+                disablePromptOk = acceptBtn != null &&
+                                  acceptBtn.Text == "切回高速代理" &&
+                                  prompt.SelectedOutcome == UI.StaticProxyDialog.DialogOutcome.Cancelled;
+            }
+            check("SP35 停用确认窗默认焦点为「切回高速代理」且不默认关闭高速代理",
+                disablePromptOk,
+                "disablePromptOk=" + disablePromptOk);
 
             sb.Insert(0, "\n[独立固定 IP StaticProxy 自检] " + pass + " PASS / " + fail + " FAIL\n");
             return sb.ToString();

@@ -157,6 +157,7 @@ namespace ProxyPicker.UI
         int _staticDelayMs = -1;
         bool _staticTimedOut;
         bool _staticChecking;
+        int _staticTimeoutStreak;
         DateTime _lastStaticAlertAt = DateTime.MinValue;
         bool _staticWarnShown;
         string _status = "正在准备…";
@@ -5481,6 +5482,7 @@ namespace ProxyPicker.UI
 
                 _staticDelayMs = -1;
                 _staticTimedOut = false;
+                _staticTimeoutStreak = 0;
 
                 if (dlg.Outcome == StaticProxyDialog.DialogOutcome.SavedAndEnabled)
                 {
@@ -5552,11 +5554,13 @@ namespace ProxyPicker.UI
             try
             {
                 string cfgPath = Paths.ClashYaml;
-                var res = await Task.Run(() => Profile.MeasureDelayConfirmed(StaticProxy.NodeName, null, 7000, cfgPath));
+                var res = await Task.Run(() => Profile.MeasureDelayConfirmed(
+                    StaticProxy.NodeName, null, StaticProxy.HealthTimeoutMs, cfgPath));
                 if (!UiAlive || res.KernelUnreachable) return;
                 if (res.Ok)
                 {
                     bool wasDown = _staticTimedOut;
+                    _staticTimeoutStreak = 0;
                     _staticDelayMs = res.DelayMs;
                     _staticTimedOut = false;
                     SyncStaticUiBanner();
@@ -5568,20 +5572,27 @@ namespace ProxyPicker.UI
                 }
                 else if (res.TimedOut)
                 {
+                    _staticTimeoutStreak++;
+                    if (!manual && _staticTimeoutStreak == 1)
+                    {
+                        // 后台首次超时先静默等待 12 秒二次确认（底层 PP-STATIC-OUT 规则依然锁定防漂移），
+                        // 避免跨洋瞬时 10 秒内可自愈的波动误弹窗吓唬用户去停用。
+                        _ = ReconfirmStaticProxyHealthAfterDelayAsync();
+                        return;
+                    }
                     // 严格遵循宁断不漂（Fail-Closed）：绝不自动把固定 IP 软件漂移到普通共享节点
                     _staticDelayMs = -1;
                     _staticTimedOut = true;
                     SyncStaticUiBanner();
-                    bool alertDue = manual || (DateTime.UtcNow - _lastStaticAlertAt).TotalSeconds >= 120;
-                    if (alertDue)
+                    if (StaticProxy.ShouldAlertStaticTimeout(manual, _staticTimeoutStreak, _lastStaticAlertAt, DateTime.UtcNow))
                     {
                         _lastStaticAlertAt = DateTime.UtcNow;
                         AuditLog.Record("STATIC", "独立固定 IP 不可达（已锁定防漂移）：" + (res.Error ?? "超时"));
                         Toast("独立固定 IP 不可达（已锁定防漂移）",
-                            "为防止 IP 暴露，已阻断漂移到普通节点；请检查前置跳板或续费静态 IP",
+                            "为防止 IP 暴露，已阻断漂移到普通节点；请检查前置跳板或静态 IP 状态",
                             Theme.Danger, 3);
                         if (!Visible && TrayBalloon != null)
-                            TrayBalloon("独立固定 IP 不可达（已锁定防漂移）", "请检查前置节点或静态 IP 状态");
+                            TrayBalloon("独立固定 IP 不可达（已锁定防漂移）", "请检查前置跳板或静态 IP 状态");
                     }
                 }
             }
@@ -5590,6 +5601,17 @@ namespace ProxyPicker.UI
             {
                 _staticChecking = false;
             }
+        }
+
+        async Task ReconfirmStaticProxyHealthAfterDelayAsync()
+        {
+            try
+            {
+                await Task.Delay(12000);
+                if (!UiAlive || _shuttingDown || !StaticProxy.IsEnabledAndValid || _staticTimeoutStreak <= 0) return;
+                await CheckStaticProxyHealthAsync(false);
+            }
+            catch { }
         }
 
         public string DiagnosticsText() { return DiagnosticsText(_traffic); }

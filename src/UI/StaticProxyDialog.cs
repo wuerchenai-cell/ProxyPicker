@@ -823,33 +823,158 @@ namespace ProxyPicker.UI
             var boundNames = _allApps.Where(a => a.Proxy && a.IsStatic).Select(a => a.Name).ToList();
             if (boundNames.Count == 0)
             {
-                Outcome = DialogOutcome.DisabledToDirect;
+                Outcome = DialogOutcome.DisabledToDefaultProxy;
                 DialogResult = DialogResult.OK;
                 Close();
                 return;
             }
 
-            string sample = string.Join("、", boundNames.GetRange(0, Math.Min(3, boundNames.Count)));
-            if (boundNames.Count > 3) sample += " 等 " + boundNames.Count + " 个软件";
+            using (var prompt = new DisableConfirmPrompt(boundNames))
+            {
+                prompt.ShowDialog(this);
+                if (prompt.SelectedOutcome == DialogOutcome.Cancelled) return;
+                Outcome = prompt.SelectedOutcome;
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+        }
 
-            var choice = MessageBox.Show(
-                this,
-                "当前仍有 " + boundNames.Count + " 个软件锁定使用独立固定 IP（" + sample + "）。\n\n" +
-                "停用独立固定 IP 后，这些软件要如何处理？\n\n" +
-                "• 点「是(Y)」：改为直连（最严防风控推荐，避免暴露到普通共享节点）\n" +
-                "• 点「否(N)」：切回普通高速代理\n" +
-                "• 点「取消」：暂不停用",
-                "停用独立固定 IP",
-                MessageBoxButtons.YesNoCancel,
-                MessageBoxIcon.Question,
-                MessageBoxDefaultButton.Button1);
+        /// <summary>
+        /// 停用独立固定 IP 时清晰二选一确认窗（按 Theme.S 缩放）：
+        /// 默认按钮为「切回高速代理」，避免系统 YesNo 弹窗让用户误点把原本的高速代理也全部关成直连。
+        /// </summary>
+        internal sealed class DisableConfirmPrompt : Form
+        {
+            public DialogOutcome SelectedOutcome { get; private set; } = DialogOutcome.Cancelled;
+            readonly List<Font> _fonts = new List<Font>();
 
-            if (choice == DialogResult.Cancel) return;
-            Outcome = choice == DialogResult.Yes
-                ? DialogOutcome.DisabledToDirect
-                : DialogOutcome.DisabledToDefaultProxy;
-            DialogResult = DialogResult.OK;
-            Close();
+            public DisableConfirmPrompt(IList<string> boundNames)
+            {
+                int count = boundNames != null ? boundNames.Count : 0;
+                string sample = "";
+                if (count > 0)
+                {
+                    var items = new List<string>(boundNames);
+                    sample = string.Join("、", items.GetRange(0, Math.Min(3, items.Count)));
+                    if (count > 3) sample += " 等 " + count + " 个软件";
+                }
+
+                AutoScaleMode = AutoScaleMode.None;
+                Text = "停用独立固定 IP";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                ShowInTaskbar = false;
+                StartPosition = FormStartPosition.CenterParent;
+                BackColor = Theme.Bg;
+                ForeColor = Theme.Fg;
+
+                var bodyFont = Theme.Ui(12.5f * Theme.S);
+                var btnFont = Theme.Ui(12f * Theme.S);
+                var primaryFont = Theme.Ui(12f * Theme.S, FontStyle.Bold);
+                _fonts.Add(bodyFont);
+                _fonts.Add(btnFont);
+                _fonts.Add(primaryFont);
+                Font = bodyFont;
+
+                int pad = S(20);
+                int w = S(476);
+                int innerW = w - pad * 2;
+
+                string msg = "当前仍有 " + count + " 个软件绑定了独立固定 IP（" + sample + "）。\n\n" +
+                             "停用独立固定 IP 后，这些软件要如何处理？\n\n" +
+                             "• 「切回高速代理」（推荐）：保留代理开启，改走原机场高速节点。\n" +
+                             "• 「改为直连(防风控)」：关闭代理开关，防止暴露到普通共享 IP。";
+
+                Size measured = TextRenderer.MeasureText(
+                    msg, bodyFont, new Size(innerW, int.MaxValue),
+                    TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
+                int msgH = Math.Max(S(110), measured.Height + S(12));
+
+                var lbl = new Label
+                {
+                    Left = pad,
+                    Top = S(18),
+                    Width = innerW,
+                    Height = msgH,
+                    Font = bodyFont,
+                    ForeColor = Theme.Fg,
+                    Text = msg
+                };
+                Controls.Add(lbl);
+
+                int btnY = lbl.Bottom + S(18);
+                int btnH = S(34);
+                int gap = S(10);
+
+                var btnCancel = new Button
+                {
+                    Width = S(76),
+                    Height = btnH,
+                    Top = btnY,
+                    Left = w - pad - S(76),
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = Theme.Btn,
+                    ForeColor = Theme.Fg,
+                    Font = btnFont,
+                    Text = "取消",
+                    Cursor = Cursors.Hand
+                };
+                btnCancel.FlatAppearance.BorderColor = Theme.Line;
+                btnCancel.FlatAppearance.BorderSize = 1;
+                btnCancel.Click += (s, e) => { SelectedOutcome = DialogOutcome.Cancelled; Close(); };
+
+                var btnDirect = new Button
+                {
+                    Width = S(156),
+                    Height = btnH,
+                    Top = btnY,
+                    Left = btnCancel.Left - S(156) - gap,
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = Theme.Btn,
+                    ForeColor = Theme.Fg,
+                    Font = btnFont,
+                    Text = "改为直连(防风控)",
+                    Cursor = Cursors.Hand
+                };
+                btnDirect.FlatAppearance.BorderColor = Theme.Line;
+                btnDirect.FlatAppearance.BorderSize = 1;
+                btnDirect.Click += (s, e) => { SelectedOutcome = DialogOutcome.DisabledToDirect; DialogResult = DialogResult.OK; Close(); };
+
+                var btnKeepHighSpeed = new Button
+                {
+                    Width = S(140),
+                    Height = btnH,
+                    Top = btnY,
+                    Left = btnDirect.Left - S(140) - gap,
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = Theme.Accent,
+                    ForeColor = Color.White,
+                    Font = primaryFont,
+                    Text = "切回高速代理",
+                    Cursor = Cursors.Hand
+                };
+                btnKeepHighSpeed.FlatAppearance.BorderSize = 0;
+                btnKeepHighSpeed.Click += (s, e) => { SelectedOutcome = DialogOutcome.DisabledToDefaultProxy; DialogResult = DialogResult.OK; Close(); };
+
+                Controls.Add(btnKeepHighSpeed);
+                Controls.Add(btnDirect);
+                Controls.Add(btnCancel);
+
+                ClientSize = new Size(w, btnY + btnH + S(18));
+                AcceptButton = btnKeepHighSpeed;
+                CancelButton = btnCancel;
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    foreach (var f in _fonts) { try { f.Dispose(); } catch { } }
+                    _fonts.Clear();
+                }
+                base.Dispose(disposing);
+            }
         }
     }
 }

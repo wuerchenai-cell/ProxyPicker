@@ -4,6 +4,19 @@
 程序里的「检查更新」读的是 GitHub Releases API 的 `tag_name`，不是本文件里的条目；
 本文件只是给人看的变更记录。
 
+## v2.3.1 — 2026-11-25（固定 IP 停用默认切回高速防误关 + 跨洋抖动双轮复检加固）
+
+- **修复：停用独立固定 IP 不再误关高速代理（UI/StaticProxyDialog.cs）**
+  - 将停用确认弹窗由容易误触的系统 YesNoCancel 提示框升级为自适应高 DPI 的清晰三按钮对话框 DisableConfirmPrompt：
+    - 默认主按钮（AcceptButton）改为 **「切回高速代理」**，保留这些软件的代理开启并平滑恢复为 PP-FIXED 高速代理；
+    - **「改为直连(防风控)」** 设为独立次按钮，仅显式点击时才关闭代理开关；
+    - **「取消」** 设为 CancelButton，无误操作风险。
+- **优化：独立固定 IP 健康检查抗瞬态抖动防误报（Core/StaticProxy.cs、UI/MainForm.cs）**
+  - 双跳跨洋链路的单次健康检测超时上限由 7000 ms 放宽至 10000 ms（StaticProxy.HealthTimeoutMs）。
+  - 引入 _staticTimeoutStreak 与 StaticProxy.ShouldAlertStaticTimeout：后台定时体检首次遇到超时时先保持底层 PP-STATIC-OUT 规则锁死防漂移并在 12 秒后静默复检一次；仅当手动测速失败或连续两轮仍不可达（且满足 120 秒冷却）时触发红字弹窗与托盘告警，消除几秒内可自愈波动带来的误报警。
+- **工程与自检收口**
+  - 新增静态代理单元测试 SP34–SP35（2 项），离线自检扩展至 **332 项**（201 + 52 + 19 + 7 + 13 + 5 + 35，全部 0 失败）；同步更新版本号至 2.3.1（ProxyPicker.csproj、pp.manifest）。
+
 ## v2.3.0 — 2026-11-24（可选独立固定 IP 多渠道分流与进程列表无损自动刷新）
 
 - **新增：独立固定 IP（静态 SOCKS5）多渠道分流（可选）**
