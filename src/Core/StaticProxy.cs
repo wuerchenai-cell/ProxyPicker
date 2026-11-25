@@ -1912,6 +1912,30 @@ namespace ProxyPicker.Core
                 disablePromptOk,
                 "disablePromptOk=" + disablePromptOk);
 
+            // SP36：开启独立固定 IP 摘要卡高度扩展与全宽度无碰撞几何边界自检（466px 到 880px 全断点）
+            bool staticLayoutOk = true;
+            foreach (float tw in new[] { 466f, 519f, 520f, 534f, 577f, 639f, 640f, 706f, 880f })
+            {
+                bool sDual, twoRow;
+                float sDivX, sLeft1R, sLeft2R;
+                System.Drawing.RectangleF sSpark, sMini, sRect, sortRect;
+                System.Drawing.RectangleF[] tRects;
+                UI.MainForm.ComputeSummaryLayoutBounds(
+                    tw, true, out sDual, out sDivX, out sSpark, out sMini, out sLeft1R, out sLeft2R);
+                UI.MainForm.ComputeAppsToolbarBounds(tw, true, out sRect, out tRects, out sortRect, out twoRow);
+                float sumBot = 88f + UI.MainForm.SummaryHeightFor(true);
+                if (sDual != (tw >= 520f)) staticLayoutOk = false;
+                if (sSpark.IsEmpty || sSpark.Width < 120f || sSpark.Height < 26f || sSpark.Bottom >= sumBot) staticLayoutOk = false;
+                if (!sDual && (sMini.IsEmpty || sMini.Height < 30f || sMini.Bottom >= sSpark.Y)) staticLayoutOk = false;
+                if (sDual && (sLeft1R >= sDivX || sLeft2R >= sDivX || sDivX >= sSpark.X)) staticLayoutOk = false;
+                if (sRect.Y <= sumBot || UI.MainForm.ListTopFor(twoRow, true) <= tRects[0].Bottom) staticLayoutOk = false;
+                if (twoRow && sRect.Right >= sortRect.X) staticLayoutOk = false;
+                if (!twoRow && (sRect.Right >= tRects[0].X || tRects[3].Right >= sortRect.X)) staticLayoutOk = false;
+            }
+            check("SP36 开启独立固定 IP 后摘要卡三通道速率与三色曲线全断点无碰撞（466–880px）",
+                staticLayoutOk,
+                "staticLayoutOk=" + staticLayoutOk);
+
             sb.Insert(0, "\n[独立固定 IP StaticProxy 自检] " + pass + " PASS / " + fail + " FAIL\n");
             return sb.ToString();
         }

@@ -23,16 +23,31 @@ namespace ProxyPicker.UI
         const float NavTop = 48f;
         const float NavH = 34f;
         const float SummaryTop = 88f;
-        const float SummaryH = 74f;
-        const float SearchTop = 168f;
+        const float SummaryHBase = 74f;
+        const float SummaryHWithStatic = 92f;
         const float SearchH = 34f;
         const float FooterH = 66f;
         const float FooterSlimH = 34f;
 
+        internal static float SummaryHeightFor(bool showStatic) { return showStatic ? SummaryHWithStatic : SummaryHBase; }
+        internal static float SearchTopFor(bool showStatic) { return SummaryTop + SummaryHeightFor(showStatic) + 6f; }
+        internal static float TabsTopFor(bool twoRow, bool showStatic)
+        {
+            float st = SearchTopFor(showStatic);
+            return twoRow ? (st + 40f) : (st + 3f);
+        }
+        internal static float ListTopFor(bool twoRow, bool showStatic)
+        {
+            return TabsTopFor(twoRow, showStatic) + (twoRow ? 34f : 37f);
+        }
+
+        bool ShowStaticRow { get { return StaticProxy.IsEnabledAndValid; } }
+        float SummaryH { get { return SummaryHeightFor(ShowStaticRow); } }
+        float SearchTop { get { return SearchTopFor(ShowStaticRow); } }
         bool NarrowShell { get { return LogicalW < 640f; } }
         bool CompactToolbar { get { return LogicalW < 640f; } }
-        float TabsTop { get { return CompactToolbar ? 208f : 171f; } }
-        float ListTop { get { return CompactToolbar ? 242f : 208f; } }
+        float TabsTop { get { return TabsTopFor(CompactToolbar, ShowStaticRow); } }
+        float ListTop { get { return ListTopFor(CompactToolbar, ShowStaticRow); } }
 
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
@@ -181,9 +196,11 @@ namespace ProxyPicker.UI
         Traffic.Sample _traffic;
         // 界面显示值与内核采样值分开：采样每秒跳一次，显示值按时间连续逼近，
         // 数字不再「0 → 800 KB/s → 0」地瞬间变脸。
-        double _rateProxyDown, _rateProxyUp, _rateDirectDown, _rateDirectUp;
+        double _rateProxyDown, _rateProxyUp, _rateStaticDown, _rateStaticUp, _rateDirectDown, _rateDirectUp;
         readonly List<float> _sparkProxy = new List<float>();
+        readonly List<float> _sparkStatic = new List<float>();
         readonly List<float> _sparkDirect = new List<float>();
+        bool _lastShowStaticRow;
         // 横轴固定为 1 秒一格，纵轴使用固定对数刻度。
         // 不能再随当前峰值/采样间隔重缩放：那会把已经发生的历史点整体拉高、压低或拉宽，
         // 用户看到的就是「之前的速度还在上下动」。这里只有最新一段做插值，旧点永远不重算。
@@ -610,6 +627,8 @@ namespace ProxyPicker.UI
                 // 220ms 时间常数既能去掉台阶，也不会把真实变化拖成慢动作。
                 _rateProxyDown = Approach(_rateProxyDown, _traffic.ProxyDown, dt, 0.22);
                 _rateProxyUp = Approach(_rateProxyUp, _traffic.ProxyUp, dt, 0.22);
+                _rateStaticDown = Approach(_rateStaticDown, _traffic.StaticDown, dt, 0.22);
+                _rateStaticUp = Approach(_rateStaticUp, _traffic.StaticUp, dt, 0.22);
                 _rateDirectDown = Approach(_rateDirectDown, _traffic.DirectDown, dt, 0.22);
                 _rateDirectUp = Approach(_rateDirectUp, _traffic.DirectUp, dt, 0.22);
                 summaryNeed = true;
@@ -2136,7 +2155,7 @@ namespace ProxyPicker.UI
                 else
                 {
                     // 内核断线后立刻把旧网速归零，防止界面停留在大数字上假装还在跑流量
-                    _rateProxyDown = _rateProxyUp = _rateDirectDown = _rateDirectUp = 0;
+                    _rateProxyDown = _rateProxyUp = _rateStaticDown = _rateStaticUp = _rateDirectDown = _rateDirectUp = 0;
                     if (wasTrafficOk)
                     {
                         Mihomo.Forget();
@@ -2157,6 +2176,7 @@ namespace ProxyPicker.UI
                             for (int i = 0; i < _sparkAt.Count; i++) _sparkAt[i] += shift;
                     }
                     Push(_sparkProxy, (float)s.ProxyDown);
+                    Push(_sparkStatic, (float)s.StaticDown);
                     Push(_sparkDirect, (float)s.DirectDown);
                     long last = _sparkAt.Count > 0 ? _sparkAt[_sparkAt.Count - 1] : long.MinValue;
                     long next = now;
@@ -3740,9 +3760,23 @@ namespace ProxyPicker.UI
 
         float LogicalW { get { return ClientSize.Width > 0 ? ClientSize.Width / Theme.S : DefaultWinW; } }
         float LogicalH { get { return ClientSize.Height > 0 ? ClientSize.Height / Theme.S : DefaultWinH; } }
-        /// <summary>计算摘要卡在不同窗口逻辑宽度下的对称双栏 / 极窄紧凑折线图无碰撞布局。</summary>
+        /// <summary>兼容既有 7 参数布局检查（不含独立固定 IP 增高行）。</summary>
         internal static void ComputeSummaryLayoutBounds(
             float logicalW,
+            out bool dualColumn,
+            out float divX,
+            out RectangleF sparkRect,
+            out RectangleF miniRatePillRect,
+            out float leftRow1Right,
+            out float leftRow2Right)
+        {
+            ComputeSummaryLayoutBounds(logicalW, false, out dualColumn, out divX, out sparkRect, out miniRatePillRect, out leftRow1Right, out leftRow2Right);
+        }
+
+        /// <summary>计算摘要卡在不同窗口逻辑宽度与是否开启独立固定 IP 下的对称双栏 / 极窄紧凑折线图无碰撞布局。</summary>
+        internal static void ComputeSummaryLayoutBounds(
+            float logicalW,
+            bool showStatic,
             out bool dualColumn,
             out float divX,
             out RectangleF sparkRect,
@@ -3760,7 +3794,9 @@ namespace ProxyPicker.UI
                 divX = cardRight - rightW - 14f;
                 float rx = divX + 12f;
                 float rw = Math.Max(180f, cardRight - 14f - rx);
-                sparkRect = new RectangleF(rx, SummaryTop + 42f, rw, 24f);
+                sparkRect = showStatic
+                    ? new RectangleF(rx, SummaryTop + 55f, rw, 28f)
+                    : new RectangleF(rx, SummaryTop + 42f, rw, 24f);
                 miniRatePillRect = RectangleF.Empty;
                 leftRow1Right = divX - 10f;
                 leftRow2Right = divX - 10f;
@@ -3770,8 +3806,16 @@ namespace ProxyPicker.UI
                 divX = 0f;
                 const float miniW = 122f;
                 float rx = cardRight - 12f - miniW;
-                miniRatePillRect = new RectangleF(rx, SummaryTop + 8f, miniW, 20f);
-                sparkRect = new RectangleF(rx, SummaryTop + 34f, miniW, 29f);
+                if (showStatic)
+                {
+                    miniRatePillRect = new RectangleF(rx, SummaryTop + 6f, miniW, 33f);
+                    sparkRect = new RectangleF(rx, SummaryTop + 44f, miniW, 40f);
+                }
+                else
+                {
+                    miniRatePillRect = new RectangleF(rx, SummaryTop + 8f, miniW, 20f);
+                    sparkRect = new RectangleF(rx, SummaryTop + 34f, miniW, 29f);
+                }
                 leftRow1Right = rx - 8f;
                 leftRow2Right = rx - 8f;
             }
@@ -3784,7 +3828,7 @@ namespace ProxyPicker.UI
                 bool dual;
                 float divX, l1, l2;
                 RectangleF spark, mini;
-                ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
+                ComputeSummaryLayoutBounds(LogicalW, ShowStaticRow, out dual, out divX, out spark, out mini, out l1, out l2);
                 return divX;
             }
         }
@@ -3816,10 +3860,11 @@ namespace ProxyPicker.UI
                 bool dual;
                 float divX, l1, l2;
                 RectangleF spark, mini;
-                ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
+                bool showStatic = ShowStaticRow;
+                ComputeSummaryLayoutBounds(LogicalW, showStatic, out dual, out divX, out spark, out mini, out l1, out l2);
                 float x = LogicalW < 660f ? 174f : 186f;
                 float w = Math.Max(0f, l1 - x);
-                return new RectangleF(x, SummaryTop + 13, w, 18);
+                return new RectangleF(x, SummaryTop + 13f + (showStatic ? 9f : 0f), w, 18);
             }
         }
         RectangleF SparkRect
@@ -3829,12 +3874,11 @@ namespace ProxyPicker.UI
                 bool dual;
                 float divX, l1, l2;
                 RectangleF spark, mini;
-                ComputeSummaryLayoutBounds(LogicalW, out dual, out divX, out spark, out mini, out l1, out l2);
+                ComputeSummaryLayoutBounds(LogicalW, ShowStaticRow, out dual, out divX, out spark, out mini, out l1, out l2);
                 return spark;
             }
         }
 
-        /// <summary>计算第 1 页工具栏（搜索框、4 枚筛选标签、排序按钮）在不同窗口宽度下的无碰撞布局矩形。</summary>
         internal static void ComputeAppsToolbarBounds(
             float logicalW,
             out RectangleF searchRect,
@@ -3842,16 +3886,29 @@ namespace ProxyPicker.UI
             out RectangleF sortRect,
             out bool twoRow)
         {
-            twoRow = logicalW < 640f;
-            float tabsTop = twoRow ? 208f : 171f;
+            ComputeAppsToolbarBounds(logicalW, false, out searchRect, out tabRects, out sortRect, out twoRow);
+        }
 
-            float sortY = twoRow ? SearchTop + 3f : tabsTop;
+        /// <summary>计算第 1 页工具栏（搜索框、4 枚筛选标签、排序按钮）在不同窗口宽度下的无碰撞布局矩形。</summary>
+        internal static void ComputeAppsToolbarBounds(
+            float logicalW,
+            bool showStatic,
+            out RectangleF searchRect,
+            out RectangleF[] tabRects,
+            out RectangleF sortRect,
+            out bool twoRow)
+        {
+            twoRow = logicalW < 640f;
+            float searchTop = SearchTopFor(showStatic);
+            float tabsTop = TabsTopFor(twoRow, showStatic);
+
+            float sortY = twoRow ? searchTop + 3f : tabsTop;
             sortRect = new RectangleF(logicalW - 24f - 76f, sortY, 76f, 28f);
 
             float searchW = twoRow
                 ? Math.Max(160f, logicalW - 48f - 84f)
                 : Math.Min(300f, Math.Max(148f, logicalW - 446f));
-            searchRect = new RectangleF(24f, SearchTop, searchW, SearchH);
+            searchRect = new RectangleF(24f, searchTop, searchW, SearchH);
 
             float startX = twoRow ? 24f : (searchRect.Right + 10f);
             float rightBound = twoRow ? (logicalW - 24f) : (sortRect.X - 8f);
@@ -3873,7 +3930,7 @@ namespace ProxyPicker.UI
                 RectangleF s, sort;
                 RectangleF[] tabs;
                 bool twoRow;
-                ComputeAppsToolbarBounds(LogicalW, out s, out tabs, out sort, out twoRow);
+                ComputeAppsToolbarBounds(LogicalW, ShowStaticRow, out s, out tabs, out sort, out twoRow);
                 return s;
             }
         }
@@ -3905,7 +3962,7 @@ namespace ProxyPicker.UI
                 RectangleF s, sort;
                 RectangleF[] tabs;
                 bool twoRow;
-                ComputeAppsToolbarBounds(LogicalW, out s, out tabs, out sort, out twoRow);
+                ComputeAppsToolbarBounds(LogicalW, ShowStaticRow, out s, out tabs, out sort, out twoRow);
                 return sort;
             }
         }
@@ -3915,7 +3972,7 @@ namespace ProxyPicker.UI
             RectangleF s, sort;
             RectangleF[] tabs;
             bool twoRow;
-            ComputeAppsToolbarBounds(LogicalW, out s, out tabs, out sort, out twoRow);
+            ComputeAppsToolbarBounds(LogicalW, ShowStaticRow, out s, out tabs, out sort, out twoRow);
             return (i >= 0 && i < 4) ? tabs[i] : RectangleF.Empty;
         }
 
@@ -4208,13 +4265,20 @@ namespace ProxyPicker.UI
         }
 
         void DrawRateRow(Graphics g, float rx, float rw, float y, string label, bool ok,
-            double down, double up, Color valColor)
+            double down, double up, Color valColor, bool showDot = false)
         {
-            bool tight = rw < 210f;
-            float labelW = tight ? (label.IndexOf('≈') >= 0 ? 31f : 27f) : 34f;
+            bool tight = rw < 214f;
+            float dotOff = showDot ? 8f : 0f;
+            float textW = tight ? (label.IndexOf('≈') >= 0 ? 31f : 27f) : (label.Length >= 4 ? 38f : 34f);
+            float labelW = dotOff + textW;
             float rateX = rx + labelW, rateW = rw - labelW;
-            float downW = tight ? rateW * 0.50f : 86f, upW = rateW - downW;
-            Draw.Text(g, label, _fTiny, Theme.Dim, new RectangleF(rx, y + 1, labelW, 15));
+            float downW = tight ? rateW * 0.50f : Math.Min(86f, rateW * 0.52f), upW = rateW - downW;
+            if (showDot)
+            {
+                using (var db = new SolidBrush(Color.FromArgb(215, valColor)))
+                    g.FillEllipse(db, rx, y + 6f, 4.5f, 4.5f);
+            }
+            Draw.Text(g, label, _fTiny, Theme.Dim, new RectangleF(rx + dotOff, y + 1, textW, 15));
             if (!ok)
             {
                 Draw.Text(g, "—", _fRate, valColor, new RectangleF(rateX, y, rateW, 16), Draw.Right);
@@ -4231,10 +4295,12 @@ namespace ProxyPicker.UI
             var card = SummaryRect;
             float lw = LogicalW;
             bool compactCopy = lw < 660f;
+            bool showStatic = ShowStaticRow;
+            float leftYOff = showStatic ? 9f : 0f;
             bool dualColumn;
             float divX, leftRow1Right, leftRow2Right;
             RectangleF sparkRect, miniRatePillRect;
-            ComputeSummaryLayoutBounds(lw, out dualColumn, out divX, out sparkRect, out miniRatePillRect, out leftRow1Right, out leftRow2Right);
+            ComputeSummaryLayoutBounds(lw, showStatic, out dualColumn, out divX, out sparkRect, out miniRatePillRect, out leftRow1Right, out leftRow2Right);
 
             Draw.Shadow(g, card, 10f, Theme.Dark ? 60 : 22);
             Theme.Fill(g, Theme.Card, card, 10f);
@@ -4245,7 +4311,7 @@ namespace ProxyPicker.UI
             float countMeasured = g.MeasureString(countText, _fSummary).Width;
             float countBoxW = Math.Min(compactCopy ? 154f : 168f, (float)Math.Ceiling(countMeasured) + 4f);
             Draw.Text(g, countText, _fSummary, selected > 0 ? Theme.Accent : Theme.Fg,
-                new RectangleF(38, SummaryTop + 9, countBoxW, 24));
+                new RectangleF(38, SummaryTop + 9 + leftYOff, countBoxW, 24));
 
             string rest = Settings.PatchOnly ? "按订阅规则" : "其余直连";
             bool modeKnown = _state.ConfigOk && !string.IsNullOrEmpty(_state.Mode) && _state.Mode != "?";
@@ -4265,22 +4331,44 @@ namespace ProxyPicker.UI
                 rest = (Settings.PatchOnly ? "取消勾选≠直连 · 按订阅规则" : "其余软件全部直连") +
                        (_visibleProcs > 0 ? (" · 可见 " + _visibleProcs + " 个") : "");
             float restX = 38f + countBoxW + 8f;
-            _mismatchRect = new RectangleF(restX, SummaryTop + 13f, Math.Max(0f, leftRow1Right - restX), 18f);
+            _mismatchRect = new RectangleF(restX, SummaryTop + 13f + leftYOff, Math.Max(0f, leftRow1Right - restX), 18f);
             Draw.Text(g, rest, _fSmall, (!_state.ConfigOk || nonRuleMode || notProxyActive || _mismatch > 0) ? Theme.Warn : Theme.Dim, _mismatchRect);
 
             if (!dualColumn)
             {
                 bool rateOkMini = _state.ConfigOk && _traffic != null && _traffic.Ok;
-                string rateStr = !_state.ConfigOk
-                    ? "内核未连接"
-                    : (!_state.ProxyActive && !rateOkMini
-                        ? "代理未开启"
-                        : (rateOkMini ? ("↓" + Traffic.Speed(_rateProxyDown) + "  ↑" + Traffic.Speed(_rateProxyUp)) : "流量读取中"));
                 Theme.Fill(g, Theme.SubCard, miniRatePillRect, 7f);
-                Draw.Text(g, rateStr, _fTiny, rateOkMini ? Theme.Accent : Theme.Dim, miniRatePillRect, Draw.Center);
+                if (!showStatic)
+                {
+                    string rateStr = !_state.ConfigOk
+                        ? "内核未连接"
+                        : (!_state.ProxyActive && !rateOkMini
+                            ? "代理未开启"
+                            : (rateOkMini ? ("↓" + Traffic.Speed(_rateProxyDown) + "  ↑" + Traffic.Speed(_rateProxyUp)) : "流量读取中"));
+                    Draw.Text(g, rateStr, _fTiny, rateOkMini ? Theme.Accent : Theme.Dim, miniRatePillRect, Draw.Center);
+                }
+                else if (!rateOkMini)
+                {
+                    string offStr = !_state.ConfigOk ? "内核未连接" : (!_state.ProxyActive ? "代理未开启" : "流量读取中");
+                    Draw.Text(g, offStr, _fTiny, Theme.Dim, miniRatePillRect, Draw.Center);
+                }
+                else
+                {
+                    float px = miniRatePillRect.X + 6f;
+                    float pw = miniRatePillRect.Width - 10f;
+                    float y1 = miniRatePillRect.Y + 2f;
+                    float y2 = miniRatePillRect.Y + 17f;
+                    using (var b1 = new SolidBrush(Theme.Accent)) g.FillEllipse(b1, px, y1 + 5f, 4f, 4f);
+                    Draw.Text(g, "↓" + Traffic.Speed(_rateProxyDown) + " ↑" + Traffic.Speed(_rateProxyUp),
+                        _fTiny, Theme.Accent, new RectangleF(px + 6f, y1, pw - 6f, 14f), Draw.Right);
+                    using (var b2 = new SolidBrush(Theme.Ok)) g.FillEllipse(b2, px, y2 + 5f, 4f, 4f);
+                    Draw.Text(g, "↓" + Traffic.Speed(_rateStaticDown) + " ↑" + Traffic.Speed(_rateStaticUp),
+                        _fTiny, Theme.Ok, new RectangleF(px + 6f, y2, pw - 6f, 14f), Draw.Right);
+                }
             }
 
             // 第二行左侧：分流底座+模式胶囊 + 当前节点快捷胶囊
+            float row2Y = SummaryTop + 42f + leftYOff;
             var fp = _fPill ?? (_fPill = Theme.Ui(9.5f));
             bool metaWarn;
             string kernelMeta = FormatKernelMeta(_state.Tun, _state.Mode, out metaWarn);
@@ -4303,7 +4391,7 @@ namespace ProxyPicker.UI
                 chipWarn = metaWarn;
             }
             float chipW = Math.Min(lw < 580f ? 142f : 156f, Math.Max(78f, g.MeasureString(chipText, fp).Width + 14f));
-            var chipRect = new RectangleF(38, SummaryTop + 42, chipW, 21);
+            var chipRect = new RectangleF(38, row2Y, chipW, 21);
             _modeChipRect = chipRect;
             Color chipBg = chipWarn
                 ? Theme.WarnSoft
@@ -4319,7 +4407,7 @@ namespace ProxyPicker.UI
             {
                 string offTxt = FitPillLabel("", "未连接 · 点此看节点", "", maxPillW - 14f, s => g.MeasureString(s, fp).Width);
                 float bw = Math.Min(maxPillW, g.MeasureString(offTxt, fp).Width + 14f);
-                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                var pill = new RectangleF(pillStart, row2Y, bw, 21);
                 _delayRect = pill;
                 Theme.Fill(g, _hover == Btn.Delay ? Theme.Hover : Theme.Btn, pill, 10f);
                 Draw.Text(g, offTxt, fp, Theme.Dim, pill, Draw.Center);
@@ -4328,7 +4416,7 @@ namespace ProxyPicker.UI
             {
                 string noOut = "节点 未找到 · 去设置 →";
                 float bw = Math.Min(maxPillW, g.MeasureString(noOut, fp).Width + 14f);
-                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                var pill = new RectangleF(pillStart, row2Y, bw, 21);
                 _delayRect = pill;
                 Theme.Fill(g, _hover == Btn.Delay ? Theme.Hover : Theme.Btn, pill, 10f);
                 Draw.Text(g, noOut, fp, Theme.Dim, pill, Draw.Center);
@@ -4338,7 +4426,7 @@ namespace ProxyPicker.UI
                 string cleanOut = CleanEmoji(outb);
                 string standby = FitPillLabel("待连接：", cleanOut, " →", maxPillW - 14f, s => g.MeasureString(s, fp).Width);
                 float bw = Math.Min(maxPillW, g.MeasureString(standby, fp).Width + 14f);
-                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                var pill = new RectangleF(pillStart, row2Y, bw, 21);
                 _delayRect = pill;
                 Theme.Fill(g, _hover == Btn.Delay ? Theme.Hover : Theme.SubCard, pill, 10f);
                 Draw.Text(g, standby, fp, Theme.Dim, pill, Draw.Center);
@@ -4363,7 +4451,7 @@ namespace ProxyPicker.UI
                 string cleanOut = CleanEmoji(outb);
                 string label = FitPillLabel("节点 ", cleanOut, suffix, maxPillW - 14f, s => g.MeasureString(s, fp).Width);
                 float bw = Math.Min(maxPillW, g.MeasureString(label, fp).Width + 14f);
-                var pill = new RectangleF(pillStart, SummaryTop + 42, bw, 21);
+                var pill = new RectangleF(pillStart, row2Y, bw, 21);
                 _delayRect = pill;
                 bool isDirectExit = Profile.ClassifyExit(outb) == Profile.ExitKind.Direct;
                 Color pillBg = isWarn ? Theme.WarnSoft : (isDirectExit ? Theme.SubCard : (_hover == Btn.Delay ? Theme.Hover : Theme.AccentSoft));
@@ -4375,17 +4463,30 @@ namespace ProxyPicker.UI
 
             if (dualColumn)
             {
-                // 中间竖线 + 右上对称双行流量速率（>=520px 起即展示完整双栏流量面板）
+                // 中间竖线 + 右上对称流量速率（>=520px 展示完整双栏；开启独立固定 IP 时拆为「代理 / 固定IP / 直连」三行+三色曲线）
                 using (var vpen = new Pen(Theme.Line))
                     g.DrawLine(vpen, divX, SummaryTop + 10f, divX, SummaryTop + SummaryH - 10f);
 
                 float rx = sparkRect.X, rw = sparkRect.Width;
                 bool estimated = _traffic != null && _traffic.Estimated > 0;
                 bool rateOk = _state.ConfigOk && _traffic != null && _traffic.Ok;
-                DrawRateRow(g, rx, rw, SummaryTop + 5, estimated ? "代理≈" : "代理", rateOk,
-                    _rateProxyDown, _rateProxyUp, Theme.Accent);
-                DrawRateRow(g, rx, rw, SummaryTop + 23, "直连", rateOk,
-                    _rateDirectDown, _rateDirectUp, Theme.Dim);
+                if (showStatic)
+                {
+                    string staticLabel = rw >= 218f ? "固定IP" : "固定";
+                    DrawRateRow(g, rx, rw, SummaryTop + 5, estimated ? "代理≈" : "代理", rateOk,
+                        _rateProxyDown, _rateProxyUp, Theme.Accent, true);
+                    DrawRateRow(g, rx, rw, SummaryTop + 21, staticLabel, rateOk,
+                        _rateStaticDown, _rateStaticUp, Theme.Ok, true);
+                    DrawRateRow(g, rx, rw, SummaryTop + 37, "直连", rateOk,
+                        _rateDirectDown, _rateDirectUp, Theme.Dim, true);
+                }
+                else
+                {
+                    DrawRateRow(g, rx, rw, SummaryTop + 5, estimated ? "代理≈" : "代理", rateOk,
+                        _rateProxyDown, _rateProxyUp, Theme.Accent);
+                    DrawRateRow(g, rx, rw, SummaryTop + 23, "直连", rateOk,
+                        _rateDirectDown, _rateDirectUp, Theme.Dim);
+                }
             }
 
             if (!sparkRect.IsEmpty)
@@ -4399,12 +4500,16 @@ namespace ProxyPicker.UI
                 var sparkAt = _sparkAt.ToArray();
                 bool hasDirectSpark = _sparkDirect.Count >= 2 && sparkAt.Length == _sparkDirect.Count;
                 bool hasProxySpark = _sparkProxy.Count >= 2 && sparkAt.Length == _sparkProxy.Count;
+                bool hasStaticSpark = showStatic && _sparkStatic.Count >= 2 && sparkAt.Length == _sparkStatic.Count;
                 if (hasDirectSpark)
                     Draw.Spark(g, _sparkDirect.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
                         sparkRect, Theme.Dim, _sparkPulse);
                 if (hasProxySpark)
                     Draw.Spark(g, _sparkProxy.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
                         sparkRect, Theme.Accent, _sparkPulse);
+                if (hasStaticSpark)
+                    Draw.Spark(g, _sparkStatic.ToArray(), sparkAt, _sparkAxis, SparkPeriodMs, SparkPoints,
+                        sparkRect, Theme.Ok, _sparkPulse);
 
                 var tipAlign = dualColumn ? Draw.Right : Draw.Center;
                 if (!_state.ConfigOk)
@@ -5441,6 +5546,12 @@ namespace ProxyPicker.UI
                 boundCount,
                 _staticDelayMs,
                 _staticTimedOut);
+            if (active != _lastShowStaticRow)
+            {
+                _lastShowStaticRow = active;
+                if (IsHandleCreated) LayoutChildren();
+                Invalidate();
+            }
             _list.Invalidate();
         }
 

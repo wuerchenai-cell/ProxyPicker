@@ -51,9 +51,12 @@ namespace ProxyPicker.Core
         {
             public double ProxyDown;
             public double ProxyUp;
+            public double StaticDown;
+            public double StaticUp;
             public double DirectDown;
             public double DirectUp;
             public int ProxyCount;
+            public int StaticCount;
             public int DirectCount;
             public double Seconds;
             public bool Ok = true;
@@ -250,7 +253,7 @@ namespace ProxyPicker.Core
             }
 
             var now = new Dictionary<string, Mark>(arr.Count, StringComparer.Ordinal);
-            long proxyDown = 0, proxyUp = 0, directDown = 0, directUp = 0;
+            long proxyDown = 0, proxyUp = 0, staticDown = 0, staticUp = 0, directDown = 0, directUp = 0;
 
             foreach (var item in arr)
             {
@@ -362,8 +365,14 @@ namespace ProxyPicker.Core
                 // 这部分是估算而非实测，单独计数供界面标注。
                 if (chain == Chain.Unknown && exe.Length > 0 && !stale) s.Estimated++;
                 bool isProxy = chain == Chain.Unknown ? expected : chain == Chain.Proxy;
+                bool isStaticTraffic = isProxy && (viaStatic || (chain == Chain.Unknown && expectedStatic));
 
-                if (isProxy)
+                if (isStaticTraffic)
+                {
+                    staticUp += du; staticDown += dd;
+                    s.StaticCount++;
+                }
+                else if (isProxy)
                 {
                     proxyUp += du; proxyDown += dd;
                     s.ProxyCount++;
@@ -413,13 +422,15 @@ namespace ProxyPicker.Core
             if (seconds <= 0.05 || seconds > 15.0)
             {
                 // 首次采样或电脑休眠唤醒后长中断（>15s）直接重建基线、不以超长秒数稀释网速
-                s.ProxyDown = s.ProxyUp = s.DirectDown = s.DirectUp = 0;
+                s.ProxyDown = s.ProxyUp = s.StaticDown = s.StaticUp = s.DirectDown = s.DirectUp = 0;
                 s.Seconds = 0;
             }
             else
             {
                 s.ProxyDown = proxyDown / seconds;
                 s.ProxyUp = proxyUp / seconds;
+                s.StaticDown = staticDown / seconds;
+                s.StaticUp = staticUp / seconds;
                 s.DirectDown = directDown / seconds;
                 s.DirectUp = directUp / seconds;
                 s.Seconds = seconds;
@@ -768,6 +779,53 @@ namespace ProxyPicker.Core
             var afterSleep = AnalyzeConnections(lateConn, expectedSet, false, nowUtc, null, nowUtc.AddHours(2).Ticks, true);
             check("T19 休眠唤醒后长中断首轮自动重建基线（Seconds=0、速率清零而非稀释）",
                 afterSleep.Seconds == 0 && afterSleep.ProxyDown == 0);
+
+            // T20：三通道速率独立拆算（普通代理 / 独立固定 IP / 直连各自计量，互不混算）
+            Reset();
+            var triConns = new Dictionary<string, object>
+            {
+                {
+                    "connections", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", "tri-proxy" }, { "upload", 1000.0 }, { "download", 2000.0 },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "日本-A", "PP-FIXED" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "msedge.exe" } } }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "tri-static" }, { "upload", 500.0 }, { "download", 3000.0 },
+                            { "start", recentStart },
+                            { "chains", new List<object> { StaticProxy.NodeName } },
+                            { "metadata", new Dictionary<string, object> { { "process", "chrome.exe" } } }
+                        },
+                        new Dictionary<string, object>
+                        {
+                            { "id", "tri-direct" }, { "upload", 200.0 }, { "download", 4000.0 },
+                            { "start", recentStart },
+                            { "chains", new List<object> { "DIRECT" } },
+                            { "metadata", new Dictionary<string, object> { { "process", "weixin.exe" } } }
+                        }
+                    }
+                }
+            };
+            var triProxySet = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "msedge.exe", "chrome.exe" };
+            var triStaticSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "chrome.exe" };
+            AnalyzeConnections(triConns, triProxySet, false, nowUtc, null, nowUtc.Ticks, true, triStaticSet);
+            var triList = (List<object>)triConns["connections"];
+            ((Dictionary<string, object>)triList[0])["download"] = 12000.0; // +10,000 B/s proxy
+            ((Dictionary<string, object>)triList[1])["download"] = 23000.0; // +20,000 B/s static
+            ((Dictionary<string, object>)triList[1])["upload"] = 3500.0;    // +3,000 B/s static up
+            ((Dictionary<string, object>)triList[2])["download"] = 34000.0; // +30,000 B/s direct
+            var triSample = AnalyzeConnections(triConns, triProxySet, false, nowUtc, null, nowUtc.AddSeconds(1).Ticks, true, triStaticSet);
+            check("T20 三通道速率独立计量（普通代理 / 独立固定 IP / 直连互不混算）",
+                Math.Abs(triSample.ProxyDown - 10000.0) < 100.0 &&
+                Math.Abs(triSample.StaticDown - 20000.0) < 100.0 &&
+                Math.Abs(triSample.StaticUp - 3000.0) < 100.0 &&
+                Math.Abs(triSample.DirectDown - 30000.0) < 100.0 &&
+                triSample.ProxyCount == 1 && triSample.StaticCount == 1 && triSample.DirectCount == 1);
             Reset();
 
             sb.AppendLine(pass + "/" + total + " 流量对账口径通过");
