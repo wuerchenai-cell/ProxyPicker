@@ -314,7 +314,7 @@ namespace ProxyPicker.UI
                 ForeColor = Theme.Fg,
                 Font = F(12f)
             };
-            _cmbHop.Items.Add("链式：智能优选最低延迟跳板（独立，推荐）");
+            _cmbHop.Items.Add("链式：智能优选最低延迟跳板（独立 · 每10分自动稳速，推荐）");
             _cmbHop.Items.Add("链式：自动跟随当前高速主节点");
             _cmbHop.Items.Add("直连：直接连接该 SOCKS5（不经前置跳板）");
             foreach (var n in _availableNodes)

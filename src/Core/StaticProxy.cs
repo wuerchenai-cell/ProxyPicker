@@ -43,6 +43,68 @@ namespace ProxyPicker.Core
         /// <summary>双跳跨洋静态 SOCKS5 健康检查单次超时上限（毫秒）。</summary>
         public const int HealthTimeoutMs = 10000;
 
+        /// <summary>智能优选跳板后台定期稳速刷新周期（分钟）：每 10 分钟零干扰巡检一次，确保固定 IP 通道长期稳定。</summary>
+        public const int AutoHopRefreshIntervalMinutes = 10;
+
+        /// <summary>独立固定 IP 实时端到端延迟探测间隔（秒，独立于主节点测速周期）。</summary>
+        public const int StaticHealthCheckIntervalSeconds = 45;
+
+        /// <summary>检测到延迟连续劣化时，提前触发优选的防抖冷却（秒）。</summary>
+        public const int AutoHopDegradeCooldownSeconds = 180;
+
+        /// <summary>检测到超时不可达时，触发紧急重优切换的防抖冷却（秒）。</summary>
+        public const int AutoHopEmergencyCooldownSeconds = 120;
+
+        /// <summary>
+        /// 稳态优选综合评分：兼顾平均延迟与多轮抖动（均值 + 抖动/2），
+        /// 防止挑到单次偶发偏低但剧烈波动的不稳定节点。
+        /// </summary>
+        public static int ComputeStabilityScore(int avgMs, int jitterMs)
+        {
+            if (avgMs <= 0) return int.MaxValue;
+            int j = jitterMs > 0 ? jitterMs : 0;
+            return avgMs + (j / 2);
+        }
+
+        /// <summary>
+        /// 判断当前固定 IP 实时延迟是否出现明显劣化（触发提前稳速刷新）：
+        /// 绝对延迟 &gt;= 750ms，或存在历史基线且当前 &gt;= 420ms 且较基线暴涨 &gt;= 65%。
+        /// </summary>
+        public static bool IsStaticDelayDegraded(int currentMs, int baselineMs)
+        {
+            if (currentMs <= 0) return false;
+            if (currentMs >= 750) return true;
+            if (baselineMs > 0 && currentMs >= 420 && currentMs * 100 >= baselineMs * 165)
+                return true;
+            return false;
+        }
+
+        /// <summary>
+        /// 智能优选后台定期稳速刷新调度判据（供定时看守与健康检查共用）：
+        /// 1) 超时不可达：满足急救冷却（120 秒）立即触发重优；
+        /// 2) 延迟连续 2 轮明显劣化：满足冷却（180 秒）提前重优；
+        /// 3) 正常稳态：距本会话与上次落盘优选均满 10 分钟（或尚未实测过）自动刷新。
+        /// </summary>
+        public static bool ShouldRunScheduledAutoHopRefresh(
+            bool isAutoMode,
+            bool optimizing,
+            DateTime lastSessionUtc,
+            long lastSavedUtcTicks,
+            DateTime nowUtc,
+            int slowStreak,
+            bool timedOut)
+        {
+            if (!isAutoMode || optimizing) return false;
+            double sessionSec = lastSessionUtc == DateTime.MinValue ? 999999.0 : (nowUtc - lastSessionUtc).TotalSeconds;
+            if (timedOut) return sessionSec >= AutoHopEmergencyCooldownSeconds;
+            if (slowStreak >= 2) return sessionSec >= AutoHopDegradeCooldownSeconds;
+
+            bool sessionDue = sessionSec >= AutoHopRefreshIntervalMinutes * 60.0;
+            bool savedDue = lastSavedUtcTicks <= 0 ||
+                            (nowUtc - new DateTime(lastSavedUtcTicks, DateTimeKind.Utc)).TotalMinutes >= AutoHopRefreshIntervalMinutes;
+            return sessionDue && savedDue;
+        }
+
         /// <summary>
         /// 静态 IP 健康检查防抖动判据：
         /// 手动测速失败立即提示；后台巡检首次超时先静默复检（底层规则依然锁定防漂移），
@@ -164,6 +226,9 @@ namespace ProxyPicker.Core
         {
             public string NodeName = "";
             public int DelayMs = -1;
+            public int JitterMs;
+            public int StabilityScore = int.MaxValue;
+            public int SuccessSamples;
         }
 
         public sealed class AutoHopBenchmarkResult
@@ -172,10 +237,40 @@ namespace ProxyPicker.Core
             public string Error = "";
             public string BestNode = "";
             public int BestDelayMs = -1;
+            public int BestJitterMs;
             public int TestedCount;
             public int ReachableCount;
+            public int VerifiedCount;
             public long ElapsedMs;
             public List<HopCandidateResult> TopCandidates = new List<HopCandidateResult>();
+        }
+
+        /// <summary>
+        /// 对经过稳态复测的候选跳板排序：
+        /// 1) 优先全部采样均成功（SuccessSamples 最高），淘汰复测期掉线的假稳节点；
+        /// 2) 其次按 StabilityScore（平均延迟 + 抖动惩罚）从低到高；
+        /// 3) 最后按平均延迟与名称确定性兜底。
+        /// </summary>
+        internal static void RankVerifiedHopCandidates(List<HopCandidateResult> candidates)
+        {
+            if (candidates == null || candidates.Count <= 1) return;
+            candidates.Sort((a, b) =>
+            {
+                if (ReferenceEquals(a, b)) return 0;
+                if (a == null) return 1;
+                if (b == null) return -1;
+                int cmp = b.SuccessSamples.CompareTo(a.SuccessSamples);
+                if (cmp != 0) return cmp;
+                int sa = a.StabilityScore > 0 && a.StabilityScore < int.MaxValue
+                    ? a.StabilityScore : ComputeStabilityScore(a.DelayMs, a.JitterMs);
+                int sb = b.StabilityScore > 0 && b.StabilityScore < int.MaxValue
+                    ? b.StabilityScore : ComputeStabilityScore(b.DelayMs, b.JitterMs);
+                cmp = sa.CompareTo(sb);
+                if (cmp != 0) return cmp;
+                cmp = a.DelayMs.CompareTo(b.DelayMs);
+                if (cmp != 0) return cmp;
+                return string.Compare(a.NodeName, b.NodeName, StringComparison.OrdinalIgnoreCase);
+            });
         }
 
         public sealed class StaticProbeResult
@@ -1670,13 +1765,15 @@ namespace ProxyPicker.Core
 
         /// <summary>
         /// 在零干扰旁路 mihomo 中并发实测订阅内所有物理候选节点经由固定 IP 的端到端真实双跳延迟，
-        /// 自动挑出最快跳板与 Top 12 备选池（绝不修改主网络节点或规则）。
+        /// 并对入围前 5 名（含当前活跃跳板）执行 2 轮稳态复核（共 3 次采样计算均延迟+抖动稳态分），
+        /// 挑出真正既快又稳的冠军跳板与 Top 12 备选池（绝不修改主网络节点或规则）。
         /// </summary>
         public static AutoHopBenchmarkResult BenchmarkBestHopsThroughSidecar(
             StaticProxyConfig candidate,
             string knownConfigPath = null,
             Action<string> progress = null,
-            CancellationToken cancel = default(CancellationToken))
+            CancellationToken cancel = default(CancellationToken),
+            string currentHopNode = null)
         {
             var res = new AutoHopBenchmarkResult();
             if (candidate == null)
@@ -1714,6 +1811,10 @@ namespace ProxyPicker.Core
                 int total = candidateHops.Count;
                 res.TestedCount = total;
                 var results = new HopCandidateResult[total];
+                var idxByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                for (int i = 0; i < total; i++)
+                    if (!idxByName.ContainsKey(candidateHops[i])) idxByName[candidateHops[i]] = i;
+
                 int done = 0;
                 using (var sem = new SemaphoreSlim(16))
                 {
@@ -1738,7 +1839,13 @@ namespace ProxyPicker.Core
                                     string _;
                                     ms = session.MeasureDelay(BenchNodePrefix + idx, 4500, out _);
                                 }
-                                results[idx] = new HopCandidateResult { NodeName = hopName, DelayMs = ms };
+                                results[idx] = new HopCandidateResult
+                                {
+                                    NodeName = hopName,
+                                    DelayMs = ms,
+                                    SuccessSamples = ms > 0 ? 1 : 0,
+                                    StabilityScore = ms > 0 ? ComputeStabilityScore(ms, 0) : int.MaxValue
+                                };
                             }
                             catch
                             {
@@ -1749,17 +1856,17 @@ namespace ProxyPicker.Core
                                 sem.Release();
                                 int curDone = Interlocked.Increment(ref done);
                                 if (progress != null && (curDone == total || curDone % 4 == 0))
-                                    progress("正在端到端实测最快跳板（" + curDone + "/" + total + "）…");
+                                    progress("正在端到端初筛候选跳板（" + curDone + "/" + total + "）…");
                             }
                         }));
                     }
                     Task.WaitAll(tasks.ToArray());
                 }
 
-                sw.Stop();
-                res.ElapsedMs = sw.ElapsedMilliseconds;
                 if (cancel.IsCancellationRequested)
                 {
+                    sw.Stop();
+                    res.ElapsedMs = sw.ElapsedMilliseconds;
                     res.Error = "已取消跳板优选";
                     return res;
                 }
@@ -1777,14 +1884,100 @@ namespace ProxyPicker.Core
                 res.ReachableCount = okList.Count;
                 if (okList.Count == 0)
                 {
+                    sw.Stop();
+                    res.ElapsedMs = sw.ElapsedMilliseconds;
                     res.Error = "全量 " + total + " 个候选跳板均无法连通该固定 IP，请检查 SOCKS5 参数或机场节点状态";
                     return res;
                 }
 
-                for (int i = 0; i < okList.Count && i < 12; i++)
-                    res.TopCandidates.Add(okList[i]);
-                res.BestNode = okList[0].NodeName;
-                res.BestDelayMs = okList[0].DelayMs;
+                // 第二阶段：挑选前 5 名 + 当前活跃跳板（若可达），再做 2 轮连续端到端稳态复核（共 3 次采样），
+                // 计算均延迟与抖动稳态分，杜绝选到单次偶快但高抖动/掉线的不稳定跳板。
+                var verifyTargets = new List<HopCandidateResult>();
+                for (int i = 0; i < okList.Count && i < 5; i++) verifyTargets.Add(okList[i]);
+                if (!string.IsNullOrWhiteSpace(currentHopNode))
+                {
+                    string curTrim = currentHopNode.Trim();
+                    bool alreadyIn = false;
+                    foreach (var vt in verifyTargets)
+                        if (string.Equals(vt.NodeName, curTrim, StringComparison.OrdinalIgnoreCase)) { alreadyIn = true; break; }
+                    if (!alreadyIn)
+                    {
+                        foreach (var ok in okList)
+                        {
+                            if (string.Equals(ok.NodeName, curTrim, StringComparison.OrdinalIgnoreCase))
+                            {
+                                verifyTargets.Add(ok);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (verifyTargets.Count > 0 && !cancel.IsCancellationRequested)
+                {
+                    if (progress != null)
+                        progress("正在对前 " + verifyTargets.Count + " 个候选跳板做多轮稳态复核…");
+                    var verifyTasks = new List<Task>(verifyTargets.Count);
+                    foreach (var item in verifyTargets)
+                    {
+                        var target = item;
+                        int benchIdx;
+                        if (!idxByName.TryGetValue(target.NodeName, out benchIdx)) continue;
+                        verifyTasks.Add(Task.Run(() =>
+                        {
+                            var samples = new List<int>(3) { target.DelayMs };
+                            for (int round = 0; round < 2; round++)
+                            {
+                                if (cancel.IsCancellationRequested) break;
+                                string _;
+                                int ms = session.MeasureDelay(BenchNodePrefix + benchIdx, 4500, out _);
+                                if (ms > 0) samples.Add(ms);
+                            }
+                            if (samples.Count > 0)
+                            {
+                                int sum = 0, min = int.MaxValue, max = 0;
+                                foreach (int s in samples)
+                                {
+                                    sum += s;
+                                    if (s < min) min = s;
+                                    if (s > max) max = s;
+                                }
+                                int avg = (int)Math.Round(sum / (double)samples.Count);
+                                int jitter = samples.Count >= 2 ? (max - min) : 0;
+                                target.DelayMs = avg;
+                                target.JitterMs = jitter;
+                                target.SuccessSamples = samples.Count;
+                                target.StabilityScore = ComputeStabilityScore(avg, jitter);
+                            }
+                        }));
+                    }
+                    Task.WaitAll(verifyTasks.ToArray());
+                    res.VerifiedCount = verifyTargets.Count;
+                }
+
+                sw.Stop();
+                res.ElapsedMs = sw.ElapsedMilliseconds;
+                if (cancel.IsCancellationRequested)
+                {
+                    res.Error = "已取消跳板优选";
+                    return res;
+                }
+
+                // 排好入围复核组，再把剩余未入围的可达候选按初筛延迟附在后面形成完整 Top 12 备选池
+                RankVerifiedHopCandidates(verifyTargets);
+                var verifiedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var vt in verifyTargets) verifiedSet.Add(vt.NodeName);
+
+                var finalList = new List<HopCandidateResult>(okList.Count);
+                foreach (var vt in verifyTargets) finalList.Add(vt);
+                foreach (var ok in okList)
+                    if (!verifiedSet.Contains(ok.NodeName)) finalList.Add(ok);
+
+                for (int i = 0; i < finalList.Count && i < 12; i++)
+                    res.TopCandidates.Add(finalList[i]);
+                res.BestNode = finalList[0].NodeName;
+                res.BestDelayMs = finalList[0].DelayMs;
+                res.BestJitterMs = finalList[0].JitterMs;
                 res.Ok = true;
                 return res;
             }
@@ -2171,12 +2364,14 @@ namespace ProxyPicker.Core
             try
             {
                 Redactor.RegisterRuntimeSecrets("static-isp.example.com", "isp_user_99", "SuperSecret!9988");
-                string rawDiag = "static host=static-isp.example.com user=isp_user_99 pass=SuperSecret!9988";
+                string rawDiag = "static host=static-isp.example.com user=isp_user_99 pass=SuperSecret!9988\nstaticHop=MySecretAirportNode(1x)\n固定 IP 稳速优选切换前置跳板：MySecretAirportNode(1x)（192ms）";
                 string masked = Redactor.Apply(rawDiag);
-                check("SP18 Redactor 动态脱敏彻底隐藏静态主机/用户名/密码",
+                check("SP18 Redactor 动态脱敏彻底隐藏静态主机/用户名/密码及 staticHop 与优选日志节点名",
                     !masked.Contains("static-isp.example.com") &&
                     !masked.Contains("isp_user_99") &&
-                    !masked.Contains("SuperSecret!9988"),
+                    !masked.Contains("SuperSecret!9988") &&
+                    !masked.Contains("MySecretAirportNode") &&
+                    masked.Contains("staticHop=<节点名已隐藏>"),
                     "masked=" + masked);
             }
             finally
@@ -2655,6 +2850,78 @@ namespace ProxyPicker.Core
                 benchYaml.Contains("dialer-proxy: \"Node-US-01\"") &&
                 barBtnsOk,
                 "barBtnsOk=" + barBtnsOk);
+
+            // SP43：首页固定 IP 延迟胶囊文案格式化（ms/测速中/稳速刷新/超时）与三行摘要卡全断点无碰撞（466–880px）
+            string spPref, spMid, spSuf, spTone;
+            UI.MainForm.FormatStaticDelayPillParts(autoCfg, "Node-US-01", 196, false, false, false, true, true,
+                out spPref, out spMid, out spSuf, out spTone);
+            bool pillOk = spPref == "固定IP " && spMid == "优选:Node-US-01" && spSuf == " · 196ms" && spTone == "ok";
+            UI.MainForm.FormatStaticDelayPillParts(autoCfg, "Node-US-01", 520, false, false, false, true, true,
+                out spPref, out spMid, out spSuf, out spTone);
+            pillOk = pillOk && spSuf == " · 520ms" && spTone == "warn";
+            UI.MainForm.FormatStaticDelayPillParts(autoCfg, "Node-US-01", -1, false, true, false, true, true,
+                out spPref, out spMid, out spSuf, out spTone);
+            pillOk = pillOk && spSuf == " · 测速中…" && spTone == "ok";
+            UI.MainForm.FormatStaticDelayPillParts(autoCfg, "Node-US-01", 196, false, false, true, true, true,
+                out spPref, out spMid, out spSuf, out spTone);
+            pillOk = pillOk && spSuf == " · 稳速刷新中…" && spTone == "accent";
+            UI.MainForm.FormatStaticDelayPillParts(autoCfg, "Node-US-01", -1, true, false, false, true, true,
+                out spPref, out spMid, out spSuf, out spTone);
+            pillOk = pillOk && spSuf == " · 超时" && spTone == "danger";
+            string fittedNarrow = UI.MainForm.FitPillLabel("固定IP ", "优选:很长的日本东京专线节点名称(高级流量)", " · 196ms",
+                120f, s => s.Length * 7.5f);
+            pillOk = pillOk && fittedNarrow.EndsWith(" · 196ms", StringComparison.Ordinal);
+
+            bool row3GeoOk = true;
+            foreach (float tw in new[] { 466f, 519f, 520f, 534f, 640f, 880f })
+            {
+                bool sDual;
+                float sDivX, l1, l2;
+                System.Drawing.RectangleF spk, mini, r1, r2, r3;
+                UI.MainForm.ComputeSummaryLayoutBounds(tw, true, out sDual, out sDivX, out spk, out mini, out l1, out l2);
+                UI.MainForm.ComputeSummaryRowBounds(tw, true, out r1, out r2, out r3);
+                float sumBot = 88f + UI.MainForm.SummaryHeightFor(true);
+                if (r1.Bottom > r2.Top || r2.Bottom > r3.Top || r3.Bottom > sumBot - 6f) row3GeoOk = false;
+                if (r3.Width < 200f || r3.Right > l2 + 0.5f) row3GeoOk = false;
+                if (!sDual && r3.Right >= mini.Left) row3GeoOk = false;
+                if (sDual && r3.Right >= sDivX) row3GeoOk = false;
+            }
+            check("SP43 首页固定 IP 延迟胶囊全态格式化、窄屏保毫秒尾缀与三行摘要卡全断点零碰撞",
+                pillOk && row3GeoOk,
+                "pillOk=" + pillOk + " row3GeoOk=" + row3GeoOk);
+
+            // SP44：定期稳速刷新调度策略（10 分钟定时、连续 2 轮劣化 3 分钟冷却、超时 2 分钟急救、抖动惩罚分）
+            var nowRef = t0.AddMinutes(11);
+            bool schedOk =
+                ComputeStabilityScore(200, 20) < ComputeStabilityScore(190, 120) &&
+                !IsStaticDelayDegraded(260, 200) &&
+                IsStaticDelayDegraded(450, 200) &&
+                IsStaticDelayDegraded(760, -1) &&
+                !ShouldRunScheduledAutoHopRefresh(false, false, DateTime.MinValue, 0, nowRef, 0, false) &&
+                !ShouldRunScheduledAutoHopRefresh(true, true, DateTime.MinValue, 0, nowRef, 0, false) &&
+                ShouldRunScheduledAutoHopRefresh(true, false, t0, t0.Ticks, nowRef, 0, false) &&
+                !ShouldRunScheduledAutoHopRefresh(true, false, t0.AddMinutes(5), t0.AddMinutes(5).Ticks, nowRef, 0, false) &&
+                ShouldRunScheduledAutoHopRefresh(true, false, nowRef.AddSeconds(-185), nowRef.AddSeconds(-185).Ticks, nowRef, 2, false) &&
+                !ShouldRunScheduledAutoHopRefresh(true, false, nowRef.AddSeconds(-100), nowRef.AddSeconds(-100).Ticks, nowRef, 2, false) &&
+                ShouldRunScheduledAutoHopRefresh(true, false, nowRef.AddSeconds(-125), nowRef.AddSeconds(-125).Ticks, nowRef, 0, true) &&
+                !ShouldRunScheduledAutoHopRefresh(true, false, nowRef.AddSeconds(-60), nowRef.AddSeconds(-60).Ticks, nowRef, 0, true);
+            check("SP44 定期稳速刷新策略（10分钟巡检/2轮劣化提前触发/超时急救冷却/稳态抖动惩罚分）",
+                schedOk,
+                "schedOk=" + schedOk);
+
+            // SP45：稳态复核排序（3 次全通低抖动节点打败 1 次偶快掉线节点与高抖动节点）
+            var rankTest = new List<HopCandidateResult>
+            {
+                new HopCandidateResult { NodeName = "FlakyFast", DelayMs = 150, JitterMs = 0, SuccessSamples = 1, StabilityScore = ComputeStabilityScore(150, 0) },
+                new HopCandidateResult { NodeName = "JitteryFast", DelayMs = 185, JitterMs = 140, SuccessSamples = 3, StabilityScore = ComputeStabilityScore(185, 140) },
+                new HopCandidateResult { NodeName = "SteadyBest", DelayMs = 200, JitterMs = 16, SuccessSamples = 3, StabilityScore = ComputeStabilityScore(200, 16) }
+            };
+            RankVerifiedHopCandidates(rankTest);
+            check("SP45 稳态复核排序优先 3 次全通且低抖动节点（SteadyBest > JitteryFast > FlakyFast）",
+                rankTest[0].NodeName == "SteadyBest" &&
+                rankTest[1].NodeName == "JitteryFast" &&
+                rankTest[2].NodeName == "FlakyFast",
+                "order=" + rankTest[0].NodeName + "," + rankTest[1].NodeName + "," + rankTest[2].NodeName);
 
             sb.Insert(0, "\n[独立固定 IP StaticProxy 自检] " + pass + " PASS / " + fail + " FAIL\n");
             return sb.ToString();

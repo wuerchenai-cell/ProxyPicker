@@ -589,6 +589,21 @@ namespace ProxyPicker
                     sb.AppendLine("kernelUnreachable=" + d.KernelUnreachable);
                     sb.AppendLine("delayMs=" + d.DelayMs);
                     if (!string.IsNullOrEmpty(d.Error)) sb.AppendLine("error=" + d.Error);
+                    if (Core.StaticProxy.IsEnabledAndValid)
+                    {
+                        var spCfg = Core.StaticProxy.Current;
+                        var sd = Core.Profile.MeasureDelayConfirmed(Core.StaticProxy.NodeName, null, Core.StaticProxy.HealthTimeoutMs, cfg);
+                        string liveHop = string.Equals(spCfg.HopMode, Core.StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase)
+                            ? ""
+                            : Core.StaticProxy.ReadLiveHopNode(cfg);
+                        sb.AppendLine("staticEnabled=True");
+                        sb.AppendLine("staticHopMode=" + spCfg.HopMode);
+                        if (!string.IsNullOrEmpty(liveHop)) sb.AppendLine("staticHop=" + liveHop);
+                        sb.AppendLine("staticOk=" + sd.Ok);
+                        sb.AppendLine("staticTimedOut=" + sd.TimedOut);
+                        sb.AppendLine("staticDelayMs=" + sd.DelayMs);
+                        if (!string.IsNullOrEmpty(sd.Error)) sb.AppendLine("staticError=" + sd.Error);
+                    }
                     System.IO.File.WriteAllText(args[1], Core.Redactor.Apply(sb.ToString()), new System.Text.UTF8Encoding(false));
                     if (!d.Ok) Environment.ExitCode = 1;
                 }

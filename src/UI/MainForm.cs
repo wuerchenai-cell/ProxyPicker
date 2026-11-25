@@ -103,7 +103,7 @@ namespace ProxyPicker.UI
              _fTab, _fTabActive, _fRate, _fTiny, _fHelp, _fHelpTitle;
         Font _fPill;   // 出口胶囊，懒加载
 
-        enum Btn { None, Nav0, Nav1, Nav2, Save, Direct, Refresh, Close, Max, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch, Delay, ModeChip }
+        enum Btn { None, Nav0, Nav1, Nav2, Save, Direct, Refresh, Close, Max, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch, Delay, StaticDelay, ModeChip }
         Btn _hover = Btn.None;
         int _page;          // 一级功能区：0=应用分流 1=节点策略 2=链路体检
         readonly Stack<int> _pageHistory = new Stack<int>();
@@ -175,9 +175,12 @@ namespace ProxyPicker.UI
         bool _staticOptimizing;
         string _staticLiveHop = "";
         int _staticTimeoutStreak;
+        int _staticSlowStreak;
+        DateTime _lastStaticHealthCheckAt = DateTime.MinValue;
         DateTime _lastStaticAlertAt = DateTime.MinValue;
         DateTime _lastAutoHopOptimizeAt = DateTime.MinValue;
         bool _staticWarnShown;
+        RectangleF _staticDelayRect;
         string _status = "正在准备…";
         Color _statusColor;
 
@@ -367,6 +370,7 @@ namespace ProxyPicker.UI
             };
             _nodesPage.ConfigureStaticProxyRequested += () => OpenStaticProxyDialog();
             _nodesPage.OptimizeStaticHopRequested += () => _ = OptimizeStaticHopAsync(true, false);
+            _nodesPage.TestStaticDelayRequested += () => TestStaticDelayPublic();
             SyncStaticUiBanner();
 
             _qualityPage.Visible = false;
@@ -936,6 +940,12 @@ namespace ProxyPicker.UI
             {
                 _ = RunDelayTestAsync(false);
             }
+            if (UiAlive && _state.ConfigOk && _state.ProxyActive && StaticProxy.IsEnabledAndValid &&
+                !_staticChecking &&
+                (_staticDelayMs <= 0 || (DateTime.UtcNow - _lastStaticHealthCheckAt).TotalSeconds >= 10))
+            {
+                _ = CheckStaticProxyHealthAsync(false);
+            }
         }
 
         /// <summary>
@@ -963,6 +973,26 @@ namespace ProxyPicker.UI
             // 定期调用 Clash /proxies/{节点}/delay 测速；即使收进托盘也会按配置间隔持续巡检并在超时时弹窗提醒
             if (!_busy && !_delayTesting && ShouldRunPeriodicDelayTest())
                 _ = RunDelayTestAsync(false);
+            // 独立固定 IP 周期实时测速与每 10 分钟稳速刷新：不依赖主节点状态，收进托盘同样持续巡检稳速
+            if (!_busy && _state.ConfigOk && _state.ProxyActive && StaticProxy.IsEnabledAndValid)
+            {
+                var nowUtc = DateTime.UtcNow;
+                if (!_staticChecking && !_staticOptimizing &&
+                    (_staticDelayMs <= 0 && !_staticTimedOut ||
+                     _lastStaticHealthCheckAt == DateTime.MinValue ||
+                     (nowUtc - _lastStaticHealthCheckAt).TotalSeconds >= StaticProxy.StaticHealthCheckIntervalSeconds))
+                {
+                    _ = CheckStaticProxyHealthAsync(false);
+                }
+                var spCfg = StaticProxy.Current;
+                bool isAutoHop = string.Equals(spCfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                if (StaticProxy.ShouldRunScheduledAutoHopRefresh(
+                        isAutoHop, _staticOptimizing, _lastAutoHopOptimizeAt,
+                        spCfg.AutoBestUpdatedAtTicks, nowUtc, _staticSlowStreak, _staticTimedOut))
+                {
+                    _ = OptimizeStaticHopAsync(false, _staticTimedOut);
+                }
+            }
             if (_busy || _watching) return;
             if (++_watchTick % 3 != 0) return;   // 10 秒 × 3 = 30 秒对一次账
             WatchAsync();
@@ -1774,6 +1804,8 @@ namespace ProxyPicker.UI
 
                     // 名单变了，流量分类的基准也跟着变
                     PollTraffic();
+                    if (StaticProxy.IsEnabledAndValid && _state.ConfigOk && _state.ProxyActive && !_staticChecking)
+                        _ = CheckStaticProxyHealthAsync(false);
                 }
                 else
                 {
@@ -2566,6 +2598,24 @@ namespace ProxyPicker.UI
             _ = RunDelayTestAsync(true);
         }
 
+        /// <summary>首页固定 IP 延迟胶囊与节点页底条共用的独立固定 IP 实时测速入口。</summary>
+        public void TestStaticDelayPublic()
+        {
+            if (!UiAlive || _shuttingDown) return;
+            if (InvokeRequired) { try { BeginInvoke(new Action(TestStaticDelayPublic)); } catch { } return; }
+            if (!StaticProxy.IsEnabledAndValid)
+            {
+                OpenStaticProxyDialog();
+                return;
+            }
+            if (!_state.ConfigOk || !_state.ProxyActive)
+            {
+                Toast("暂无法测固定 IP 延迟", "请先确认代理内核已连接且 TUN 或系统代理已开启", Theme.Warn, 2);
+                return;
+            }
+            _ = CheckStaticProxyHealthAsync(true);
+        }
+
         async Task RunDelayTestAsync(bool manual)
         {
             if (!UiAlive || _delayTesting || _nodeActionBusy || _batchDelayRunning || _failoverBusy || _shuttingDown) return;
@@ -2634,7 +2684,6 @@ namespace ProxyPicker.UI
                         SetStatus("当前节点「" + CleanEmoji(node) + "」延迟 " + res.DelayMs + " ms", Theme.Ok);
                         Toast("测速正常", CleanEmoji(node) + " · " + res.DelayMs + " ms", Theme.Accent, 2);
                     }
-                    if (StaticProxy.IsEnabledAndValid) _ = CheckStaticProxyHealthAsync(manual);
                     return;
                 }
 
@@ -2700,6 +2749,8 @@ namespace ProxyPicker.UI
                     InvalidateNavBar();
                     if (_page == 0) Invalidate(new Rectangle(0, 0, Width, Theme.Px(SummaryTop + SummaryH + 4)));
                 }
+                if (UiAlive && _state.ConfigOk && _state.ProxyActive && StaticProxy.IsEnabledAndValid && !_staticChecking)
+                    _ = CheckStaticProxyHealthAsync(manual);
             }
         }
 
@@ -3855,6 +3906,107 @@ namespace ProxyPicker.UI
 
         RectangleF SummaryRect { get { return new RectangleF(24, SummaryTop, LogicalW - 48, SummaryH); } }
 
+        /// <summary>计算摘要卡左侧各信息行的精确布局矩形（开启固定 IP 时左侧 3 行紧凑排布，与右侧三通道速率+曲线底边平齐）。</summary>
+        internal static void ComputeSummaryRowBounds(
+            float logicalW,
+            bool showStatic,
+            out RectangleF row1Rect,
+            out RectangleF row2Rect,
+            out RectangleF row3Rect)
+        {
+            bool dual;
+            float divX, l1, l2;
+            RectangleF spark, mini;
+            ComputeSummaryLayoutBounds(logicalW, showStatic, out dual, out divX, out spark, out mini, out l1, out l2);
+            float w1 = Math.Max(120f, l1 - 38f);
+            float w2 = Math.Max(120f, l2 - 38f);
+            if (showStatic)
+            {
+                row1Rect = new RectangleF(38f, SummaryTop + 6f, w1, 22f);
+                row2Rect = new RectangleF(38f, SummaryTop + 34f, w2, 21f);
+                row3Rect = new RectangleF(38f, SummaryTop + 62f, w2, 21f);
+            }
+            else
+            {
+                row1Rect = new RectangleF(38f, SummaryTop + 9f, w1, 24f);
+                row2Rect = new RectangleF(38f, SummaryTop + 42f, w2, 21f);
+                row3Rect = RectangleF.Empty;
+            }
+        }
+
+        /// <summary>生成首页独立固定 IP 实时延迟胶囊的三段文本与语义色调，配合 FitPillLabel 保证毫秒尾缀永不被截断。</summary>
+        internal static void FormatStaticDelayPillParts(
+            StaticProxy.StaticProxyConfig cfg,
+            string liveHop,
+            int delayMs,
+            bool timedOut,
+            bool checking,
+            bool optimizing,
+            bool configOk,
+            bool proxyActive,
+            out string prefix,
+            out string mid,
+            out string suffix,
+            out string tone)
+        {
+            prefix = "固定IP ";
+            string mode = cfg != null ? (cfg.HopMode ?? StaticProxy.HopFollow) : StaticProxy.HopFollow;
+            string hopName = "";
+            if (!string.IsNullOrWhiteSpace(liveHop) && !StaticProxy.IsManagedName(liveHop))
+                hopName = liveHop.Trim();
+            else if (cfg != null && string.Equals(mode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase))
+                hopName = (cfg.AutoBestHopNode ?? "").Trim();
+            else if (cfg != null && string.Equals(mode, StaticProxy.HopPin, StringComparison.OrdinalIgnoreCase))
+                hopName = (cfg.PinnedHopNode ?? "").Trim();
+            string cleanHop = string.IsNullOrEmpty(hopName) ? "" : CleanEmoji(hopName);
+
+            if (string.Equals(mode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase))
+                mid = string.IsNullOrEmpty(cleanHop) ? "智能优选" : ("优选:" + cleanHop);
+            else if (string.Equals(mode, StaticProxy.HopPin, StringComparison.OrdinalIgnoreCase))
+                mid = string.IsNullOrEmpty(cleanHop) ? "锁定跳板" : ("跳板:" + cleanHop);
+            else if (string.Equals(mode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+                mid = "直连";
+            else
+                mid = "跟随主节点";
+
+            if (!configOk)
+            {
+                suffix = " · 未连接";
+                tone = "dim";
+            }
+            else if (!proxyActive)
+            {
+                suffix = " · 待连接";
+                tone = "dim";
+            }
+            else if (optimizing)
+            {
+                suffix = " · 稳速刷新中…";
+                tone = "accent";
+            }
+            else if (checking)
+            {
+                suffix = " · 测速中…";
+                tone = "ok";
+            }
+            else if (timedOut)
+            {
+                suffix = " · 超时";
+                tone = "danger";
+            }
+            else if (delayMs > 0)
+            {
+                suffix = " · " + delayMs + "ms";
+                int baseMs = cfg != null ? cfg.AutoBestDelayMs : -1;
+                tone = (delayMs >= 450 || StaticProxy.IsStaticDelayDegraded(delayMs, baseMs)) ? "warn" : "ok";
+            }
+            else
+            {
+                suffix = " · 点此测速";
+                tone = "ok";
+            }
+        }
+
         /// <summary>摘要卡右侧第一行提示。有分流异常时整块可点击，打开完整明细。</summary>
         RectangleF MismatchRect
         {
@@ -3868,7 +4020,7 @@ namespace ProxyPicker.UI
                 ComputeSummaryLayoutBounds(LogicalW, showStatic, out dual, out divX, out spark, out mini, out l1, out l2);
                 float x = LogicalW < 660f ? 174f : 186f;
                 float w = Math.Max(0f, l1 - x);
-                return new RectangleF(x, SummaryTop + 13f + (showStatic ? 9f : 0f), w, 18);
+                return new RectangleF(x, SummaryTop + (showStatic ? 10f : 13f), w, 18);
             }
         }
         RectangleF SparkRect
@@ -4300,11 +4452,12 @@ namespace ProxyPicker.UI
             float lw = LogicalW;
             bool compactCopy = lw < 660f;
             bool showStatic = ShowStaticRow;
-            float leftYOff = showStatic ? 9f : 0f;
             bool dualColumn;
             float divX, leftRow1Right, leftRow2Right;
             RectangleF sparkRect, miniRatePillRect;
             ComputeSummaryLayoutBounds(lw, showStatic, out dualColumn, out divX, out sparkRect, out miniRatePillRect, out leftRow1Right, out leftRow2Right);
+            RectangleF row1Bounds, row2Bounds, row3Bounds;
+            ComputeSummaryRowBounds(lw, showStatic, out row1Bounds, out row2Bounds, out row3Bounds);
 
             Draw.Shadow(g, card, 10f, Theme.Dark ? 60 : 22);
             Theme.Fill(g, Theme.Card, card, 10f);
@@ -4315,7 +4468,7 @@ namespace ProxyPicker.UI
             float countMeasured = g.MeasureString(countText, _fSummary).Width;
             float countBoxW = Math.Min(compactCopy ? 154f : 168f, (float)Math.Ceiling(countMeasured) + 4f);
             Draw.Text(g, countText, _fSummary, selected > 0 ? Theme.Accent : Theme.Fg,
-                new RectangleF(38, SummaryTop + 9 + leftYOff, countBoxW, 24));
+                new RectangleF(row1Bounds.X, row1Bounds.Y, countBoxW, row1Bounds.Height));
 
             string rest = Settings.PatchOnly ? "按订阅规则" : "其余直连";
             bool modeKnown = _state.ConfigOk && !string.IsNullOrEmpty(_state.Mode) && _state.Mode != "?";
@@ -4335,7 +4488,7 @@ namespace ProxyPicker.UI
                 rest = (Settings.PatchOnly ? "取消勾选≠直连 · 按订阅规则" : "其余软件全部直连") +
                        (_visibleProcs > 0 ? (" · 可见 " + _visibleProcs + " 个") : "");
             float restX = 38f + countBoxW + 8f;
-            _mismatchRect = new RectangleF(restX, SummaryTop + 13f + leftYOff, Math.Max(0f, leftRow1Right - restX), 18f);
+            _mismatchRect = new RectangleF(restX, row1Bounds.Y + 4f, Math.Max(0f, leftRow1Right - restX), 18f);
             Draw.Text(g, rest, _fSmall, (!_state.ConfigOk || nonRuleMode || notProxyActive || _mismatch > 0) ? Theme.Warn : Theme.Dim, _mismatchRect);
 
             if (!dualColumn)
@@ -4371,8 +4524,8 @@ namespace ProxyPicker.UI
                 }
             }
 
-            // 第二行左侧：分流底座+模式胶囊 + 当前节点快捷胶囊
-            float row2Y = SummaryTop + 42f + leftYOff;
+            // 第二行左侧：分流底座+模式胶囊 + 当前主中转节点延迟胶囊
+            float row2Y = row2Bounds.Y;
             var fp = _fPill ?? (_fPill = Theme.Ui(9.5f));
             bool metaWarn;
             string kernelMeta = FormatKernelMeta(_state.Tun, _state.Mode, out metaWarn);
@@ -4462,6 +4615,52 @@ namespace ProxyPicker.UI
                 Color pillFg = isWarn ? Theme.Warn : (isDirectExit ? Theme.Dim : Theme.Accent);
                 Theme.Fill(g, pillBg, pill, 10f);
                 Draw.Text(g, label, fp, pillFg, pill, Draw.Center);
+            }
+
+            // 第三行左侧（仅开启独立固定 IP 时）：实时端到端延迟胶囊 + 自动稳速刷新提示（左键测速 / 右键菜单）
+            if (showStatic && !row3Bounds.IsEmpty)
+            {
+                var spCfg = StaticProxy.Current;
+                string spPrefix, spMid, spSuffix, spTone;
+                FormatStaticDelayPillParts(
+                    spCfg, _staticLiveHop, _staticDelayMs, _staticTimedOut,
+                    _staticChecking, _staticOptimizing, _state.ConfigOk, _state.ProxyActive,
+                    out spPrefix, out spMid, out spSuffix, out spTone);
+                float maxSpW = Math.Max(96f, row3Bounds.Width);
+                string spText = FitPillLabel(spPrefix, spMid, spSuffix, maxSpW - 18f, s => g.MeasureString(s, fp).Width);
+                float spW = Math.Min(maxSpW, g.MeasureString(spText, fp).Width + 18f);
+                var spPill = new RectangleF(row3Bounds.X, row3Bounds.Y, spW, row3Bounds.Height);
+                _staticDelayRect = spPill;
+
+                Color spBg, spFg;
+                if (spTone == "danger") { spBg = Theme.DangerSoft; spFg = Theme.Danger; }
+                else if (spTone == "warn") { spBg = Theme.WarnSoft; spFg = Theme.Warn; }
+                else if (spTone == "accent") { spBg = Theme.AccentSoft; spFg = Theme.Accent; }
+                else if (spTone == "dim") { spBg = Theme.SubCard; spFg = Theme.Dim; }
+                else { spBg = Theme.OkSoft; spFg = Theme.Ok; }
+                if (_hover == Btn.StaticDelay)
+                    spBg = Theme.Blend(spBg, spFg, Theme.Dark ? 0.16f : 0.10f);
+                Theme.Fill(g, spBg, spPill, 10f);
+                using (var dotB = new SolidBrush(spFg))
+                    g.FillEllipse(dotB, spPill.X + 7f, spPill.Y + 7.5f, 5.5f, 5.5f);
+                Draw.Text(g, spText, fp, spFg, new RectangleF(spPill.X + 14f, spPill.Y, spPill.Width - 18f, spPill.Height), Draw.Left);
+
+                float remainW = row3Bounds.Right - (spPill.Right + 8f);
+                if (dualColumn && remainW >= 96f && _state.ConfigOk && _state.ProxyActive)
+                {
+                    bool isAuto = string.Equals(spCfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                    string spTip = isAuto
+                        ? (remainW >= 158f
+                            ? ("每" + StaticProxy.AutoHopRefreshIntervalMinutes + "分自动稳速 · 点此测速")
+                            : ("每" + StaticProxy.AutoHopRefreshIntervalMinutes + "分自动稳速"))
+                        : (remainW >= 122f ? "点此测速 · 右键管理" : "点此测速");
+                    Draw.Text(g, spTip, _fTiny, Theme.Dim,
+                        new RectangleF(spPill.Right + 8f, row3Bounds.Y + 3f, remainW, 16f));
+                }
+            }
+            else
+            {
+                _staticDelayRect = RectangleF.Empty;
             }
             if (false && kernelMeta.Length == 0) { }
 
@@ -4816,6 +5015,7 @@ namespace ProxyPicker.UI
             if (!_modeChipRect.IsEmpty && _modeChipRect.Contains(x, y)) return Btn.ModeChip;
             if (_mismatch > 0 && MismatchRect.Contains(x, y)) return Btn.Mismatch;
             if (!_delayRect.IsEmpty && _delayRect.Contains(x, y)) return Btn.Delay;
+            if (!_staticDelayRect.IsEmpty && _staticDelayRect.Contains(x, y)) return Btn.StaticDelay;
             if (SaveRect.Contains(x, y)) return Btn.Save;
             if (DirectRect.Contains(x, y)) return Btn.Direct;
             if (SortRect.Contains(x, y)) return Btn.Sort;
@@ -4857,6 +5057,7 @@ namespace ProxyPicker.UI
             if (e.Button == MouseButtons.Right)
             {
                 if (b == Btn.Delay) TestDelayPublic();
+                else if (b == Btn.StaticDelay) ShowStaticDelayMenu();
                 else if (b == Btn.ModeChip) ShowModePickerMenu();
                 return;
             }
@@ -4881,6 +5082,7 @@ namespace ProxyPicker.UI
             if (b == Btn.HelpUpdate) { VersionClick(); return; }
             if (b == Btn.Mismatch) { ShowMismatchDialog(); return; }
             if (b == Btn.Delay) { PushAndSwitchPage(1); return; }
+            if (b == Btn.StaticDelay) { TestStaticDelayPublic(); return; }
 
             int tab = HitTab(e.Location);
             if (tab >= 0) { _tab = tab; Settings.Current.Tab = tab; Settings.Save(); RebuildVisible(true); return; }
@@ -4920,6 +5122,39 @@ namespace ProxyPicker.UI
             menu.Items.Add(patchItem);
 
             menu.Show(this, new Point(Theme.Px(_modeChipRect.X), Theme.Px(_modeChipRect.Bottom + 4)));
+        }
+
+        /// <summary>在摘要卡片右键独立固定 IP 延迟胶囊时弹出的快捷菜单（立即测速 / 立即稳速优选 / 打开设置）。</summary>
+        void ShowStaticDelayMenu()
+        {
+            if (!UiAlive || _busy || _staticDelayRect.IsEmpty) return;
+            var cfg = StaticProxy.Current;
+            var menu = new ContextMenuStrip { ShowImageMargin = false };
+            menu.Closed += (s, e) =>
+            {
+                var c = (ContextMenuStrip)s;
+                if (!UiAlive) return;
+                BeginInvoke(new Action(() => { if (!c.IsDisposed) c.Dispose(); }));
+            };
+
+            var testItem = new ToolStripMenuItem("立即测固定 IP 实时延迟");
+            testItem.Click += (s, e) => TestStaticDelayPublic();
+            menu.Items.Add(testItem);
+
+            if (!string.Equals(cfg.HopMode, StaticProxy.HopDirect, StringComparison.OrdinalIgnoreCase))
+            {
+                var optItem = new ToolStripMenuItem("立即刷新优选前置跳板（每 " + StaticProxy.AutoHopRefreshIntervalMinutes + " 分钟自动稳速）");
+                optItem.Enabled = !_staticOptimizing;
+                optItem.Click += (s, e) => _ = OptimizeStaticHopAsync(true, false);
+                menu.Items.Add(optItem);
+            }
+
+            menu.Items.Add(new ToolStripSeparator());
+            var manageItem = new ToolStripMenuItem("打开独立固定 IP 设置…");
+            manageItem.Click += (s, e) => OpenStaticProxyDialog();
+            menu.Items.Add(manageItem);
+
+            menu.Show(this, new Point(Theme.Px(_staticDelayRect.X), Theme.Px(_staticDelayRect.Bottom + 4)));
         }
 
         void ApplyModeSelection(bool patchOnly)
@@ -5562,12 +5797,17 @@ namespace ProxyPicker.UI
                 _staticTimedOut,
                 cfg.HopMode,
                 hopDisplay,
-                _staticOptimizing);
+                _staticOptimizing,
+                _staticChecking);
             if (active != _lastShowStaticRow)
             {
                 _lastShowStaticRow = active;
                 if (IsHandleCreated) LayoutChildren();
                 Invalidate();
+            }
+            else if (IsHandleCreated)
+            {
+                Invalidate(new Rectangle(0, Theme.Px(SummaryTop - 2), Width, Theme.Px(SummaryH + 6)));
             }
             _list.Invalidate();
         }
@@ -5681,11 +5921,12 @@ namespace ProxyPicker.UI
             if (!UiAlive || _staticChecking || _shuttingDown) return;
             var cfg = StaticProxy.Current;
             if (!cfg.IsActive()) return;
-            // 仅当确实有软件绑定固定 IP 或用户主动点击测速时探测，节省静态节点请求
-            int boundCount = _all.Count(r => r.Proxy && r.IsStatic);
-            if (!manual && boundCount == 0) return;
 
             _staticChecking = true;
+            _lastStaticHealthCheckAt = DateTime.UtcNow;
+            SyncStaticUiBanner();
+            if (manual)
+                SetStatus("正在实测独立固定 IP 端到端延迟…", Theme.Dim);
             try
             {
                 string cfgPath = Paths.ClashYaml;
@@ -5703,23 +5944,31 @@ namespace ProxyPicker.UI
                         string liveHop = await Task.Run(() => StaticProxy.ReadLiveHopNode(cfgPath));
                         if (!string.IsNullOrEmpty(liveHop)) _staticLiveHop = liveHop;
                     }
+                    bool degraded = StaticProxy.IsStaticDelayDegraded(res.DelayMs, cfg.AutoBestDelayMs);
+                    _staticSlowStreak = degraded ? (_staticSlowStreak + 1) : 0;
+
                     SyncStaticUiBanner();
+                    string hopHint = string.IsNullOrEmpty(_staticLiveHop)
+                        ? ""
+                        : ("（前置：" + CleanEmoji(_staticLiveHop) + "）");
                     if (wasDown)
                     {
                         AuditLog.Record("STATIC", "独立固定 IP 已恢复可用 · " + res.DelayMs + " ms");
-                        Toast("独立固定 IP 已恢复", cfg.DisplayLabel + " · " + res.DelayMs + " ms", Theme.Ok, 2);
+                        SetStatus("独立固定 IP 已恢复：" + res.DelayMs + " ms" + hopHint, Theme.Ok);
+                        Toast("独立固定 IP 已恢复", cfg.DisplayLabel + " · " + res.DelayMs + " ms" + hopHint, Theme.Ok, 2);
                     }
-                    // 智能优选模式下的低频后台平滑复优（每 25 分钟最多一次，且须满足 >=15% 与 >=60ms 防抖门槛）
-                    if (!manual && boundCount > 0 && !_staticOptimizing &&
-                        string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase))
+                    else if (manual)
                     {
-                        var nowUtc = DateTime.UtcNow;
-                        bool sessionDue = _lastAutoHopOptimizeAt == DateTime.MinValue ||
-                                          (nowUtc - _lastAutoHopOptimizeAt).TotalMinutes >= 25.0;
-                        bool savedDue = cfg.AutoBestUpdatedAtTicks <= 0 ||
-                                        (nowUtc - new DateTime(cfg.AutoBestUpdatedAtTicks, DateTimeKind.Utc)).TotalMinutes >= 25.0;
-                        if (sessionDue && savedDue)
-                            _ = OptimizeStaticHopAsync(false, false);
+                        SetStatus("独立固定 IP 端到端延迟 " + res.DelayMs + " ms" + hopHint, degraded ? Theme.Warn : Theme.Ok);
+                        Toast("独立固定 IP 测速正常", res.DelayMs + " ms" + hopHint, degraded ? Theme.Warn : Theme.Ok, 2);
+                    }
+                    // 智能优选模式下的每 10 分钟定时稳速刷新 + 连续 2 轮劣化提前触发重优
+                    bool isAutoHop = string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                    if (!manual && StaticProxy.ShouldRunScheduledAutoHopRefresh(
+                            isAutoHop, _staticOptimizing, _lastAutoHopOptimizeAt,
+                            cfg.AutoBestUpdatedAtTicks, DateTime.UtcNow, _staticSlowStreak, false))
+                    {
+                        _ = OptimizeStaticHopAsync(false, false);
                     }
                 }
                 else if (res.TimedOut)
@@ -5735,11 +5984,13 @@ namespace ProxyPicker.UI
                     // 严格遵循宁断不漂（Fail-Closed）：绝不自动把固定 IP 软件漂移到普通共享节点
                     _staticDelayMs = -1;
                     _staticTimedOut = true;
+                    _staticSlowStreak = 0;
                     SyncStaticUiBanner();
-                    // 智能优选模式下超时：自动触发一次零干扰端到端重优急救切换前置跳板（外部固定 IP 保持绝对不变）
-                    if (string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase) &&
-                        !_staticOptimizing &&
-                        (_lastAutoHopOptimizeAt == DateTime.MinValue || (DateTime.UtcNow - _lastAutoHopOptimizeAt).TotalSeconds >= 180))
+                    // 智能优选模式下超时：满足 120 秒急救冷却后自动触发零干扰端到端重优切换前置跳板（外部固定 IP 保持绝对不变）
+                    bool isAutoHop = string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                    if (StaticProxy.ShouldRunScheduledAutoHopRefresh(
+                            isAutoHop, _staticOptimizing, _lastAutoHopOptimizeAt,
+                            cfg.AutoBestUpdatedAtTicks, DateTime.UtcNow, 0, true))
                     {
                         _ = OptimizeStaticHopAsync(false, true);
                     }
@@ -5748,7 +5999,7 @@ namespace ProxyPicker.UI
                         _lastStaticAlertAt = DateTime.UtcNow;
                         AuditLog.Record("STATIC", "独立固定 IP 不可达（已锁定防漂移）：" + (res.Error ?? "超时"));
                         Toast("独立固定 IP 不可达（已锁定防漂移）",
-                            string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase)
+                            isAutoHop
                                 ? "已锁定固定 IP 防泄漏，正在后台自动重测优选可用前置跳板…"
                                 : "为防止 IP 暴露，已阻断漂移到普通节点；请检查前置跳板或静态 IP 状态",
                             Theme.Danger, 3);
@@ -5761,6 +6012,7 @@ namespace ProxyPicker.UI
             finally
             {
                 _staticChecking = false;
+                if (UiAlive) SyncStaticUiBanner();
             }
         }
 
@@ -5796,6 +6048,7 @@ namespace ProxyPicker.UI
             try
             {
                 string cfgPath = Paths.ClashYaml;
+                string curHopBefore = await Task.Run(() => StaticProxy.ReadLiveHopNode(cfgPath));
                 var bench = await Task.Run(() => StaticProxy.BenchmarkBestHopsThroughSidecar(
                     cfg, cfgPath,
                     msg =>
@@ -5805,7 +6058,9 @@ namespace ProxyPicker.UI
                             try { BeginInvoke(new Action(() => SetStatus(msg, Theme.Accent))); }
                             catch { }
                         }
-                    }));
+                    },
+                    default(System.Threading.CancellationToken),
+                    curHopBefore));
                 if (!UiAlive || _shuttingDown) return;
                 if (bench == null || !bench.Ok || string.IsNullOrEmpty(bench.BestNode))
                 {
@@ -5818,7 +6073,9 @@ namespace ProxyPicker.UI
                     return;
                 }
 
-                string curHop = await Task.Run(() => StaticProxy.ReadLiveHopNode(cfgPath));
+                string curHop = !string.IsNullOrEmpty(curHopBefore)
+                    ? curHopBefore
+                    : await Task.Run(() => StaticProxy.ReadLiveHopNode(cfgPath));
                 int curBenchMs = _staticDelayMs;
                 if (!string.IsNullOrEmpty(curHop))
                 {
@@ -5840,6 +6097,7 @@ namespace ProxyPicker.UI
                     .Select(x => x.NodeName)
                     .ToList();
 
+                string jitterTag = bench.BestJitterMs > 0 ? (" · 抖动 " + bench.BestJitterMs + "ms") : "";
                 if (switchIt)
                 {
                     updated.AutoBestHopNode = bench.BestNode;
@@ -5858,28 +6116,40 @@ namespace ProxyPicker.UI
                     _staticDelayMs = bench.BestDelayMs;
                     _staticTimedOut = false;
                     _staticTimeoutStreak = 0;
+                    _staticSlowStreak = 0;
 
                     string cleanBest = CleanEmoji(bench.BestNode);
                     AuditLog.Record("STATIC",
-                        (emergencyRecovery ? "固定 IP 前置故障自愈切换至：" : "固定 IP 智能优选前置跳板：") +
-                        bench.BestNode + "（" + bench.BestDelayMs + "ms，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）");
-                    SetStatus("固定 IP 已切至独立最快跳板「" + cleanBest + "」（" + bench.BestDelayMs + "ms，外部 IP 不变）", Theme.Ok);
-                    Toast(emergencyRecovery ? "固定 IP 跳板已自愈切换" : "固定 IP 已切换最快跳板",
-                        "独立前置：" + cleanBest + "（" + bench.BestDelayMs + "ms · " + bench.ReachableCount + "/" + bench.TestedCount + " 可达），主 VPN 节点不受影响",
-                        Theme.Ok, 3);
+                        (emergencyRecovery ? "固定 IP 前置故障自愈切换至：" : "固定 IP 稳速优选切换前置跳板：") +
+                        bench.BestNode + "（" + bench.BestDelayMs + "ms" + jitterTag + "，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）");
+                    SetStatus("固定 IP 已切至稳速最快跳板「" + cleanBest + "」（" + bench.BestDelayMs + "ms" + jitterTag + "，外部 IP 不变）", Theme.Ok);
+                    if (manual || emergencyRecovery)
+                    {
+                        Toast(emergencyRecovery ? "固定 IP 跳板已自愈切换" : "固定 IP 已切换稳速最快跳板",
+                            "独立前置：" + cleanBest + "（" + bench.BestDelayMs + "ms" + jitterTag + " · " + bench.ReachableCount + "/" + bench.TestedCount + " 可达），主 VPN 节点不受影响",
+                            Theme.Ok, 3);
+                    }
                 }
                 else
                 {
                     if (string.IsNullOrEmpty(updated.AutoBestHopNode))
                         updated.AutoBestHopNode = string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop;
+                    int keptMs = curBenchMs > 0 ? curBenchMs : bench.BestDelayMs;
+                    if (keptMs > 0)
+                    {
+                        updated.AutoBestDelayMs = keptMs;
+                        _staticDelayMs = keptMs;
+                    }
+                    _staticSlowStreak = 0;
                     string saveErr;
                     StaticProxy.Save(updated, out saveErr);
                     if (!string.IsNullOrEmpty(curHop)) _staticLiveHop = curHop;
+                    string cleanCur = CleanEmoji(string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop);
+                    AuditLog.Record("STATIC", "固定 IP 定时稳速巡检完成：当前跳板「" + cleanCur + "」保持最优（" + keptMs + "ms，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）");
                     if (manual)
                     {
-                        string cleanCur = CleanEmoji(string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop);
-                        SetStatus("当前固定 IP 跳板「" + cleanCur + "」已是最优（" + bench.BestDelayMs + "ms，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）", Theme.Ok);
-                        Toast("当前固定 IP 跳板已是最优", cleanCur + " · " + bench.BestDelayMs + "ms（主 VPN 节点互不干扰）", Theme.Ok, 2);
+                        SetStatus("当前固定 IP 跳板「" + cleanCur + "」已是最稳最优（" + keptMs + "ms" + jitterTag + "，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）", Theme.Ok);
+                        Toast("当前固定 IP 跳板已是最优", cleanCur + " · " + keptMs + "ms（主 VPN 节点互不干扰）", Theme.Ok, 2);
                     }
                 }
             }

@@ -4,6 +4,19 @@
 程序里的「检查更新」读的是 GitHub Releases API 的 `tag_name`，不是本文件里的条目；
 本文件只是给人看的变更记录。
 
+## v2.5.1（2026-11-25）
+
+### 首页独立固定 IP 实时延迟胶囊 + 每 10 分钟稳态定期刷新优选跳板
+- **首页直接展示固定 IP 实时端到端延迟（`UI/MainForm.cs`、`UI/NodesPage.cs`、`Program.cs`）**：
+  - 启用独立固定 IP 后，首页摘要卡左侧与蓝色主中转节点胶囊上下对称新增绿色「`● 固定IP 优选:<跳板> · <ms>`」胶囊（466px 极窄侧栏至 2400px 宽屏全断点零截断，`FitPillLabel` 永保毫秒尾缀；`>=450ms` 或劣化标琥珀、超时标红、刷新中标蓝）。
+  - 启动、保存规则、主节点测速后及每 45 秒后台独立自动探测 `PP-STATIC-OUT` 真实端到端延迟并即时重绘首页与节点页，不再依赖主节点测速成功或必须先绑定软件。
+  - 胶囊左键点击立即实测当前固定 IP 延迟；右键弹出快捷菜单（「立即测固定 IP 实时延迟」「立即刷新优选前置跳板」「打开独立固定 IP 设置…」）；`2. 节点策略` 固定 IP 横条同步支持点击测速；CLI `--delay` 同步附加 `staticEnabled` / `staticHopMode` / `staticHop` / `staticOk` / `staticDelayMs` 输出。
+- **定期稳速刷新 + 3 次稳态复核防抖优选（`Core/StaticProxy.cs`、`UI/MainForm.cs`）**：
+  - 智能优选模式（`HopAuto`）下，后台定时看守每隔 **10 分钟**自动在零干扰旁路静默复测候选跳板池（收进托盘照常巡检），避免长时间运行后跳板节点拥堵掉速。
+  - `BenchmarkBestHopsThroughSidecar` 升级为两阶段实测：16 路并发全量初筛后，对 Top 5 与当前活跃跳板在旁路执行 **2 轮连续复测（共 3 次采样）**，按综合稳态分 `ComputeStabilityScore = avgMs + jitterMs / 2` 且 3 次全通优先进行排序，淘汰偶快但高抖动/掉线的假稳节点。
+  - 新增延迟劣化提前自愈（`IsStaticDelayDegraded`：连续 2 轮 `>=420ms` 且较基线涨 `>=65%`，或 `>=750ms` 时满足 3 分钟冷却即提前刷新；超时满足 2 分钟急救冷却即切备用跳板）；平稳期保持 15%/60ms 防抖不来回横跳，对外固定 IP 地址全程保持绝对不变。
+- **离线自检扩至 343 项（0 失败）**：新增 `SP43`（首页固定 IP 延迟胶囊全态格式化、窄屏保尾缀与三行摘要卡 466–880px 全断点零碰撞）、`SP44`（10 分钟定时巡检/2 轮劣化提前触发/超时急救冷却/稳态抖动惩罚分）与 `SP45`（3 次稳态复核排序）。
+
 ## v2.5.0 — 2026-11-25（彻底封死固定 IP UDP/QUIC 穿透直连 + 独立端到端最低延迟前置跳板自动优选）
 
 - **修复：彻底封死固定 IP 绑定进程的 UDP / HTTP/3 QUIC / WebRTC 穿透直连漏洞（Core/Discovery.cs、Core/Profile.cs、Core/Guard.cs、Core/Traffic.cs）**
@@ -105,7 +118,8 @@
   - NodeManager 修复 RxDe 含 FRA 导致「法国 FRA」/ FRA-01 被先判成德国 DE 的歧义，同时正确保持「德国 FRA / 法兰克福」为 DE；BatchMeasureNodes 内核失联时同步将当前项 LiveDelayMs 置 -2 与 Alive = false 并向界面反馈中断原因（按局部副本更新进度）；
   - Traffic.AnalyzeConnections 首见新连接只写入基线、当拍增量记  （计数回绕同样置  ），消除长期连接暴露时的虚假封顶尖峰，并为 Poll 透传当前配置路径；
   - Mihomo 对通用 mihomo / mihomo-* 命名管道（含 TryPipe 与 RequestRaw）发送 Bearer Secret 前追加实时 PidProvesConfig 配置归属证明，并令 CommandLineProvesConfig 拒绝无法核对工作目录的相对 -f/-d 路径；
-  - Discovery.BuildPayload 放行 ules: 段内的缩进与 <<: 合并键不截断后续规则，收紧 IsClientRunning 非品牌兜底匹配；
+  - Discovery.BuildPayload 放行 
+ules: 段内的缩进与 <<: 合并键不截断后续规则，收紧 IsClientRunning 非品牌兜底匹配；
   - MainForm.ToggleBatchQualityScanAsync inally 为逐项恢复节点与 origMode 加独立异常保护和返回值提示；ProbeSidecar 启用纯内核内部标准 DNS（无本地监听）并校验相对 path: 防越界；Profile.LeaveNoTraceCore 全量还原前复核指纹防替换新订阅；Updater 禁用自动重定向并约束 Release URL 主机；Json 支持 UTF-16 代理对转义校验；TrayContext.ExitApp 弹窗异常时保守留在托盘；pp.manifest 同步版本号 2.2.4.0。
 - 离线自检增至 **292 项**（通用性 199 + 控制接口安全 50 + 流量对账 18 + 节点管理 7 + 网络质量与风控 13 + 零干扰侧车探测 5，全部 0 失败）。
 
