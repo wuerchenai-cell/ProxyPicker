@@ -78,6 +78,16 @@ namespace ProxyPicker.Core
             // v2.1.0：记住用户拖拽调整的窗口逻辑宽高（默认 880×600，最小兼容最初版 466 宽度）
             public int WinW = 880;
             public int WinH = 600;
+            // v2.6.0：双向软件联动启停（跟随指定软件同生共死 + 打开 ProxyPicker 时同步拉起勾选软件）
+            public bool FollowEnabled;
+            public string FollowAppExe = "";
+            public string FollowAppPath = "";
+            public string FollowAppName = "";
+            public bool FollowAutoExit = true;
+            public bool FollowWatchAtLogon;
+            public bool LaunchAppsEnabled;
+            public bool LaunchAppsOnFollow = true;
+            public List<string> LaunchAppPaths = new List<string>();
         }
 
         static Data _data;
@@ -484,6 +494,15 @@ namespace ProxyPicker.Core
             var hidden = new List<string>(d.Hidden);
             var custom = new List<string>(d.Custom);
             var candidateNodes = new List<string>(d.CandidateNodes);
+            var launchAppPaths = new List<string>(d.LaunchAppPaths ?? new List<string>());
+            bool followEnabled = d.FollowEnabled;
+            string followAppExe = d.FollowAppExe ?? "";
+            string followAppPath = d.FollowAppPath ?? "";
+            string followAppName = d.FollowAppName ?? "";
+            bool followAutoExit = d.FollowAutoExit;
+            bool followWatchAtLogon = d.FollowWatchAtLogon;
+            bool launchAppsEnabled = d.LaunchAppsEnabled;
+            bool launchAppsOnFollow = d.LaunchAppsOnFollow;
 
             var sb = new StringBuilder();
             sb.Append("{\n");
@@ -510,6 +529,14 @@ namespace ProxyPicker.Core
             sb.Append("  \"desiredRegion\": ").Append(Json.Quote(desiredRegion)).Append(",\n");
             sb.Append("  \"winW\": ").Append(winW).Append(",\n");
             sb.Append("  \"winH\": ").Append(winH).Append(",\n");
+            sb.Append("  \"followEnabled\": ").Append(followEnabled ? "true" : "false").Append(",\n");
+            sb.Append("  \"followAppExe\": ").Append(Json.Quote(followAppExe)).Append(",\n");
+            sb.Append("  \"followAppPath\": ").Append(Json.Quote(followAppPath)).Append(",\n");
+            sb.Append("  \"followAppName\": ").Append(Json.Quote(followAppName)).Append(",\n");
+            sb.Append("  \"followAutoExit\": ").Append(followAutoExit ? "true" : "false").Append(",\n");
+            sb.Append("  \"followWatchAtLogon\": ").Append(followWatchAtLogon ? "true" : "false").Append(",\n");
+            sb.Append("  \"launchAppsEnabled\": ").Append(launchAppsEnabled ? "true" : "false").Append(",\n");
+            sb.Append("  \"launchAppsOnFollow\": ").Append(launchAppsOnFollow ? "true" : "false").Append(",\n");
 
             AppendStringArray(sb, "order", order); sb.Append(",\n");
 
@@ -533,7 +560,8 @@ namespace ProxyPicker.Core
 
             AppendStringArray(sb, "hidden", hidden); sb.Append(",\n");
             AppendStringArray(sb, "custom", custom); sb.Append(",\n");
-            AppendStringArray(sb, "candidateNodes", candidateNodes); sb.Append("\n}\n");
+            AppendStringArray(sb, "candidateNodes", candidateNodes); sb.Append(",\n");
+            AppendStringArray(sb, "launchAppPaths", launchAppPaths); sb.Append("\n}\n");
             return sb.ToString();
         }
 
@@ -653,6 +681,14 @@ namespace ProxyPicker.Core
             if (!string.IsNullOrEmpty(desiredRegion)) d.DesiredRegion = NormalizeDesiredRegion(desiredRegion);
             if (root.TryGetValue("winW", out v) && v is double) d.WinW = ClampWindowW((int)(double)v);
             if (root.TryGetValue("winH", out v) && v is double) d.WinH = ClampWindowH((int)(double)v);
+            if (root.TryGetValue("followEnabled", out v) && v is bool) d.FollowEnabled = (bool)v;
+            d.FollowAppExe = Json.Str(root, "followAppExe") ?? "";
+            d.FollowAppPath = Json.Str(root, "followAppPath") ?? "";
+            d.FollowAppName = Json.Str(root, "followAppName") ?? "";
+            if (root.TryGetValue("followAutoExit", out v) && v is bool) d.FollowAutoExit = (bool)v;
+            if (root.TryGetValue("followWatchAtLogon", out v) && v is bool) d.FollowWatchAtLogon = (bool)v;
+            if (root.TryGetValue("launchAppsEnabled", out v) && v is bool) d.LaunchAppsEnabled = (bool)v;
+            if (root.TryGetValue("launchAppsOnFollow", out v) && v is bool) d.LaunchAppsOnFollow = (bool)v;
 
             Dictionary<string, object> obj;
             ReadStringList(root, "order", d.Order);
@@ -682,6 +718,7 @@ namespace ProxyPicker.Core
             }
             ReadStringList(root, "custom", d.Custom);
             ReadStringList(root, "candidateNodes", d.CandidateNodes, true);
+            ReadStringList(root, "launchAppPaths", d.LaunchAppPaths, true);
             return d;
         }
 
@@ -991,6 +1028,56 @@ namespace ProxyPicker.Core
                     }
                 }
                 Save();
+            }
+        }
+
+        /// <summary>读取软件联动启停配置快照。</summary>
+        public static AppCompanion.CompanionConfig GetCompanionConfig()
+        {
+            lock (Gate)
+            {
+                var d = Current;
+                return new AppCompanion.CompanionConfig
+                {
+                    FollowEnabled = d.FollowEnabled,
+                    FollowAppExe = d.FollowAppExe ?? "",
+                    FollowAppPath = d.FollowAppPath ?? "",
+                    FollowAppName = d.FollowAppName ?? "",
+                    FollowAutoExit = d.FollowAutoExit,
+                    FollowWatchAtLogon = d.FollowWatchAtLogon,
+                    LaunchAppsEnabled = d.LaunchAppsEnabled,
+                    LaunchAppsOnFollow = d.LaunchAppsOnFollow,
+                    LaunchAppPaths = new List<string>(d.LaunchAppPaths ?? new List<string>())
+                };
+            }
+        }
+
+        /// <summary>保存软件联动启停配置到 settings.json。</summary>
+        public static bool SaveCompanionConfig(AppCompanion.CompanionConfig cfg)
+        {
+            if (cfg == null) return false;
+            lock (Gate)
+            {
+                var d = Current;
+                d.FollowEnabled = cfg.FollowEnabled;
+                d.FollowAppExe = AppCompanion.ExtractExeName(string.IsNullOrWhiteSpace(cfg.FollowAppExe) ? cfg.FollowAppPath : cfg.FollowAppExe);
+                d.FollowAppPath = (cfg.FollowAppPath ?? "").Trim().Trim('"');
+                d.FollowAppName = (cfg.FollowAppName ?? "").Trim();
+                d.FollowAutoExit = cfg.FollowAutoExit;
+                d.FollowWatchAtLogon = cfg.FollowWatchAtLogon;
+                d.LaunchAppsEnabled = cfg.LaunchAppsEnabled;
+                d.LaunchAppsOnFollow = cfg.LaunchAppsOnFollow;
+                d.LaunchAppPaths = AppCompanion.OrderLaunchTargets(cfg.LaunchAppPaths);
+            }
+            return Save();
+        }
+
+        /// <summary>供独立守望进程检测到 settings.json 磁盘更新时重新加载联动字段。</summary>
+        public static void ReloadCompanionFromDisk()
+        {
+            lock (Gate)
+            {
+                _data = Load();
             }
         }
     }

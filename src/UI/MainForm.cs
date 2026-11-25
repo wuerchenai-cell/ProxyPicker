@@ -98,12 +98,13 @@ namespace ProxyPicker.UI
         // 用独立计时器而不是挂在 _trafficTimer 上，是因为收进托盘后流量计时器会停，
         // 而「换订阅后自己发现」这件事恰恰要在收进托盘时也能工作。
         readonly Timer _watchTimer = new Timer { Interval = 10000 };
+        readonly Timer _companionTimer = new Timer { Interval = 2500 };
 
         Font _fTitle, _fSub, _fSummary, _fBtn, _fHint, _fSmall, _fInput,
              _fTab, _fTabActive, _fRate, _fTiny, _fHelp, _fHelpTitle;
         Font _fPill;   // 出口胶囊，懒加载
 
-        enum Btn { None, Nav0, Nav1, Nav2, Save, Direct, Refresh, Close, Max, Help, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch, Delay, StaticDelay, ModeChip }
+        enum Btn { None, Nav0, Nav1, Nav2, Save, Direct, Refresh, Close, Max, Help, Companion, Sort, HelpClose, HelpDiag, HelpUnhide, HelpMode, HelpIpv6, Min, HelpUpdate, Mismatch, Delay, StaticDelay, ModeChip }
         Btn _hover = Btn.None;
         int _page;          // 一级功能区：0=应用分流 1=节点策略 2=链路体检
         readonly Stack<int> _pageHistory = new Stack<int>();
@@ -181,6 +182,11 @@ namespace ProxyPicker.UI
         DateTime _lastAutoHopOptimizeAt = DateTime.MinValue;
         bool _staticWarnShown;
         RectangleF _staticDelayRect;
+        string _companionSessionFollowExe = "";
+        bool _launchedViaCompanion;
+        AppCompanion.FollowExitTracker _followTracker;
+        bool _companionBootStarted;
+        bool _companionDialogBusy;
         string _status = "正在准备…";
         Color _statusColor;
 
@@ -418,6 +424,7 @@ namespace ProxyPicker.UI
             _clock.Tick += ClockTick;
             _trafficTimer.Tick += (s, e) => PollTraffic();
             _watchTimer.Tick += (s, e) => WatchTick();
+            _companionTimer.Tick += (s, e) => CompanionTimerTick();
             _watchTimer.Start();
             Opacity = 0.06;
             _show = 0f;
@@ -770,6 +777,7 @@ namespace ProxyPicker.UI
             // 仅禁用子控件操作而不把顶层窗体整窗 Enabled=false 冻成无响应假死。
             try { _trafficTimer.Stop(); } catch { }
             try { _watchTimer.Stop(); } catch { }
+            try { _companionTimer.Stop(); } catch { }
             SetChildControlsEnabled(false);
             SetStatus("正在清理内核规则并退出…", Theme.Dim);
         }
@@ -780,6 +788,7 @@ namespace ProxyPicker.UI
             try { Enabled = true; } catch { }
             SetChildControlsEnabled(true);
             try { _watchTimer.Start(); } catch { }
+            try { if (_followTracker != null) _companionTimer.Start(); } catch { }
             try { if (Visible) _trafficTimer.Start(); } catch { }
             SetStatus("已取消退出，继续在后台守护分流", Theme.Dim);
         }
@@ -794,6 +803,9 @@ namespace ProxyPicker.UI
 
         /// <summary>点「×」时抛给 TrayContext：走「还原 + 退出」，不再静默收进托盘。</summary>
         public event Action CloseRequested;
+
+        /// <summary>跟随的目标软件关闭时抛给 TrayContext：执行无弹窗同生共死还原退出。</summary>
+        public event Action CompanionAutoExitRequested;
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -4110,6 +4122,8 @@ namespace ProxyPicker.UI
         RectangleF MaxRect { get { return new RectangleF(LogicalW - 82, 10, 26, 26); } }
         RectangleF MinRect { get { return new RectangleF(LogicalW - 114, 10, 26, 26); } }
         RectangleF RefreshRect { get { return new RectangleF(LogicalW - 146, 10, 26, 26); } }
+        internal static RectangleF CompanionBtnRectFor(float logicalW) { return new RectangleF(logicalW - 236f, 10f, 52f, 26f); }
+        RectangleF CompanionRect { get { return CompanionBtnRectFor(LogicalW); } }
         RectangleF HelpRect { get { return new RectangleF(LogicalW - 178, 10, 26, 26); } }
         RectangleF SortRect
         {
@@ -4199,10 +4213,11 @@ namespace ProxyPicker.UI
                 g.FillRectangle(b, 0, 0, lw, TitleH + 6);
 
             if (_titleIcon != null) g.DrawImage(_titleIcon, 24f, 11f, 24f, 24f);
-            float titleAvail = Math.Max(140f, HelpRect.X - 64f);
+            float titleAvail = Math.Max(140f, CompanionRect.X - 64f);
             Draw.Text(g, "ProxyPicker", _fTitle, Theme.Fg, new RectangleF(56, 7, titleAvail, 22));
             Draw.Text(g, Subtitle(), _fSub, Theme.Dim, new RectangleF(56, 27, titleAvail, 16));
 
+            DrawCompanionButton(g);
             DrawChromeButton(g, HelpRect, Btn.Help, "?");
             DrawRefresh(g);
             DrawMin(g);
@@ -4745,6 +4760,29 @@ namespace ProxyPicker.UI
             Draw.Text(g, label, _fTiny, c, new RectangleF(r.X + 24, r.Y, r.Width - 28, r.Height));
         }
 
+        void DrawCompanionButton(Graphics g)
+        {
+            var r = CompanionRect;
+            var cfg = Settings.GetCompanionConfig();
+            bool active = cfg.IsAnyActive || !string.IsNullOrEmpty(_companionSessionFollowExe);
+            bool hover = _hover == Btn.Companion;
+            Color bg = active
+                ? (hover ? Theme.Blend(Theme.AccentSoft, Theme.Accent, 0.14f) : Theme.AccentSoft)
+                : (hover ? Theme.Hover : (Theme.Dark ? Theme.Btn : Theme.FromHex("#F1F3F6")));
+            Color fg = active ? Theme.Accent : (hover ? Theme.Fg : Theme.Dim);
+            Theme.Fill(g, bg, r, 7f);
+            if (active)
+            {
+                using (var dotB = new SolidBrush(Theme.Ok))
+                    g.FillEllipse(dotB, r.X + 7f, r.Y + 10.5f, 5f, 5f);
+                Draw.Text(g, "联动", _fTiny, fg, new RectangleF(r.X + 12f, r.Y, r.Width - 14f, r.Height), Draw.Center);
+            }
+            else
+            {
+                Draw.Text(g, "联动", _fTiny, fg, r, Draw.Center);
+            }
+        }
+
         void DrawChromeButton(Graphics g, RectangleF r, Btn btn, string text)
         {
             if (_hover == btn) Theme.Fill(g, Theme.Hover, r, 7f);
@@ -5005,6 +5043,7 @@ namespace ProxyPicker.UI
             if (MinRect.Contains(x, y)) return Btn.Min;
             if (RefreshRect.Contains(x, y)) return Btn.Refresh;
             if (HelpRect.Contains(x, y)) return Btn.Help;
+            if (CompanionRect.Contains(x, y)) return Btn.Companion;
 
             if (NavSegRect(0).Contains(x, y)) return Btn.Nav0;
             if (NavSegRect(1).Contains(x, y)) return Btn.Nav1;
@@ -5067,6 +5106,7 @@ namespace ProxyPicker.UI
             if (b == Btn.Min) { MinimizeToTray(); return; }
             if (b == Btn.Refresh) { if (_page == 1 || _page == 2) _ = LoadNodesCatalogAsync(); else RefreshAsync(); return; }
             if (b == Btn.Help) { OpenHelp(); return; }
+            if (b == Btn.Companion) { OpenCompanionDialogPublic(); return; }
             if (b == Btn.Nav0) { SwitchPage(0); return; }
             if (b == Btn.Nav1) { SwitchPage(1); return; }
             if (b == Btn.Nav2) { SwitchPage(2); return; }
@@ -6176,6 +6216,301 @@ namespace ProxyPicker.UI
             catch { }
         }
 
+        // ---------------------------------------------------------------- 双向软件联动启停（v2.6.0）
+
+        /// <summary>由 TrayContext 启动时注入本次联动会话（快捷方式 --follow / 静默守望 --follow-exe）。</summary>
+        public void ConfigureCompanionSession(string followSessionExe, bool launchedViaCompanion)
+        {
+            _companionSessionFollowExe = AppCompanion.ExtractExeName(followSessionExe);
+            _launchedViaCompanion = launchedViaCompanion;
+            RefreshFollowTrackerFromConfig();
+        }
+
+        void RefreshFollowTrackerFromConfig()
+        {
+            var cfg = Settings.GetCompanionConfig();
+            string targetExe = "";
+            bool autoExit = false;
+            if (!string.IsNullOrEmpty(_companionSessionFollowExe))
+            {
+                targetExe = _companionSessionFollowExe;
+                autoExit = cfg.FollowAutoExit;
+            }
+            else if (cfg.HasValidFollowTarget && cfg.FollowAutoExit)
+            {
+                targetExe = cfg.FollowAppExe;
+                autoExit = true;
+            }
+
+            if (autoExit && !string.IsNullOrEmpty(targetExe))
+            {
+                if (_followTracker == null || !string.Equals(_followTracker.TargetExe, targetExe, StringComparison.OrdinalIgnoreCase))
+                    _followTracker = new AppCompanion.FollowExitTracker(targetExe, 2);
+                if (!_shuttingDown && !_companionTimer.Enabled) _companionTimer.Start();
+            }
+            else
+            {
+                _followTracker = null;
+                if (_companionTimer.Enabled) _companionTimer.Stop();
+            }
+        }
+
+        /// <summary>主程序就绪后执行一次联动启动序列：同步守望器、按序拉起代理客户端→快检生效分流→拉起业务软件。</summary>
+        public void StartCompanionBootSequence()
+        {
+            if (_companionBootStarted || !UiAlive || _shuttingDown) return;
+            _companionBootStarted = true;
+            try
+            {
+                var cfg = Settings.GetCompanionConfig();
+                AppCompanion.ApplyWatcherState(cfg);
+                RefreshFollowTrackerFromConfig();
+                if (_launchedViaCompanion || cfg.HasAnyLaunchApps)
+                    _ = RunCompanionBootAsync(cfg);
+            }
+            catch { }
+        }
+
+        async Task RunCompanionBootAsync(AppCompanion.CompanionConfig cfg)
+        {
+            try
+            {
+                if (!UiAlive || _shuttingDown) return;
+                bool shouldLaunchApps = cfg != null && cfg.HasAnyLaunchApps &&
+                                        (!_launchedViaCompanion || cfg.LaunchAppsOnFollow);
+                var ordered = shouldLaunchApps
+                    ? AppCompanion.OrderLaunchTargets(cfg.LaunchAppPaths, _companionSessionFollowExe)
+                    : new List<string>();
+                var proxyClients = ordered.Where(p => AppCompanion.IsProxyClientExe(p)).ToList();
+                var otherApps = ordered.Where(p => !AppCompanion.IsProxyClientExe(p)).ToList();
+
+                AppCompanion.LaunchBatchOutcome clientOut = null;
+                if (proxyClients.Count > 0)
+                {
+                    clientOut = await Task.Run(() => AppCompanion.LaunchApps(proxyClients));
+                    if (!UiAlive || _shuttingDown) return;
+                }
+
+                // 若拉起了代理客户端，或通过联动随软件启动：快速等待内核就绪（最多 12 秒），
+                // 避免干等 30 秒常规看守周期，尽早把已保存的白名单与固定 IP 规则推生效。
+                bool needFastKernelSync = _launchedViaCompanion ||
+                                          (clientOut != null && clientOut.Started.Count > 0) ||
+                                          otherApps.Count > 0;
+                if (needFastKernelSync && Profile.HasSavedIntent && !Settings.RepairSuspended)
+                {
+                    bool kernelReady = false;
+                    for (int i = 0; i < 20 && UiAlive && !_shuttingDown; i++)
+                    {
+                        bool ok = await Task.Run(() =>
+                        {
+                            try
+                            {
+                                string c = Discovery.Detect(i > 0).ConfigPath;
+                                if (string.IsNullOrEmpty(c)) return false;
+                                var r = Mihomo.FetchJson("/configs", 2000, c);
+                                return r.Ok && r.Data != null;
+                            }
+                            catch { return false; }
+                        });
+                        if (ok) { kernelReady = true; break; }
+                        await Task.Delay(600);
+                    }
+                    if (kernelReady && UiAlive && !_shuttingDown && !_busy)
+                    {
+                        WatchAsync();
+                        // 给规则补回留一小段落地时间，再启动浏览器等业务软件以防抢跑直连
+                        for (int w = 0; w < 12 && (_watching || _busy) && UiAlive && !_shuttingDown; w++)
+                            await Task.Delay(300);
+                        if (StaticProxy.IsEnabledAndValid && !_staticChecking && UiAlive && !_shuttingDown)
+                            _ = CheckStaticProxyHealthAsync(false);
+                    }
+                }
+
+                AppCompanion.LaunchBatchOutcome otherOut = null;
+                if (otherApps.Count > 0 && UiAlive && !_shuttingDown)
+                    otherOut = await Task.Run(() => AppCompanion.LaunchApps(otherApps));
+
+                var allStarted = new List<string>();
+                if (clientOut != null) allStarted.AddRange(clientOut.Started);
+                if (otherOut != null) allStarted.AddRange(otherOut.Started);
+                if (allStarted.Count > 0)
+                {
+                    string joined = string.Join("、", allStarted.Take(3));
+                    if (allStarted.Count > 3) joined += " 等 " + allStarted.Count + " 个";
+                    AuditLog.Record("COMPANION", "联动自动拉起软件：" + string.Join(", ", allStarted));
+                    SetStatus("联动已同步开启：" + joined, Theme.Ok);
+                    if (Visible)
+                        Toast("已自动同步开启软件", joined, Theme.Ok, 2);
+                    else if (TrayBalloon != null)
+                        TrayBalloon("ProxyPicker 联动已就绪", "已同步开启：" + joined);
+                }
+                else if (_launchedViaCompanion && !string.IsNullOrEmpty(_companionSessionFollowExe))
+                {
+                    string hostDisp = Catalog.DisplayName(_companionSessionFollowExe);
+                    AuditLog.Record("COMPANION", "已随软件联动后台启动：" + _companionSessionFollowExe);
+                    if (TrayBalloon != null)
+                        TrayBalloon("ProxyPicker 已随 " + hostDisp + " 联动启动", "分流名单与固定 IP 规则已在后台自动守护");
+                }
+            }
+            catch { }
+        }
+
+        void CompanionTimerTick()
+        {
+            if (!UiAlive || _shuttingDown || _followTracker == null) return;
+            try
+            {
+                bool running = AppCompanion.IsProcessRunning(_followTracker.TargetExe);
+                if (_followTracker.Observe(running))
+                {
+                    string closedExe = _followTracker.TargetExe;
+                    _companionTimer.Stop();
+                    AuditLog.Record("COMPANION", "检测到跟随目标软件已关闭（" + closedExe + "），触发同生共死自动还原退出");
+                    var handler = CompanionAutoExitRequested;
+                    if (handler != null) handler();
+                    else RealExit();
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>托盘菜单与标题栏「联动」按钮共用的双向联动设置弹窗入口。</summary>
+        public async void OpenCompanionDialogPublic()
+        {
+            if (!UiAlive || _shuttingDown || _companionDialogBusy) return;
+            if (InvokeRequired) { try { BeginInvoke(new Action(OpenCompanionDialogPublic)); } catch { } return; }
+            _companionDialogBusy = true;
+            try
+            {
+                var current = Settings.GetCompanionConfig();
+                var proxiedExes = _all.Where(r => r.Proxy).Select(r => r.Exe).ToList();
+                var extras = new List<string>(current.LaunchAppPaths);
+                if (!string.IsNullOrWhiteSpace(current.FollowAppPath)) extras.Add(current.FollowAppPath);
+
+                SetStatus("正在扫描电脑上的可联动软件…", Theme.Dim);
+                var candidates = await Task.Run(() => AppCompanion.DiscoverLaunchableApps(proxiedExes, extras));
+                if (!UiAlive || _shuttingDown) return;
+
+                using (var dlg = new CompanionDialog(current, candidates))
+                {
+                    IWin32Window owner = Visible ? (IWin32Window)this : null;
+                    if (dlg.ShowDialog(owner) != DialogResult.OK || dlg.ResultConfig == null) return;
+
+                    var next = dlg.ResultConfig;
+                    if (!Settings.SaveCompanionConfig(next))
+                    {
+                        Toast("保存软件联动设置失败", Settings.LastSaveError, Theme.Danger, 3);
+                        return;
+                    }
+                    AppCompanion.ApplyWatcherState(next);
+                    RefreshFollowTrackerFromConfig();
+                    Invalidate(new Rectangle(0, 0, Width, Theme.Px(TitleH + 4)));
+
+                    var descParts = new List<string>();
+                    if (next.HasValidFollowTarget)
+                    {
+                        string fn = string.IsNullOrWhiteSpace(next.FollowAppName) ? next.FollowAppExe : next.FollowAppName;
+                        descParts.Add("跟随 " + fn + (next.FollowAutoExit ? "(同退)" : ""));
+                    }
+                    if (next.HasAnyLaunchApps)
+                        descParts.Add("自启 " + next.LaunchAppPaths.Count + " 个软件");
+                    string summary = descParts.Count > 0 ? string.Join(" · ", descParts) : "已全部关闭";
+                    AuditLog.Record("COMPANION", "更新双向软件联动设置：" + summary);
+                    SetStatus("软件联动设置已生效：" + summary, Theme.Ok);
+                    Toast("软件联动设置已生效", summary, Theme.Ok, 2);
+
+                    if (dlg.LaunchNowRequested)
+                        _ = LaunchCompanionAppsAsync(next.LaunchAppPaths);
+                }
+            }
+            catch (Exception ex) { ReportFailure("打开软件联动设置", ex); }
+            finally { _companionDialogBusy = false; }
+        }
+
+        /// <summary>托盘菜单「立即拉起配套软件」入口。</summary>
+        public void LaunchCompanionAppsPublic()
+        {
+            if (!UiAlive || _shuttingDown) return;
+            if (InvokeRequired) { try { BeginInvoke(new Action(LaunchCompanionAppsPublic)); } catch { } return; }
+            var cfg = Settings.GetCompanionConfig();
+            var list = AppCompanion.OrderLaunchTargets(cfg.LaunchAppPaths);
+            if (list.Count == 0)
+            {
+                OpenCompanionDialogPublic();
+                return;
+            }
+            _ = LaunchCompanionAppsAsync(list);
+        }
+
+        async Task LaunchCompanionAppsAsync(IEnumerable<string> rawPaths)
+        {
+            try
+            {
+                var ordered = AppCompanion.OrderLaunchTargets(rawPaths);
+                if (ordered.Count == 0) return;
+                SetStatus("正在同步拉起配套软件…", Theme.Dim);
+                var proxyClients = ordered.Where(p => AppCompanion.IsProxyClientExe(p)).ToList();
+                var others = ordered.Where(p => !AppCompanion.IsProxyClientExe(p)).ToList();
+
+                var started = new List<string>();
+                var already = new List<string>();
+                var failed = new List<string>();
+
+                if (proxyClients.Count > 0)
+                {
+                    var r1 = await Task.Run(() => AppCompanion.LaunchApps(proxyClients));
+                    started.AddRange(r1.Started);
+                    already.AddRange(r1.AlreadyRunning);
+                    failed.AddRange(r1.Failed);
+                    if (r1.Started.Count > 0 && Profile.HasSavedIntent && !Settings.RepairSuspended)
+                    {
+                        // 刚拉起代理客户端时稍等内核就绪再启动业务软件
+                        for (int i = 0; i < 16 && UiAlive && !_shuttingDown; i++)
+                        {
+                            bool ok = await Task.Run(() =>
+                            {
+                                try
+                                {
+                                    string c = Discovery.Detect(i > 0).ConfigPath;
+                                    var res = !string.IsNullOrEmpty(c) ? Mihomo.FetchJson("/configs", 2000, c) : null;
+                                    return res != null && res.Ok && res.Data != null;
+                                }
+                                catch { return false; }
+                            });
+                            if (ok) { WatchAsync(); break; }
+                            await Task.Delay(500);
+                        }
+                    }
+                }
+                if (others.Count > 0 && UiAlive && !_shuttingDown)
+                {
+                    var r2 = await Task.Run(() => AppCompanion.LaunchApps(others));
+                    started.AddRange(r2.Started);
+                    already.AddRange(r2.AlreadyRunning);
+                    failed.AddRange(r2.Failed);
+                }
+                if (!UiAlive) return;
+                if (started.Count > 0)
+                {
+                    string s = string.Join("、", started);
+                    SetStatus("已同步开启：" + s, Theme.Ok);
+                    Toast("已同步开启软件", s + (already.Count > 0 ? ("（另有 " + already.Count + " 个已在运行）") : ""), Theme.Ok, 2);
+                }
+                else if (failed.Count > 0)
+                {
+                    string f = string.Join("；", failed);
+                    SetStatus("部分软件拉起失败：" + f, Theme.Warn);
+                    Toast("软件拉起失败", f, Theme.Warn, 3);
+                }
+                else
+                {
+                    SetStatus("勾选的配套软件均已在运行中", Theme.Dim);
+                    Toast("配套软件已在运行", "无需重复打开", Theme.Accent, 2);
+                }
+            }
+            catch (Exception ex) { ReportFailure("拉起配套软件", ex); }
+        }
+
         public string DiagnosticsText() { return DiagnosticsText(_traffic); }
 
         /// <summary>面板与托盘共用的完整诊断文本：环境 + 出口核对 + 最近动作，统一脱敏。</summary>
@@ -6276,6 +6611,7 @@ namespace ProxyPicker.UI
                 _clock.Stop(); _clock.Dispose();
                 _trafficTimer.Stop(); _trafficTimer.Dispose();
                 _watchTimer.Stop(); _watchTimer.Dispose();
+                _companionTimer.Stop(); _companionTimer.Dispose();
                 DisposeFonts();
                 try { if (_timerRaised) { timeEndPeriod(1); _timerRaised = false; } } catch { }
                 if (_windowIcon != null) _windowIcon.Dispose();

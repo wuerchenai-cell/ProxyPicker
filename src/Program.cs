@@ -59,12 +59,29 @@ namespace ProxyPicker
             }
         }
 
+        /// <summary>判断参数是否为合法的联动启停引导开关（不带输出文件，直接进入运行/守望模式）。</summary>
+        internal static bool IsCompanionBootFlag(string flag)
+        {
+            if (string.IsNullOrEmpty(flag)) return false;
+            return flag.Equals("--tray", StringComparison.OrdinalIgnoreCase) ||
+                   flag.Equals("--watch-companion", StringComparison.OrdinalIgnoreCase) ||
+                   flag.Equals("--follow", StringComparison.OrdinalIgnoreCase) ||
+                   flag.Equals("--follow-exe", StringComparison.OrdinalIgnoreCase);
+        }
+
         static void Run(string[] args)
         {
             // 开关统一小写：以前 --Apply 能通过合法性检查，却因为后面按大小写比较
             // 直接落到 GUI，脚本拿到 exit 0 以为执行了（复审 F-20）。
             if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal))
                 args[0] = args[0].ToLowerInvariant();
+
+            // 轻量静默守望模式（--watch-companion）：不建窗口、不占托盘，监听目标软件启动并联动拉起主程序
+            if (args.Length >= 1 && args[0] == "--watch-companion")
+            {
+                Core.AppCompanion.RunWatchCompanionLoop();
+                return;
+            }
 
             // --apply 少了 --yes：以前被下面「参数不足」的通用校验先拦下，
             // 脚本只拿到一段用法文字、拿不到结果文件。现在先给它一个明确的 ok=False。
@@ -89,7 +106,7 @@ namespace ProxyPicker
 
             // 所有命令行开关都必须带输出文件：只敲 --selftest 时不能悄悄打开图形界面，
             // 否则脚本会误以为「自检跑了且通过」（评审 R1-9）。
-            if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal) && args[0] != "--tray")
+            if (args.Length > 0 && args[0].StartsWith("--", StringComparison.Ordinal) && !IsCompanionBootFlag(args[0]))
             {
                 int need = MinArgs(args[0]);
                 bool known = KnownFlags.IndexOf("|" + args[0] + "|", StringComparison.OrdinalIgnoreCase) >= 0;
@@ -372,7 +389,7 @@ namespace ProxyPicker
                     string result = Core.Discovery.SelfTest() + Core.Mihomo.SecuritySelfTest()
                                   + Core.Traffic.SelfTest() + Core.NodeManager.SelfTest()
                                   + Core.NodeQuality.SelfTest() + Core.ProbeSidecar.SelfTest()
-                                  + Core.StaticProxy.SelfTest();
+                                  + Core.StaticProxy.SelfTest() + Core.AppCompanion.SelfTest();
                     System.IO.File.WriteAllText(args[1], result, new System.Text.UTF8Encoding(false));
                     if (result.Contains("FAIL  ")) Environment.ExitCode = 1;
                 }
@@ -614,26 +631,61 @@ namespace ProxyPicker
                 return;
             }
 
+            // 快捷方式双启模式：ProxyPicker.exe --follow "<目标exe路径>"
+            // 先拉起目标软件（若尚未运行），再让 ProxyPicker 后台静默进入跟随守护态。
+            string followSessionExe = "";
+            bool launchedViaCompanion = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i].Equals("--follow", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    string targetPath = (args[i + 1] ?? "").Trim().Trim('"');
+                    string targetErr;
+                    if (Core.AppCompanion.ValidateTargetExeOrPath(targetPath, true, out targetErr))
+                    {
+                        bool _; string _e;
+                        Core.AppCompanion.TryLaunchApp(targetPath, out _, out _e);
+                        followSessionExe = Core.AppCompanion.ExtractExeName(targetPath);
+                        launchedViaCompanion = true;
+                    }
+                    i++;
+                }
+                else if (args[i].Equals("--follow-exe", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+                {
+                    string targetExe = (args[i + 1] ?? "").Trim().Trim('"');
+                    string targetErr;
+                    if (Core.AppCompanion.ValidateTargetExeOrPath(targetExe, false, out targetErr))
+                    {
+                        followSessionExe = Core.AppCompanion.ExtractExeName(targetExe);
+                        launchedViaCompanion = true;
+                    }
+                    i++;
+                }
+            }
+
             bool created;
             using (var mutex = new Mutex(true, MutexName, out created))
             {
                 if (!created)
                 {
-                    // 已有实例：让它把面板弹出来，然后自己退出
-                    try
+                    // 若通过 --follow 快捷方式启动且主实例已在跑，目标软件已拉起，不必弹窗打扰
+                    if (!launchedViaCompanion)
                     {
-                        using (var ev = EventWaitHandle.OpenExisting(EventName))
-                            ev.Set();
+                        try
+                        {
+                            using (var ev = EventWaitHandle.OpenExisting(EventName))
+                                ev.Set();
+                        }
+                        catch { }
                     }
-                    catch { }
                     return;
                 }
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
-                bool background = Array.IndexOf(args, "--tray") >= 0;
-                var ctx = new TrayContext(!background);
+                bool background = launchedViaCompanion || Array.IndexOf(args, "--tray") >= 0;
+                var ctx = new TrayContext(!background, followSessionExe, launchedViaCompanion);
 
                 // 第二个实例被启动时，把面板叫到前台
                 var listener = new Thread(() =>

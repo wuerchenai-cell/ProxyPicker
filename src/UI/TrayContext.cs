@@ -85,9 +85,10 @@ namespace ProxyPicker.UI
             catch { return false; }
         }
 
-        public TrayContext(bool showOnStart)
+        public TrayContext(bool showOnStart, string followSessionExe = "", bool launchedViaCompanion = false)
         {
             _form = new MainForm();
+            _form.ConfigureCompanionSession(followSessionExe, launchedViaCompanion);
 
             var menu = _menu = new ContextMenuStrip();
             menu.Items.Add("打开面板", null, (s, e) => ShowPanel());
@@ -106,6 +107,8 @@ namespace ProxyPicker.UI
                 }
             };
             menu.Items.Add(_autoStartItem);
+            menu.Items.Add("软件联动同步启停…", null, (s, e) => _form.OpenCompanionDialogPublic());
+            menu.Items.Add("立即拉起配套软件", null, (s, e) => _form.LaunchCompanionAppsPublic());
 
             menu.Items.Add("重新读取状态", null, (s, e) =>
             {
@@ -170,7 +173,7 @@ namespace ProxyPicker.UI
                 menu.Items.Add("检查更新（当前 v" + Updater.CurrentText + "）", null,
                     (s, e) => _form.CheckUpdatePublic());
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("退出 ProxyPicker（还原配置）", null, (s, e) => ExitApp());
+            menu.Items.Add("退出 ProxyPicker（还原配置）", null, (s, e) => ExitApp(false));
 
             _trayIcon = Draw.AppIco(SystemInformation.SmallIconSize.Width);
             _icon = new NotifyIcon
@@ -209,9 +212,10 @@ namespace ProxyPicker.UI
             };
             _icon.BalloonTipClicked += (s, e) => { try { _form.ShowPanel(); } catch { } };
 
-            // 点窗口「×」也走退出（并还原内核），不再静默藏进托盘：
-            // 用户关掉窗口却还有进程在后台，正是「我明明关了它怎么还在跑」的来源。
-            _form.CloseRequested += ExitApp;
+            // 点窗口「×」走人工退出（并还原内核），不再静默藏进托盘；
+            // 跟随目标软件关闭时走同生共死静默自动还原退出。
+            _form.CloseRequested += () => ExitApp(false);
+            _form.CompanionAutoExitRequested += () => ExitApp(true);
 
             if (showOnStart) ShowPanel();
             else
@@ -220,11 +224,22 @@ namespace ProxyPicker.UI
                 try { if (!_form.IsHandleCreated) { var unused = _form.Handle; } }
                 catch { }
             }
-            // 放在托盘图标和气泡委托都就绪之后：后台启动也会自检，且提示能真的弹出来。
+            // 放在托盘图标和气泡委托都就绪之后：后台启动也会自检与执行联动启动流程。
             // 必须排进消息队列再跑 —— 此刻 Application.Run 还没启动，
             // 直接调 async 方法会捕获不到 UI 同步上下文，网络回调落回线程池线程。
-            try { _form.BeginInvoke(new Action(() => _form.StartAutoUpdateCheck())); }
-            catch { _form.StartAutoUpdateCheck(); }
+            try
+            {
+                _form.BeginInvoke(new Action(() =>
+                {
+                    _form.StartAutoUpdateCheck();
+                    _form.StartCompanionBootSequence();
+                }));
+            }
+            catch
+            {
+                _form.StartAutoUpdateCheck();
+                _form.StartCompanionBootSequence();
+            }
         }
 
         /// <summary>explorer 重启后重新注册托盘图标。</summary>
@@ -310,11 +325,17 @@ namespace ProxyPicker.UI
         /// <summary>
         /// 退出 = 把系统还回去：删掉内核里的本工具规则块、把 IPv6 恢复成接管前的值，
         /// 然后再结束进程。用户要求「不用的时候电脑跟没装一样」，这是那条要求的落点。
+        /// silentFollowExit=true 时为跟随目标软件关闭触发的同生共死自动退出，不弹阻塞确认窗。
         /// </summary>
-        void ExitApp()
+        void ExitApp(bool silentFollowExit = false)
         {
             if (_exiting) return;      // DoEvents 期间重复点退出不能起第二个还原任务
             _exiting = true;
+            if (!silentFollowExit)
+            {
+                // 用户手动退出时通知守望器：本轮宿主关闭前不再强行拉起主程序
+                AppCompanion.NotifyManualExitToWatcher();
+            }
             // 退出还原期间禁止再开保存或菜单任务：DoEvents 会继续分发点击，
             // 以前用户还能点「保存」，任务等锁 → 还原放锁 → 抢在 Exit 前又推一次配置。
             try { if (_menu != null) _menu.Enabled = false; } catch { }
@@ -345,15 +366,15 @@ namespace ProxyPicker.UI
                 }
                 else why = "还原超时（可能仍在保存，规则未必已撤销）";
                 Core.AuditLog.Record("EXIT",
-                    restored
-                        ? (string.IsNullOrEmpty(why) ? "退出：已还原内核配置（规则块已移除）" : "退出：" + why)
-                        : "退出：还原失败 · " + why);
+                    (silentFollowExit ? "联动同退：" : "退出：") +
+                    (restored
+                        ? (string.IsNullOrEmpty(why) ? "已还原内核配置（规则块已移除）" : why)
+                        : ("还原失败 · " + why)));
             }
             catch (Exception ex) { restored = false; why = ex.Message; }
 
-            // 仅当控制面真的可疑失败（例如内核仍在跑却返 401/500、安全拦截或跨进程锁超时）才弹窗告知，
-            // 并且传入合法 owner、按用户直觉「点是=立即退出 / 点否=暂不退出」处理，绝不把人卡死在弹窗里。
-            if (!restored)
+            // 仅当人工退出且控制面真的可疑失败才弹窗告知；同生共死自动退出绝不弹阻塞弹窗卡住关机/退软件。
+            if (!restored && !silentFollowExit)
             {
                 try
                 {
