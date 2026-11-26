@@ -16,9 +16,21 @@ namespace ProxyPicker.Core
     {
         static readonly object SecretGate = new object();
         static string[] _runtimeSecrets = new string[0];
+        static string[] _shortPasswordSecrets = new string[0];
 
         /// <summary>登记运行期需要脱敏的敏感字面量（如独立固定 IP 的服务器地址/用户名/密码），按长度降序优先遮盖。</summary>
         public static void RegisterRuntimeSecrets(params string[] values)
+        {
+            RegisterRuntimeSecretsCore(values, null);
+        }
+
+        /// <summary>登记独立固定 IP 的主机、账号与口令：口令即使短于 4 字符也按字段边界精准打码（v2.6.1 P3-01 修复）。</summary>
+        public static void RegisterStaticCredentials(string host, string username, string password)
+        {
+            RegisterRuntimeSecretsCore(new[] { host, username, password }, new[] { password });
+        }
+
+        static void RegisterRuntimeSecretsCore(string[] values, string[] passwordValues)
         {
             var list = new System.Collections.Generic.List<string>();
             if (values != null)
@@ -35,12 +47,34 @@ namespace ProxyPicker.Core
                 }
             }
             list.Sort((a, b) => b.Length.CompareTo(a.Length));
-            lock (SecretGate) _runtimeSecrets = list.ToArray();
+
+            var shortPw = new System.Collections.Generic.List<string>();
+            if (passwordValues != null)
+            {
+                var seenPw = new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal);
+                foreach (var rawPw in passwordValues)
+                {
+                    string p = (rawPw ?? "").Trim();
+                    if (p.Length >= 1 && p.Length < 4 && seenPw.Add(p))
+                        shortPw.Add(p);
+                }
+            }
+            shortPw.Sort((a, b) => b.Length.CompareTo(a.Length));
+
+            lock (SecretGate)
+            {
+                _runtimeSecrets = list.ToArray();
+                _shortPasswordSecrets = shortPw.ToArray();
+            }
         }
 
         public static void ClearRuntimeSecrets()
         {
-            lock (SecretGate) _runtimeSecrets = new string[0];
+            lock (SecretGate)
+            {
+                _runtimeSecrets = new string[0];
+                _shortPasswordSecrets = new string[0];
+            }
         }
 
         internal static string[] SnapshotRuntimeSecrets()
@@ -50,7 +84,11 @@ namespace ProxyPicker.Core
 
         internal static void RestoreRuntimeSecrets(string[] snapshot)
         {
-            lock (SecretGate) _runtimeSecrets = snapshot != null ? (string[])snapshot.Clone() : new string[0];
+            lock (SecretGate)
+            {
+                _runtimeSecrets = snapshot != null ? (string[])snapshot.Clone() : new string[0];
+                _shortPasswordSecrets = new string[0];
+            }
         }
 
         public static string Apply(string text)
@@ -60,12 +98,30 @@ namespace ProxyPicker.Core
 
             // 先遮盖运行期登记的静态代理凭据（主机/账号/密码），确保任何日志与诊断出口均零泄漏
             string[] secrets;
-            lock (SecretGate) secrets = _runtimeSecrets;
+            string[] shortPws;
+            lock (SecretGate)
+            {
+                secrets = _runtimeSecrets;
+                shortPws = _shortPasswordSecrets;
+            }
             for (int i = 0; i < secrets.Length; i++)
             {
                 string sec = secrets[i];
                 if (!string.IsNullOrEmpty(sec) && s.IndexOf(sec, StringComparison.Ordinal) >= 0)
                     s = s.Replace(sec, "<凭据已隐藏>");
+            }
+            // 短于 4 字符的口令按字段上下文或 URL 凭据位精准打码，既防泄露也不破坏正文单词
+            for (int i = 0; i < shortPws.Length; i++)
+            {
+                string pw = shortPws[i];
+                if (string.IsNullOrEmpty(pw)) continue;
+                string esc = Regex.Escape(pw);
+                s = Regex.Replace(s,
+                    @"((?:""|')?(?:password|passwd|pass|pwd|密码)(?:""|')?\s*[:=：]\s*(?:""|')?)" + esc + @"(?=(?:""|')?(?:[\s,;)\]}]|$))",
+                    "$1<凭据已隐藏>", RegexOptions.IgnoreCase);
+                s = Regex.Replace(s,
+                    @"(\b(?:socks5h?|https?)://[^/\s:@]+:)" + esc + @"(@)",
+                    "$1<凭据已隐藏>$2", RegexOptions.IgnoreCase);
             }
 
             // 整词边界：短用户名（a / li / user）不能把堆栈里的类名搅成乱码（复审 P2）。

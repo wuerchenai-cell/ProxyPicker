@@ -1072,13 +1072,57 @@ namespace ProxyPicker.Core
             return Save();
         }
 
+        /// <summary>
+        /// 供独立守望进程检测到 settings.json 磁盘更新时安全重载联动字段（v2.6.1 P1-02 修复）：
+        /// 明确区分「读取/解析成功」「文件不存在」与「瞬时 IO 共享冲突/解析失败」。
+        /// 遇到瞬时读取失败时保留内存中上一份有效配置并返回 false，防止守望进程误判联动关闭而退出。
+        /// </summary>
+        public static bool TryReloadCompanionFromDisk(out bool fileMissing)
+        {
+            fileMissing = false;
+            string path;
+            try { path = FilePath; }
+            catch { return false; }
+
+            if (!File.Exists(path))
+            {
+                fileMissing = true;
+                return false;
+            }
+
+            try
+            {
+                if (new FileInfo(path).Length > 1024 * 1024)
+                    throw new FormatException("偏好文件超过 1 MiB，未加载");
+                string text;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                using (var sr = new StreamReader(fs, Encoding.UTF8))
+                    text = sr.ReadToEnd();
+                var root = Json.AsObject(Json.Parse(text));
+                var fresh = PopulateFromObject(root);
+                lock (Gate)
+                {
+                    _data = fresh;
+                }
+                return true;
+            }
+            catch (FileNotFoundException)
+            {
+                // 主程序 File.Replace 替换窗口内可能瞬时找不到文件，按瞬时冲突处理而非误删配置
+                return false;
+            }
+            catch (Exception ex)
+            {
+                CrashLog.Write(ex, "守望进程重载联动配置失败，继续沿用上一份有效配置");
+                return false;
+            }
+        }
+
         /// <summary>供独立守望进程检测到 settings.json 磁盘更新时重新加载联动字段。</summary>
         public static void ReloadCompanionFromDisk()
         {
-            lock (Gate)
-            {
-                _data = Load();
-            }
+            bool missing;
+            TryReloadCompanionFromDisk(out missing);
         }
     }
 }

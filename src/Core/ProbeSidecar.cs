@@ -250,7 +250,7 @@ namespace ProxyPicker.Core
                     if (Process != null && !Process.HasExited)
                     {
                         Process.Kill();
-                        Process.WaitForExit(1500);
+                        Process.WaitForExit(3000);
                     }
                 }
                 catch { }
@@ -258,28 +258,122 @@ namespace ProxyPicker.Core
                 JobHandle = IntPtr.Zero;
                 try { if (Process != null) Process.Dispose(); } catch { }
                 Process = null;
-                if (!string.IsNullOrEmpty(TempDir) && Directory.Exists(TempDir))
+                WipeAndDeleteTempDir(TempDir);
+            }
+        }
+
+        /// <summary>旁路探测临时根目录：优先放入当前用户 AppData 私有子目录，降低公共 TEMP 明文暴露面（v2.6.1 P2-02 修复）。</summary>
+        internal static string PrivateProbeTempRoot()
+        {
+            try
+            {
+                string root = Path.Combine(Paths.OwnDir, "probe_tmp");
+                Directory.CreateDirectory(root);
+                return root;
+            }
+            catch
+            {
+                return Path.GetTempPath();
+            }
+        }
+
+        /// <summary>先零字节覆写删除 probe.yaml 再递归删除临时目录，带退避重试防止子进程句柄未及时释放。</summary>
+        internal static bool WipeAndDeleteTempDir(string dir)
+        {
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return true;
+            string yamlFile = Path.Combine(dir, "probe.yaml");
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                try
                 {
-                    // 先清空覆写临时探针配置，避免静态代理账密在磁盘临时文件残留
-                    try
+                    if (File.Exists(yamlFile))
                     {
-                        string yamlFile = Path.Combine(TempDir, "probe.yaml");
-                        if (File.Exists(yamlFile))
-                        {
-                            long len = new FileInfo(yamlFile).Length;
-                            if (len > 0 && len < 2 * 1024 * 1024)
-                                File.WriteAllBytes(yamlFile, new byte[len]);
-                            File.Delete(yamlFile);
-                        }
+                        long len = new FileInfo(yamlFile).Length;
+                        if (len > 0 && len < 4 * 1024 * 1024)
+                            File.WriteAllBytes(yamlFile, new byte[len]);
+                        File.Delete(yamlFile);
                     }
-                    catch { }
-                    for (int i = 0; i < 3; i++)
+                    break;
+                }
+                catch { Thread.Sleep(100); }
+            }
+            for (int i = 0; i < 6; i++)
+            {
+                try
+                {
+                    if (!Directory.Exists(dir)) return true;
+                    Directory.Delete(dir, true);
+                    return true;
+                }
+                catch { Thread.Sleep(100); }
+            }
+            return !Directory.Exists(dir);
+        }
+
+        /// <summary>清扫硬杀/断电残留的过期 pp_probe_* 临时目录（先零字节覆写 probe.yaml 再删除，绝不动当前活跃会话）。</summary>
+        public static int SweepStaleProbeDirs(TimeSpan? maxAge = null, string extraRoot = null)
+        {
+            var age = maxAge ?? TimeSpan.FromMinutes(10);
+            var activeDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            lock (SessionLock)
+            {
+                foreach (var s in ActiveSessions)
+                {
+                    if (s != null && !string.IsNullOrEmpty(s.TempDir))
                     {
-                        try { Directory.Delete(TempDir, true); break; }
-                        catch { Thread.Sleep(80); }
+                        try { activeDirs.Add(Path.GetFullPath(s.TempDir).TrimEnd('\\')); }
+                        catch { activeDirs.Add(s.TempDir); }
                     }
                 }
             }
+
+            var roots = new List<string>();
+            if (!string.IsNullOrEmpty(extraRoot)) roots.Add(extraRoot);
+            else
+            {
+                roots.Add(PrivateProbeTempRoot());
+                string sysTmp = Path.GetTempPath();
+                bool dup = false;
+                foreach (var r in roots)
+                {
+                    if (string.Equals(r.TrimEnd('\\'), sysTmp.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                    {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) roots.Add(sysTmp);
+            }
+
+            int cleaned = 0;
+            DateTime cutoff = DateTime.UtcNow - age;
+            foreach (var root in roots)
+            {
+                if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                string[] dirs;
+                try { dirs = Directory.GetDirectories(root, "pp_probe_*"); }
+                catch { continue; }
+                foreach (var d in dirs)
+                {
+                    string norm = d;
+                    try { norm = Path.GetFullPath(d).TrimEnd('\\'); } catch { }
+                    if (activeDirs.Contains(norm)) continue;
+                    try
+                    {
+                        DateTime lw = Directory.GetLastWriteTimeUtc(d);
+                        string yf = Path.Combine(d, "probe.yaml");
+                        if (File.Exists(yf))
+                        {
+                            DateTime yw = File.GetLastWriteTimeUtc(yf);
+                            if (yw > lw) lw = yw;
+                        }
+                        if (lw > cutoff) continue;
+                    }
+                    catch { }
+                    if (WipeAndDeleteTempDir(d)) cleaned++;
+                }
+            }
+            return cleaned;
         }
 
         static void EnsureProcessExitCleanup()
@@ -826,7 +920,8 @@ namespace ProxyPicker.Core
         {
             earlyExit = false;
             error = "";
-            string tempDir = Path.Combine(Path.GetTempPath(), "pp_probe_" + Guid.NewGuid().ToString("N").Substring(0, 10));
+            try { SweepStaleProbeDirs(); } catch { }
+            string tempDir = Path.Combine(PrivateProbeTempRoot(), "pp_probe_" + Guid.NewGuid().ToString("N").Substring(0, 10));
             SidecarSession session = null;
             IntPtr hJob = IntPtr.Zero;
             try
@@ -854,7 +949,7 @@ namespace ProxyPicker.Core
                 if (proc == null)
                 {
                     error = "无法拉起隔离探测子进程";
-                    try { Directory.Delete(tempDir, true); } catch { }
+                    WipeAndDeleteTempDir(tempDir);
                     return null;
                 }
 
@@ -918,7 +1013,7 @@ namespace ProxyPicker.Core
                 else
                 {
                     if (hJob != IntPtr.Zero) { try { CloseHandle(hJob); } catch { } }
-                    if (Directory.Exists(tempDir)) { try { Directory.Delete(tempDir, true); } catch { } }
+                    WipeAndDeleteTempDir(tempDir);
                 }
                 return null;
             }
@@ -999,6 +1094,31 @@ namespace ProxyPicker.Core
             bool jobOk = jobTest != IntPtr.Zero;
             if (jobTest != IntPtr.Zero) CloseHandle(jobTest);
             check("PS5 CreateKillOnCloseJob 可正常建立并设置 KILL_ON_JOB_CLOSE（防孤儿侧车）", jobOk, "");
+
+            // PS6（v2.6.1 P2-02 回归）：过期残留 pp_probe_* 自动覆写清扫，且保留新鲜/活跃目录
+            string sweepRoot = Path.Combine(Path.GetTempPath(), "pp_sweep_test_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            bool ps6Ok = false;
+            try
+            {
+                string staleDir = Path.Combine(sweepRoot, "pp_probe_stale01");
+                string freshDir = Path.Combine(sweepRoot, "pp_probe_fresh02");
+                Directory.CreateDirectory(staleDir);
+                Directory.CreateDirectory(freshDir);
+                string staleYaml = Path.Combine(staleDir, "probe.yaml");
+                string freshYaml = Path.Combine(freshDir, "probe.yaml");
+                File.WriteAllText(staleYaml, "password: \"secret-stale\"");
+                File.WriteAllText(freshYaml, "password: \"secret-fresh\"");
+                DateTime oldTime = DateTime.UtcNow.AddMinutes(-30);
+                File.SetLastWriteTimeUtc(staleYaml, oldTime);
+                Directory.SetLastWriteTimeUtc(staleDir, oldTime);
+                int removed = SweepStaleProbeDirs(TimeSpan.FromMinutes(10), sweepRoot);
+                ps6Ok = removed == 1 && !Directory.Exists(staleDir) && Directory.Exists(freshDir);
+            }
+            finally
+            {
+                try { if (Directory.Exists(sweepRoot)) Directory.Delete(sweepRoot, true); } catch { }
+            }
+            check("PS6 SweepStaleProbeDirs 自动覆写清理过期 pp_probe_* 残留且不误删新鲜目录", ps6Ok, "");
 
             return "\n[零干扰侧车探测 ProbeSidecar 自检] " + pass + " PASS / " + fail + " FAIL\n" + sb;
         }

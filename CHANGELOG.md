@@ -4,6 +4,23 @@
 程序里的「检查更新」读的是 GitHub Releases API 的 `tag_name`，不是本文件里的条目；
 本文件只是给人看的变更记录。
 
+## v2.6.1（2026-11-26）
+
+针对第三方独立全仓深度审查（T51）检出的 **12 项实锤缺陷（1 P0 + 5 P1 + 4 P2 + 2 P3）** 全部完成根治收口，离线自检扩至 **362 项（0 失败）**：
+
+- **[P0-01] 固定 IP 跳板优选防旧快照覆盖（`Core/StaticProxy.cs`、`UI/MainForm.cs`）**：新增 `TryMergeAutoHopConfig` / `TryMergeAndSaveAutoHopResult`，旁路测速完成后重读最新持久化配置再合并回写；测速期间用户若停用固定 IP、修改主机/端口/凭据/UDP 或切走跳板模式，一律安全丢弃旧测速结果，绝不覆盖最新设置（新增 `SP46`）。
+- **[P1-01] 联动按序拉起强门禁防抢跑直连（`Core/AppCompanion.cs`、`UI/MainForm.cs`）**：新增 `ShouldLaunchBusinessAppsAfterSync`；等待内核就绪后若启动期 `_busy` 正在运行则耐心排队等待而非跳过 `WatchAsync()`，并实地经 `Guard.Audit` + `Guard.Judge` 核验规则已一致后才放行浏览器等业务软件，超时则安全暂缓并提示（新增 `AC9`）。
+- **[P1-02] 静默守望读设置失败不自杀退出（`Core/Settings.cs`、`Core/AppCompanion.cs`）**：新增 `TryReloadCompanionFromDisk`，精确区分「文件明确关闭」与「`File.Replace` 窗口/瞬时 IO 冲突/解析失败」，读失败时保留上一份有效配置且不推进时间戳，下轮自动重试（新增 `AC10`）。
+- **[P1-03] 同生共死进程探测全面精准化（`Core/Scanner.cs`、`Core/AppCompanion.cs`、`UI/MainForm.cs`）**：新增三态探测 `ProcessProbeState` 与完整路径精确比对（`QueryFullProcessImageNameW`，同名不同路径不算活）、Chrome/Edge 等多进程浏览器可见顶层窗口判定（防后台 helper 驻留漏退）、代理客户端防抖提至 6 轮≈15 秒（抵御热更新重启），以及枚举/权限 `Unknown` 保持计数不误退（新增 `AC11`）。
+- **[P1-04] 守望器拉起失败自动退避重试（`Core/AppCompanion.cs`）**：将 `CompanionWatchStateMachine` 拆分为 `ShouldLaunch` / `CommitLaunchSucceeded` / `RecordLaunchFailed`，仅在 `Process.Start` 成功后占锁；失败时脱敏记日志并进入 20 秒退避重试，同时保留手动退出后的同周期严格抑制（新增 `AC12`）。
+- **[P1-05] 主实例已在线时 `--follow` 快捷方式自动跨进程交接（`Program.cs`、`Core/AppCompanion.cs`、`UI/TrayContext.cs`、`UI/MainForm.cs`）**：第二实例不再静默丢弃同生共死目标，通过 `CompanionHandoff` 事件+原子文件交接给主实例立即接入守护；若已在跟随其他软件则气泡明确告知不静默覆盖（新增 `AC13`）。
+- **[P2-01] 注册表自启路径精确第 0 参数相等并清搬家孤儿（`Core/AppCompanion.cs`、`UI/TrayContext.cs`）**：以 `ExtractCommandExePath` + `CommandPointsToExe` 替代 `StartsWith`（杜绝 `.bak` 前缀假阳性）；取消开机守望时自动清理曾搬家的旧 `--watch-companion` 注册表值（新增 `AC14`）。
+- **[P2-02] 旁路探针私有目录化与过期残留自动覆写清扫（`Core/ProbeSidecar.cs`、`UI/MainForm.cs`）**：临时探针目录迁至当前用户私有目录 `LocalAppData\ProxyPicker\probe_tmp\`，`Dispose` 延长等待与 6 轮零字节覆写删除，启动与每次探测前自动清扫超过 10 分钟的异常残留 `pp_probe_*`（新增 `PS6`）。
+- **[P2-03] 节点页批量测速防异常卡死标志位（`UI/MainForm.cs`）**：将 `_batchDelayRunning = true`、UI 状态更新与 `Paths.ClashYaml` 读取全部收入 `try/catch/finally`，任意位置异常均可完整复位按钮。
+- **[P2-04] 干净还原前先剥离残留 `# PP-STATIC-BEGIN..END` 块（`Core/Profile.cs`）**：抽出 `BuildCleanRollbackFromText`，调用 `Discovery.BuildPayload` 前先 `StaticProxy.StripStaticMarkedBlocks`，彻底消除源配置含静态标记时还原残留 `PP-STATIC-OUT` 凭据节点的可能（新增 `SP47`）。
+- **[P3-01] 短于 4 字符固定 IP 口令按字段/URL 上下文精准脱敏（`Core/Redactor.cs`、`Core/StaticProxy.cs`）**：新增 `RegisterStaticCredentials`，对 1–3 字符口令按 `password=`/`密码:`/`socks5://u:p@` 上下文精准打码且不破坏正文词句（新增 `SP48`）。
+- **[P3-02] `Unknown` 监听者防盲发 Bearer（`Core/Mihomo.cs`）**：系统 TCP 表不可用返回 `Unknown` 时，必须先通过无密钥首探确认符合 mihomo JSON 特征（`LooksLikeMihomoVersion` 或无 Basic 质询的 `{"message":"Unauthorized"}`），否则拒绝发送 `Authorization: Bearer`。
+
 ## v2.6.0（2026-11-25）
 
 ### 双向软件联动同步启停（跟随指定软件同生共死 + 打开一键拉起配套软件）

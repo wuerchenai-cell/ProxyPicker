@@ -633,7 +633,7 @@ namespace ProxyPicker
 
             // 快捷方式双启模式：ProxyPicker.exe --follow "<目标exe路径>"
             // 先拉起目标软件（若尚未运行），再让 ProxyPicker 后台静默进入跟随守护态。
-            string followSessionExe = "";
+            string followSessionTarget = "";
             bool launchedViaCompanion = false;
             for (int i = 0; i < args.Length; i++)
             {
@@ -645,7 +645,7 @@ namespace ProxyPicker
                     {
                         bool _; string _e;
                         Core.AppCompanion.TryLaunchApp(targetPath, out _, out _e);
-                        followSessionExe = Core.AppCompanion.ExtractExeName(targetPath);
+                        followSessionTarget = targetPath;
                         launchedViaCompanion = true;
                     }
                     i++;
@@ -656,7 +656,7 @@ namespace ProxyPicker
                     string targetErr;
                     if (Core.AppCompanion.ValidateTargetExeOrPath(targetExe, false, out targetErr))
                     {
-                        followSessionExe = Core.AppCompanion.ExtractExeName(targetExe);
+                        followSessionTarget = targetExe;
                         launchedViaCompanion = true;
                     }
                     i++;
@@ -666,10 +666,10 @@ namespace ProxyPicker
             bool created;
             using (var mutex = new Mutex(true, MutexName, out created))
             {
-                if (!created)
+                var action = Core.AppCompanion.ClassifySecondInstanceAction(created, launchedViaCompanion, followSessionTarget);
+                if (action != Core.AppCompanion.SecondInstanceAction.ProceedAsMain)
                 {
-                    // 若通过 --follow 快捷方式启动且主实例已在跑，目标软件已拉起，不必弹窗打扰
-                    if (!launchedViaCompanion)
+                    if (action == Core.AppCompanion.SecondInstanceAction.ActivateMainWindow)
                     {
                         try
                         {
@@ -678,6 +678,11 @@ namespace ProxyPicker
                         }
                         catch { }
                     }
+                    else if (action == Core.AppCompanion.SecondInstanceAction.HandoffFollowToMain)
+                    {
+                        // v2.6.1 P1-05 修复：主实例已在线时把本次 --follow 目标交给主实例接管同生共死
+                        Core.AppCompanion.PostFollowHandoffToMain(followSessionTarget);
+                    }
                     return;
                 }
 
@@ -685,21 +690,34 @@ namespace ProxyPicker
                 Application.SetCompatibleTextRenderingDefault(false);
 
                 bool background = launchedViaCompanion || Array.IndexOf(args, "--tray") >= 0;
-                var ctx = new TrayContext(!background, followSessionExe, launchedViaCompanion);
+                var ctx = new TrayContext(!background, followSessionTarget, launchedViaCompanion);
 
-                // 第二个实例被启动时，把面板叫到前台
+                // 监听第二实例事件：0 = 把面板叫到前台；1 = 接管 --follow 联动跟随会话
                 var listener = new Thread(() =>
                 {
                     try
                     {
-                        using (var ev = new EventWaitHandle(false, EventResetMode.AutoReset, EventName))
+                        using (var showEv = new EventWaitHandle(false, EventResetMode.AutoReset, EventName))
+                        using (var handoffEv = new EventWaitHandle(false, EventResetMode.AutoReset, Core.AppCompanion.CompanionHandoffEventName))
                         {
+                            var handles = new WaitHandle[] { showEv, handoffEv };
                             while (true)
                             {
-                                ev.WaitOne();
-                                if (ctx.MainFormHandleReady)
+                                int idx = WaitHandle.WaitAny(handles);
+                                if (idx == 0)
                                 {
-                                    try { ctx.InvokeShow(); } catch { }
+                                    if (ctx.MainFormHandleReady)
+                                    {
+                                        try { ctx.InvokeShow(); } catch { }
+                                    }
+                                }
+                                else if (idx == 1)
+                                {
+                                    string target = Core.AppCompanion.ConsumeFollowHandoff();
+                                    if (!string.IsNullOrEmpty(target) && ctx.MainFormHandleReady)
+                                    {
+                                        try { ctx.InvokeAttachFollowSession(target); } catch { }
+                                    }
                                 }
                             }
                         }

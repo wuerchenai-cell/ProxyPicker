@@ -183,6 +183,7 @@ namespace ProxyPicker.UI
         bool _staticWarnShown;
         RectangleF _staticDelayRect;
         string _companionSessionFollowExe = "";
+        string _companionSessionFollowPath = "";
         bool _launchedViaCompanion;
         AppCompanion.FollowExitTracker _followTracker;
         bool _companionBootStarted;
@@ -3450,17 +3451,20 @@ namespace ProxyPicker.UI
             var targets = _nodesPage.SnapshotConcreteNodes();
             if (targets.Count == 0) { Toast("没有可测速节点", "请先刷新或确认策略组有节点", Theme.Warn, 1); return; }
 
-            _batchDelayRunning = true;
-            _batchDelayCancel = false;
             int total = targets.Count;
             int done = 0;
             bool kernelUnreachable = false;
-            _nodesPage.SetBatchTesting(true, 0, total);
-            SetStatus("正在批量测速 " + total + " 个节点（按延迟排队，可随时点停测）…", Theme.Dim);
-            string cfg = Paths.ClashYaml;
-
+            bool started = false;
             try
             {
+                // v2.6.1 P2-03 修复：所有状态置位、UI 变更与 Paths.ClashYaml 均纳入 try/finally，绝不卡死在测速中
+                _batchDelayRunning = true;
+                _batchDelayCancel = false;
+                started = true;
+                _nodesPage.SetBatchTesting(true, 0, total);
+                SetStatus("正在批量测速 " + total + " 个节点（按延迟排队，可随时点停测）…", Theme.Dim);
+                string cfg = Paths.ClashYaml;
+
                 await Task.Run(() =>
                 {
                     bool unreach;
@@ -3489,9 +3493,9 @@ namespace ProxyPicker.UI
             finally
             {
                 _batchDelayRunning = false;
-                if (UiAlive)
+                if (started && UiAlive)
                 {
-                    _nodesPage.SetBatchTesting(false, done, total);
+                    try { _nodesPage.SetBatchTesting(false, done, total); } catch { }
                     if (kernelUnreachable)
                     {
                         SetStatus("批量测速中断：内核控制接口已断开（已测 " + done + "/" + total + "）", Theme.Warn);
@@ -6124,27 +6128,43 @@ namespace ProxyPicker.UI
                     if (matchCur != null && matchCur.DelayMs > 0) curBenchMs = matchCur.DelayMs;
                 }
 
-                bool wasAuto = string.Equals(cfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
+                // v2.6.1 P0-01 修复：测速完成后必须重读最新持久化配置，严禁用开测前旧快照覆盖用户中途修改
+                var latestCfg = StaticProxy.Current;
+                bool wasAuto = string.Equals(latestCfg.HopMode, StaticProxy.HopAuto, StringComparison.OrdinalIgnoreCase);
                 bool switchIt = !wasAuto || StaticProxy.ShouldSwitchAutoHop(
                     curHop, curBenchMs, bench.BestNode, bench.BestDelayMs,
                     emergencyRecovery || _staticTimedOut, manual);
 
-                var updated = cfg.Clone();
-                if (manual) updated.HopMode = StaticProxy.HopAuto;
-                updated.AutoBestUpdatedAtTicks = DateTime.UtcNow.Ticks;
-                updated.AutoBestHopPool = bench.TopCandidates
+                var hopPool = bench.TopCandidates
                     .Where(x => x != null && !string.IsNullOrEmpty(x.NodeName))
                     .Select(x => x.NodeName)
                     .ToList();
+                int keptMs = curBenchMs > 0 ? curBenchMs : bench.BestDelayMs;
+                string keptNode = string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop;
+
+                StaticProxy.StaticProxyConfig savedCfg;
+                string discardWhy, saveErr;
+                if (!StaticProxy.TryMergeAndSaveAutoHopResult(
+                        cfg, manual, switchIt,
+                        bench.BestNode, bench.BestDelayMs,
+                        keptNode, keptMs, hopPool,
+                        out savedCfg, out discardWhy, out saveErr))
+                {
+                    if (!string.IsNullOrEmpty(discardWhy))
+                    {
+                        AuditLog.Record("STATIC", "固定 IP 优选结果已跳过写回：" + discardWhy);
+                        if (manual) SetStatus("已保留最新固定 IP 设置（" + discardWhy + "）", Theme.Dim);
+                    }
+                    else if (manual && !string.IsNullOrEmpty(saveErr))
+                    {
+                        SetStatus("保存优选跳板失败：" + saveErr, Theme.Warn);
+                    }
+                    return;
+                }
 
                 string jitterTag = bench.BestJitterMs > 0 ? (" · 抖动 " + bench.BestJitterMs + "ms") : "";
                 if (switchIt)
                 {
-                    updated.AutoBestHopNode = bench.BestNode;
-                    updated.AutoBestDelayMs = bench.BestDelayMs;
-                    string saveErr;
-                    StaticProxy.Save(updated, out saveErr);
-
                     string swErr = "";
                     bool hotSwitched = wasAuto && await Task.Run(() => StaticProxy.SwitchHopNodeInKernel(bench.BestNode, cfgPath, out swErr));
                     if (!hotSwitched)
@@ -6172,19 +6192,10 @@ namespace ProxyPicker.UI
                 }
                 else
                 {
-                    if (string.IsNullOrEmpty(updated.AutoBestHopNode))
-                        updated.AutoBestHopNode = string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop;
-                    int keptMs = curBenchMs > 0 ? curBenchMs : bench.BestDelayMs;
-                    if (keptMs > 0)
-                    {
-                        updated.AutoBestDelayMs = keptMs;
-                        _staticDelayMs = keptMs;
-                    }
+                    if (keptMs > 0) _staticDelayMs = keptMs;
                     _staticSlowStreak = 0;
-                    string saveErr;
-                    StaticProxy.Save(updated, out saveErr);
                     if (!string.IsNullOrEmpty(curHop)) _staticLiveHop = curHop;
-                    string cleanCur = CleanEmoji(string.IsNullOrEmpty(curHop) ? bench.BestNode : curHop);
+                    string cleanCur = CleanEmoji(keptNode);
                     AuditLog.Record("STATIC", "固定 IP 定时稳速巡检完成：当前跳板「" + cleanCur + "」保持最优（" + keptMs + "ms，" + bench.ReachableCount + "/" + bench.TestedCount + " 可达）");
                     if (manual)
                     {
@@ -6216,36 +6227,77 @@ namespace ProxyPicker.UI
             catch { }
         }
 
-        // ---------------------------------------------------------------- 双向软件联动启停（v2.6.0）
+        // ---------------------------------------------------------------- 双向软件联动启停（v2.6.0 / v2.6.1 加固）
 
-        /// <summary>由 TrayContext 启动时注入本次联动会话（快捷方式 --follow / 静默守望 --follow-exe）。</summary>
-        public void ConfigureCompanionSession(string followSessionExe, bool launchedViaCompanion)
+        /// <summary>由 TrayContext 启动时注入本次联动会话（快捷方式 --follow / 静默守望 --follow-exe，支持完整路径）。</summary>
+        public void ConfigureCompanionSession(string followSessionTarget, bool launchedViaCompanion)
         {
-            _companionSessionFollowExe = AppCompanion.ExtractExeName(followSessionExe);
+            _companionSessionFollowPath = (followSessionTarget ?? "").Trim().Trim('"');
+            _companionSessionFollowExe = AppCompanion.ExtractExeName(_companionSessionFollowPath);
             _launchedViaCompanion = launchedViaCompanion;
             RefreshFollowTrackerFromConfig();
+        }
+
+        /// <summary>主实例运行期间收到第二实例通过 --follow 交接来的同生共死目标（v2.6.1 P1-05 修复）。</summary>
+        public void AttachCompanionFollowSession(string targetPathOrExe)
+        {
+            if (!UiAlive || _shuttingDown) return;
+            string cleanTarget = (targetPathOrExe ?? "").Trim().Trim('"');
+            string newExe = AppCompanion.ExtractExeName(cleanTarget);
+            if (newExe.Length == 0) return;
+
+            if (_followTracker != null &&
+                !string.Equals(_followTracker.TargetExe, newExe, StringComparison.OrdinalIgnoreCase))
+            {
+                string curDisp = Catalog.DisplayName(_followTracker.TargetExe);
+                string newDisp = Catalog.DisplayName(newExe);
+                SetStatus("已在跟随 " + curDisp + "，本次未切换至 " + newDisp, Theme.Dim);
+                if (TrayBalloon != null)
+                    TrayBalloon("ProxyPicker 已在联动跟随", "当前正在跟随 " + curDisp + "，已保留原同生共死目标（未覆盖为 " + newDisp + "）");
+                return;
+            }
+
+            _companionSessionFollowPath = cleanTarget;
+            _companionSessionFollowExe = newExe;
+            _launchedViaCompanion = true;
+            RefreshFollowTrackerFromConfig();
+
+            string disp = Catalog.DisplayName(newExe);
+            AuditLog.Record("COMPANION", "主实例已接管快捷方式联动跟随：" + newExe);
+            if (TrayBalloon != null)
+                TrayBalloon("ProxyPicker 已接入联动跟随", "正在同步守护 " + disp + "；关闭它后将自动还原配置并退出");
         }
 
         void RefreshFollowTrackerFromConfig()
         {
             var cfg = Settings.GetCompanionConfig();
-            string targetExe = "";
+            string targetPathOrExe = "";
             bool autoExit = false;
             if (!string.IsNullOrEmpty(_companionSessionFollowExe))
             {
-                targetExe = _companionSessionFollowExe;
+                targetPathOrExe = !string.IsNullOrEmpty(_companionSessionFollowPath)
+                    ? _companionSessionFollowPath
+                    : _companionSessionFollowExe;
                 autoExit = cfg.FollowAutoExit;
             }
             else if (cfg.HasValidFollowTarget && cfg.FollowAutoExit)
             {
-                targetExe = cfg.FollowAppExe;
+                targetPathOrExe = !string.IsNullOrWhiteSpace(cfg.FollowAppPath)
+                    ? cfg.FollowAppPath
+                    : cfg.FollowAppExe;
                 autoExit = true;
             }
 
+            string targetExe = AppCompanion.ExtractExeName(targetPathOrExe);
             if (autoExit && !string.IsNullOrEmpty(targetExe))
             {
-                if (_followTracker == null || !string.Equals(_followTracker.TargetExe, targetExe, StringComparison.OrdinalIgnoreCase))
-                    _followTracker = new AppCompanion.FollowExitTracker(targetExe, 2);
+                int threshold = AppCompanion.RecommendedMissThreshold(targetPathOrExe);
+                if (_followTracker == null ||
+                    !string.Equals(_followTracker.TargetPath, targetPathOrExe, StringComparison.OrdinalIgnoreCase) ||
+                    _followTracker.MissThreshold != threshold)
+                {
+                    _followTracker = new AppCompanion.FollowExitTracker(targetPathOrExe, threshold);
+                }
                 if (!_shuttingDown && !_companionTimer.Enabled) _companionTimer.Start();
             }
             else
@@ -6255,13 +6307,15 @@ namespace ProxyPicker.UI
             }
         }
 
-        /// <summary>主程序就绪后执行一次联动启动序列：同步守望器、按序拉起代理客户端→快检生效分流→拉起业务软件。</summary>
+        /// <summary>主程序就绪后执行一次联动启动序列：清理异常残留旁路目录、同步守望器、按序拉起代理客户端→规则就绪门禁→拉起业务软件。</summary>
         public void StartCompanionBootSequence()
         {
             if (_companionBootStarted || !UiAlive || _shuttingDown) return;
             _companionBootStarted = true;
             try
             {
+                // 后台清扫上次若遇强杀/断电遗留的过期旁路探测临时目录（v2.6.1 P2-02 修复）
+                _ = Task.Run(() => { try { ProbeSidecar.SweepStaleProbeDirs(); } catch { } });
                 var cfg = Settings.GetCompanionConfig();
                 AppCompanion.ApplyWatcherState(cfg);
                 RefreshFollowTrackerFromConfig();
@@ -6291,15 +6345,19 @@ namespace ProxyPicker.UI
                     if (!UiAlive || _shuttingDown) return;
                 }
 
-                // 若拉起了代理客户端，或通过联动随软件启动：快速等待内核就绪（最多 12 秒），
-                // 避免干等 30 秒常规看守周期，尽早把已保存的白名单与固定 IP 规则推生效。
+                // 若拉起了代理客户端，或通过联动随软件启动，或即将启动业务软件：
+                // 必须确认内核在线且分流规则同步完成，再放行业务软件（v2.6.1 P1-01 强门禁防抢跑直连）。
+                bool hasSavedIntent = Profile.HasSavedIntent;
+                bool repairSuspended = Settings.RepairSuspended;
                 bool needFastKernelSync = _launchedViaCompanion ||
                                           (clientOut != null && clientOut.Started.Count > 0) ||
                                           otherApps.Count > 0;
-                if (needFastKernelSync && Profile.HasSavedIntent && !Settings.RepairSuspended)
+                bool kernelReady = false;
+                bool rulesSynced = false;
+
+                if (needFastKernelSync && hasSavedIntent && !repairSuspended)
                 {
-                    bool kernelReady = false;
-                    for (int i = 0; i < 20 && UiAlive && !_shuttingDown; i++)
+                    for (int i = 0; i < 25 && UiAlive && !_shuttingDown; i++)
                     {
                         bool ok = await Task.Run(() =>
                         {
@@ -6315,20 +6373,68 @@ namespace ProxyPicker.UI
                         if (ok) { kernelReady = true; break; }
                         await Task.Delay(600);
                     }
-                    if (kernelReady && UiAlive && !_shuttingDown && !_busy)
+
+                    if (kernelReady && UiAlive && !_shuttingDown)
                     {
-                        WatchAsync();
-                        // 给规则补回留一小段落地时间，再启动浏览器等业务软件以防抢跑直连
-                        for (int w = 0; w < 12 && (_watching || _busy) && UiAlive && !_shuttingDown; w++)
+                        // 若启动期 RefreshAsync 正持有 _busy，先耐心等它结束，而不是跳过规则补回！
+                        for (int b = 0; b < 35 && _busy && UiAlive && !_shuttingDown; b++)
                             await Task.Delay(300);
-                        if (StaticProxy.IsEnabledAndValid && !_staticChecking && UiAlive && !_shuttingDown)
-                            _ = CheckStaticProxyHealthAsync(false);
+
+                        if (UiAlive && !_shuttingDown && !_busy)
+                        {
+                            WatchAsync();
+                            // 给 WatchAsync 留一拍进入 _watching，然后等到本轮对账/补回彻底完成
+                            await Task.Delay(120);
+                            for (int w = 0; w < 35 && (_watching || _busy) && UiAlive && !_shuttingDown; w++)
+                                await Task.Delay(300);
+
+                            // 实地核验当前内核规则确实已经一致（或非 rule 模式由用户手动切管）才放行业务软件
+                            rulesSynced = await Task.Run(() =>
+                            {
+                                try
+                                {
+                                    string c = Discovery.Detect().ConfigPath;
+                                    if (string.IsNullOrEmpty(c)) return false;
+                                    var savedItems = Profile.Load();
+                                    var pols = Profile.LoadPolicyMap();
+                                    var wanted = savedItems
+                                        .Where(it => it != null && !string.IsNullOrEmpty(it.Exe))
+                                        .Select(it => it.IsPathRule ? it.PathRegex : it.Exe)
+                                        .ToList();
+                                    var audit = Guard.Audit(wanted, pols, c);
+                                    if (audit == null || !audit.Ok) return false;
+                                    bool modeDrifted = !string.IsNullOrEmpty(audit.Mode) &&
+                                                       !audit.Mode.Equals("rule", StringComparison.OrdinalIgnoreCase);
+                                    return modeDrifted || Guard.Judge(audit, wanted.Count, Settings.PatchOnly) == null;
+                                }
+                                catch { return false; }
+                            });
+
+                            if (StaticProxy.IsEnabledAndValid && !_staticChecking && UiAlive && !_shuttingDown)
+                                _ = CheckStaticProxyHealthAsync(false);
+                        }
                     }
                 }
 
                 AppCompanion.LaunchBatchOutcome otherOut = null;
+                string skipOtherReason = "";
                 if (otherApps.Count > 0 && UiAlive && !_shuttingDown)
-                    otherOut = await Task.Run(() => AppCompanion.LaunchApps(otherApps));
+                {
+                    if (AppCompanion.ShouldLaunchBusinessAppsAfterSync(
+                            hasSavedIntent, repairSuspended, kernelReady, rulesSynced, out skipOtherReason))
+                    {
+                        otherOut = await Task.Run(() => AppCompanion.LaunchApps(otherApps));
+                    }
+                    else
+                    {
+                        AuditLog.Record("COMPANION", "安全拦截业务软件联动启动：" + skipOtherReason);
+                        SetStatus(skipOtherReason, Theme.Warn);
+                        if (Visible)
+                            Toast("已暂缓拉起配套软件", skipOtherReason + "；内核就绪后可点托盘「立即拉起配套软件」", Theme.Warn, 4);
+                        else if (TrayBalloon != null)
+                            TrayBalloon("已暂缓拉起配套软件", skipOtherReason + "；内核就绪后可在托盘右键点「立即拉起配套软件」");
+                    }
+                }
 
                 var allStarted = new List<string>();
                 if (clientOut != null) allStarted.AddRange(clientOut.Started);
@@ -6338,13 +6444,17 @@ namespace ProxyPicker.UI
                     string joined = string.Join("、", allStarted.Take(3));
                     if (allStarted.Count > 3) joined += " 等 " + allStarted.Count + " 个";
                     AuditLog.Record("COMPANION", "联动自动拉起软件：" + string.Join(", ", allStarted));
-                    SetStatus("联动已同步开启：" + joined, Theme.Ok);
-                    if (Visible)
-                        Toast("已自动同步开启软件", joined, Theme.Ok, 2);
-                    else if (TrayBalloon != null)
-                        TrayBalloon("ProxyPicker 联动已就绪", "已同步开启：" + joined);
+                    if (string.IsNullOrEmpty(skipOtherReason))
+                        SetStatus("联动已同步开启：" + joined, Theme.Ok);
+                    if (string.IsNullOrEmpty(skipOtherReason))
+                    {
+                        if (Visible)
+                            Toast("已自动同步开启软件", joined, Theme.Ok, 2);
+                        else if (TrayBalloon != null)
+                            TrayBalloon("ProxyPicker 联动已就绪", "已同步开启：" + joined);
+                    }
                 }
-                else if (_launchedViaCompanion && !string.IsNullOrEmpty(_companionSessionFollowExe))
+                else if (_launchedViaCompanion && !string.IsNullOrEmpty(_companionSessionFollowExe) && string.IsNullOrEmpty(skipOtherReason))
                 {
                     string hostDisp = Catalog.DisplayName(_companionSessionFollowExe);
                     AuditLog.Record("COMPANION", "已随软件联动后台启动：" + _companionSessionFollowExe);
@@ -6360,8 +6470,11 @@ namespace ProxyPicker.UI
             if (!UiAlive || _shuttingDown || _followTracker == null) return;
             try
             {
-                bool running = AppCompanion.IsProcessRunning(_followTracker.TargetExe);
-                if (_followTracker.Observe(running))
+                string query = !string.IsNullOrEmpty(_followTracker.TargetPath)
+                    ? _followTracker.TargetPath
+                    : _followTracker.TargetExe;
+                var state = AppCompanion.ProbeTargetProcess(query, true);
+                if (_followTracker.Observe(state))
                 {
                     string closedExe = _followTracker.TargetExe;
                     _companionTimer.Stop();

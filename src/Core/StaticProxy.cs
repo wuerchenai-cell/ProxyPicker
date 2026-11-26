@@ -515,7 +515,110 @@ namespace ProxyPicker.Core
                 Redactor.ClearRuntimeSecrets();
                 return;
             }
-            Redactor.RegisterRuntimeSecrets(cfg.Host, cfg.Username, cfg.Password);
+            Redactor.RegisterStaticCredentials(cfg.Host, cfg.Username, cfg.Password);
+        }
+
+        /// <summary>
+        /// 跳板优选完成后将测速结果安全合并到「最新配置」纯函数（v2.6.1 P0-01 修复）：
+        /// 防止测速耗时期间用户在对话框中停用固定 IP、修改主机/端口/账密/UDP 或切走跳板模式，
+        /// 被开测前的旧快照整份写回覆盖。
+        /// </summary>
+        internal static bool TryMergeAutoHopConfig(
+            StaticProxyConfig startSnapshot,
+            StaticProxyConfig latestCurrent,
+            bool manual,
+            bool switchIt,
+            string bestNode,
+            int bestDelayMs,
+            string keptFallbackNode,
+            int keptDelayMs,
+            List<string> hopPool,
+            long updatedAtTicks,
+            out StaticProxyConfig merged,
+            out string discardReason)
+        {
+            merged = null;
+            discardReason = "";
+            if (startSnapshot == null || latestCurrent == null)
+            {
+                discardReason = "配置快照为空";
+                return false;
+            }
+            if (!latestCurrent.IsActive())
+            {
+                discardReason = "测速期间固定 IP 已停用，跳过写回";
+                return false;
+            }
+            if (!string.Equals((startSnapshot.Host ?? "").Trim(), (latestCurrent.Host ?? "").Trim(), StringComparison.OrdinalIgnoreCase) ||
+                startSnapshot.Port != latestCurrent.Port ||
+                !string.Equals(startSnapshot.Username ?? "", latestCurrent.Username ?? "", StringComparison.Ordinal) ||
+                !string.Equals(startSnapshot.Password ?? "", latestCurrent.Password ?? "", StringComparison.Ordinal) ||
+                startSnapshot.AllowUdp != latestCurrent.AllowUdp)
+            {
+                discardReason = "测速期间固定 IP 服务器、凭据或 UDP 设置已变更，丢弃旧测速结果";
+                return false;
+            }
+            if (string.Equals(latestCurrent.HopMode, HopDirect, StringComparison.OrdinalIgnoreCase))
+            {
+                discardReason = "测速期间已切为直连模式，跳过写回";
+                return false;
+            }
+            if (!manual && !string.Equals(latestCurrent.HopMode, HopAuto, StringComparison.OrdinalIgnoreCase))
+            {
+                discardReason = "测速期间跳板模式已不再是智能优选，跳过写回";
+                return false;
+            }
+
+            var next = latestCurrent.Clone();
+            if (manual) next.HopMode = HopAuto;
+            next.AutoBestUpdatedAtTicks = updatedAtTicks > 0 ? updatedAtTicks : DateTime.UtcNow.Ticks;
+            next.AutoBestHopPool = hopPool != null ? new List<string>(hopPool) : new List<string>();
+            if (switchIt)
+            {
+                if (!string.IsNullOrWhiteSpace(bestNode)) next.AutoBestHopNode = bestNode.Trim();
+                if (bestDelayMs > 0) next.AutoBestDelayMs = bestDelayMs;
+            }
+            else
+            {
+                if (string.IsNullOrEmpty(next.AutoBestHopNode))
+                    next.AutoBestHopNode = !string.IsNullOrEmpty(keptFallbackNode) ? keptFallbackNode.Trim() : (bestNode ?? "").Trim();
+                if (keptDelayMs > 0)
+                    next.AutoBestDelayMs = keptDelayMs;
+            }
+            merged = next;
+            return true;
+        }
+
+        /// <summary>在锁内基于最新持久化配置安全合并优选跳板结果并落盘（绝不覆盖中途用户修改）。</summary>
+        public static bool TryMergeAndSaveAutoHopResult(
+            StaticProxyConfig startSnapshot,
+            bool manual,
+            bool switchIt,
+            string bestNode,
+            int bestDelayMs,
+            string keptFallbackNode,
+            int keptDelayMs,
+            List<string> hopPool,
+            out StaticProxyConfig savedConfig,
+            out string discardReason,
+            out string saveError)
+        {
+            savedConfig = null;
+            discardReason = "";
+            saveError = "";
+            StaticProxyConfig latest = Current;
+            StaticProxyConfig merged;
+            if (!TryMergeAutoHopConfig(
+                    startSnapshot, latest, manual, switchIt,
+                    bestNode, bestDelayMs, keptFallbackNode, keptDelayMs,
+                    hopPool, DateTime.UtcNow.Ticks, out merged, out discardReason))
+            {
+                return false;
+            }
+            if (!Save(merged, out saveError))
+                return false;
+            savedConfig = Current;
+            return true;
         }
 
         // ============================================================
@@ -2922,6 +3025,61 @@ namespace ProxyPicker.Core
                 rankTest[1].NodeName == "JitteryFast" &&
                 rankTest[2].NodeName == "FlakyFast",
                 "order=" + rankTest[0].NodeName + "," + rankTest[1].NodeName + "," + rankTest[2].NodeName);
+
+            // SP46（v2.6.1 P0-01 回归）：跳板优选合并时若中途停用、改密或切走模式，绝不用旧快照覆盖最新配置
+            var snapStart = new StaticProxyConfig
+            {
+                Enabled = true, Host = "198.51.100.8", Port = 1080, Username = "u1", Password = "old-password",
+                HopMode = HopAuto, AllowUdp = false
+            };
+            var latestDisabled = snapStart.Clone(); latestDisabled.Enabled = false;
+            var latestNewPwd = snapStart.Clone(); latestNewPwd.Password = "new-password";
+            var latestPinned = snapStart.Clone(); latestPinned.HopMode = HopPin; latestPinned.PinnedHopNode = "Node-JP-02";
+            var latestRenamed = snapStart.Clone(); latestRenamed.Label = "我的新标签";
+            StaticProxyConfig mOut; string discWhy;
+            bool rejectDisabled = !TryMergeAutoHopConfig(snapStart, latestDisabled, false, true, "Node-US-01", 180, "", 180, new List<string> { "Node-US-01" }, t0.Ticks, out mOut, out discWhy);
+            bool rejectNewPwd = !TryMergeAutoHopConfig(snapStart, latestNewPwd, true, true, "Node-US-01", 180, "", 180, new List<string> { "Node-US-01" }, t0.Ticks, out mOut, out discWhy);
+            bool rejectPinned = !TryMergeAutoHopConfig(snapStart, latestPinned, false, true, "Node-US-01", 180, "", 180, new List<string> { "Node-US-01" }, t0.Ticks, out mOut, out discWhy);
+            bool acceptLabelEdit = TryMergeAutoHopConfig(snapStart, latestRenamed, false, true, "Node-US-01", 180, "", 180, new List<string> { "Node-US-01" }, t0.Ticks, out mOut, out discWhy) &&
+                                   mOut != null && mOut.Label == "我的新标签" && mOut.AutoBestHopNode == "Node-US-01" && mOut.AutoBestDelayMs == 180;
+            check("SP46 跳板优选写回防旧快照覆盖（中途停用/改密/改模式一律丢弃；仅改标签则保留最新标签合并）",
+                rejectDisabled && rejectNewPwd && rejectPinned && acceptLabelEdit,
+                "dis=" + rejectDisabled + " pwd=" + rejectNewPwd + " pin=" + rejectPinned + " lbl=" + acceptLabelEdit);
+
+            // SP47（v2.6.1 P2-04 回归）：干净还原输入文件若已含 # PP-STATIC-BEGIN 与 # PP-BEGIN，输出必须彻底零残留
+            string dirtySrc = InjectIntoYaml(
+                Discovery.BuildPayload(multiNodeYaml, new List<Profile.Item>
+                {
+                    new Profile.Item("chrome.exe", NodeName)
+                }, "PP-FIXED", false, "always", true),
+                autoCfg, "PP-FIXED");
+            string cleanRolled = Profile.BuildCleanRollbackFromText(dirtySrc, "strict", false, "");
+            check("SP47 BuildCleanRollbackFromText 面对已带静态代理块的订阅源彻底剥离 PP-STATIC-OUT/HOP/凭据与 PP-BEGIN",
+                !cleanRolled.Contains(NodeName) &&
+                !cleanRolled.Contains(HopGroupName) &&
+                !cleanRolled.Contains("# PP-STATIC-BEGIN") &&
+                !cleanRolled.Contains("# PP-BEGIN") &&
+                !cleanRolled.Contains(autoCfg.Password) &&
+                cleanRolled.Contains("Node-JP-02"),
+                "hasStatic=" + cleanRolled.Contains(NodeName) + " hasBegin=" + cleanRolled.Contains("# PP-BEGIN"));
+
+            // SP48（v2.6.1 P3-01 回归）：短于 4 字符的固定 IP 口令按字段/URL 上下文打码且不误伤正文普通词
+            var savedSec = Redactor.SnapshotRuntimeSecrets();
+            try
+            {
+                Redactor.RegisterStaticCredentials("198.51.100.9", "ab", "x7");
+                string rShort = Redactor.Apply("socks5://ab:x7@198.51.100.9:1080 password=x7 密码：x7 正文包含x7y不应误伤");
+                check("SP48 短口令(<4字符)在 password=/密码:/socks5 URL 均精准脱敏且不破坏正文词句",
+                    !rShort.Contains(":x7@") &&
+                    !rShort.Contains("password=x7") &&
+                    !rShort.Contains("密码：x7") &&
+                    rShort.Contains("正文包含x7y不应误伤"),
+                    rShort);
+            }
+            finally
+            {
+                Redactor.RestoreRuntimeSecrets(savedSec);
+            }
 
             sb.Insert(0, "\n[独立固定 IP StaticProxy 自检] " + pass + " PASS / " + fail + " FAIL\n");
             return sb.ToString();

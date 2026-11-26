@@ -275,22 +275,29 @@ namespace ProxyPicker.Core
         /// find-process-mode / IPv6 按记下的原值恢复，与 LeaveNoTraceCore 同一套口径。
         /// 返回 null 表示当前订阅不可读。
         /// </summary>
+        /// <summary>纯文本干净还原重建：先剥离静态代理标记块（# PP-STATIC-BEGIN..END），再剥离规则块并恢复设置（v2.6.1 P2-04 修复）。</summary>
+        internal static string BuildCleanRollbackFromText(string text, string fpm, bool ipv6Restore, string ipv6Original)
+        {
+            string stripped = StaticProxy.StripStaticMarkedBlocks(text ?? "");
+            string policy = "PP-FIXED";
+            try { bool reused; policy = Discovery.FindPolicy(stripped, out reused); } catch { }
+            string clean = Discovery.BuildPayload(stripped, new List<Item>(), policy, true, fpm);
+            if (ipv6Restore && !string.IsNullOrEmpty(ipv6Original))
+                clean = Guard.RestoreIpv6(clean, ipv6Original);
+            return clean;
+        }
+
         static string BuildCleanRollbackPayload(string currentCfg)
         {
             try
             {
                 if (string.IsNullOrEmpty(currentCfg) || !File.Exists(currentCfg)) return null;
                 string text = File.ReadAllText(currentCfg, System.Text.Encoding.UTF8);
-                string policy = "PP-FIXED";
-                try { bool reused; policy = Discovery.FindPolicy(text, out reused); } catch { }
                 // 未记过原值时保持现状（null = 仍写 always，与上次接管时的状态一致）。
                 string fpm = Settings.Current.FindProcessOriginal;
                 if (fpm.Length == 0) fpm = null;
-                string clean = Discovery.BuildPayload(text, new List<Item>(), policy, true, fpm);
                 bool ipv6Restore = Settings.Ipv6GuardOn && !string.IsNullOrEmpty(Settings.Current.Ipv6Original);
-                if (ipv6Restore)
-                    clean = Guard.RestoreIpv6(clean, Settings.Current.Ipv6Original);
-                return clean;
+                return BuildCleanRollbackFromText(text, fpm, ipv6Restore, Settings.Current.Ipv6Original);
             }
             catch { return null; }
         }

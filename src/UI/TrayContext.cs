@@ -256,13 +256,10 @@ namespace ProxyPicker.UI
 
         // ---------------------------------------------------------------- 开机自启
 
-        /// <summary>只有值确实指向当前 exe 才算已开启；便携 exe 搬过家就显示失效（评审 R6-11）。</summary>
+        /// <summary>只有值确实指向当前 exe（精确第 0 参数相等，防前缀误判）才算已开启。</summary>
         static bool PointsToThisExe(string command)
         {
-            if (string.IsNullOrEmpty(command)) return false;
-            string s = command.Trim().Trim('"');
-            string exe = Application.ExecutablePath;
-            return s.StartsWith(exe, StringComparison.OrdinalIgnoreCase);
+            return AppCompanion.CommandPointsToExe(command, Application.ExecutablePath);
         }
 
         static bool AutostartEnabled()
@@ -313,6 +310,15 @@ namespace ProxyPicker.UI
             if (_form == null || _form.IsDisposed) return;
             if (_form.InvokeRequired) _form.BeginInvoke(new Action(ShowPanel));
             else ShowPanel();
+        }
+
+        /// <summary>供第二个实例通过 --follow 快捷方式把同生共死跟随会话交接给已运行的主实例（v2.6.1 P1-05 修复）。</summary>
+        public void InvokeAttachFollowSession(string targetPathOrExe)
+        {
+            if (_form == null || _form.IsDisposed || string.IsNullOrWhiteSpace(targetPathOrExe)) return;
+            Action act = () => _form.AttachCompanionFollowSession(targetPathOrExe);
+            if (_form.InvokeRequired) _form.BeginInvoke(act);
+            else act();
         }
 
         void ShowPanel()

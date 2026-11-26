@@ -70,6 +70,23 @@ namespace ProxyPicker.Core
             return false;
         }
 
+        /// <summary>按 PID 以最小查询权限安全读取完整映像路径，避免访问高权限进程 MainModule 抛异常。</summary>
+        internal static bool TryQueryImagePathByPid(int pid, out string fullPath)
+        {
+            fullPath = "";
+            if (pid <= 0) return false;
+            IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                return TryImagePath(h, out fullPath);
+            }
+            finally
+            {
+                CloseHandle(h);
+            }
+        }
+
         public static Dictionary<string, ProcInfo> Scan()
         {
             var map = new Dictionary<string, ProcInfo>(StringComparer.OrdinalIgnoreCase);

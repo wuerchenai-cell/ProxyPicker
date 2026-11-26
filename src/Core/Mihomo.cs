@@ -817,7 +817,44 @@ namespace ProxyPicker.Core
         ///   Other   → 拒绝，并把「这个端口其实是谁在听」写进错误里；
         ///   Unknown → 允许（系统表读不到时不能把所有只开 HTTP 的用户都锁死），但已留痕。
         /// </summary>
-        static bool SecretGate(string ep, out bool sendSecret, out string error)
+        /// <summary>校验 401/403 响应体与认证头是否符合 mihomo 控制口特征（JSON {"message":"Unauthorized"} 且无 Basic/NTLM 质询）。</summary>
+        internal static bool LooksLikeMihomoUnauthorized(int status, string body, string wwwAuthenticate)
+        {
+            if (status != 401 && status != 403) return false;
+            if (!string.IsNullOrWhiteSpace(wwwAuthenticate))
+            {
+                string wa = wwwAuthenticate.Trim();
+                if (!wa.StartsWith("Bearer", StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            if (string.IsNullOrWhiteSpace(body) || body.Length > 1024) return false;
+            try
+            {
+                var root = Json.AsObject(Json.Parse(body));
+                if (root == null) return false;
+                string msg = Json.Str(root, "message");
+                return !string.IsNullOrEmpty(msg) &&
+                       msg.IndexOf("unauthorized", StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>纯函数判定：Unknown 监听者必须先通过无密钥首探确认具备 mihomo 特征，才允许携带 Bearer Secret（v2.6.1 P3-02 修复）。</summary>
+        internal static bool AllowSecretForVerdict(ListenerKind verdict, bool mihomoHintVerified)
+        {
+            if (verdict == ListenerKind.Kernel) return true;
+            if (verdict == ListenerKind.Other) return false;
+            return mihomoHintVerified;
+        }
+
+        static string _verifiedUnknownHintEp;
+
+        static bool IsUnknownHintVerified(string ep)
+        {
+            return !string.IsNullOrEmpty(ep) &&
+                   string.Equals(_verifiedUnknownHintEp, ep, StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool SecretGate(string ep, out bool sendSecret, out string error, bool mihomoHintVerified = false)
         {
             sendSecret = false;
             error = "";
@@ -827,6 +864,13 @@ namespace ProxyPicker.Core
             {
                 error = "控制端口 " + ep + " 的监听进程不是 mihomo / Clash：" + detail +
                         "；已阻止发送控制密钥";
+                _securityError = error;
+                return false;
+            }
+            bool hintOk = mihomoHintVerified || IsUnknownHintVerified(ep);
+            if (!AllowSecretForVerdict(verdict, hintOk))
+            {
+                error = "无法核实控制端口 " + ep + " 的监听进程身份，且无密钥探测未呈现 mihomo 特征；已阻止盲发控制密钥";
                 _securityError = error;
                 return false;
             }
@@ -1284,22 +1328,26 @@ namespace ProxyPicker.Core
                                 string sameFileSecret = null, bool guessed = false)
         {
             // 第一次绝不带 Authorization 头：没设 Secret 的实例不需要多余的信息披露。
-            var first = ProbeVersion(ep, null);
-            if (first == ProbeResult.Ok) return true;
+            bool mihomoUnauthHint;
+            var first = ProbeVersion(ep, null, out mihomoUnauthHint);
+            if (first == ProbeResult.Ok)
+            {
+                _verifiedUnknownHintEp = ep;
+                return true;
+            }
             if (!allowSecret || first != ProbeResult.Unauthorized) return false;
             // 收尾批 P3-1：Endpoint 已读过同一份配置时直接复用，不再二次读文件。
             string secret = sameFileSecret ?? ReadSecret(knownConfigPath);
             if (string.IsNullOrEmpty(secret)) return false;
-            // v1.3.8：**带密钥的那一次请求之前**必须先核对监听进程。
-            // v1.3.7 把核对放在 TryHttp 里，而本函数由 Endpoint() 更早调用——
-            // 本机进程只要抢占配置里的控制端口、对无密钥 /version 回 401，
-            // 就能在身份核对之前收到 Authorization: Bearer <secret>。
-            // 401 只证明「这个服务要认证」，不能据此把它升级成可信身份。
+            // v1.3.8 / v2.6.1：**带密钥的那一次请求之前**必须先核对监听进程；
+            // 若系统表不可用（Unknown），必须已通过无密钥首探确认是 mihomo JSON 401 特征才允许携带 Bearer。
             if (guessed) return false;
             bool maySend;
             string gateError;
-            if (!SecretGate(ep, out maySend, out gateError) || !maySend) return false;
-            return ProbeVersion(ep, secret) == ProbeResult.Ok;
+            if (!SecretGate(ep, out maySend, out gateError, mihomoUnauthHint) || !maySend) return false;
+            bool ok = ProbeVersion(ep, secret) == ProbeResult.Ok;
+            if (ok) _verifiedUnknownHintEp = ep;
+            return ok;
         }
 
         internal enum ProbeResult
@@ -1409,6 +1457,13 @@ namespace ProxyPicker.Core
 
         static ProbeResult ProbeVersion(string ep, string secret)
         {
+            bool unused;
+            return ProbeVersion(ep, secret, out unused);
+        }
+
+        static ProbeResult ProbeVersion(string ep, string secret, out bool mihomoUnauthHint)
+        {
+            mihomoUnauthHint = false;
             var sw = Stopwatch.StartNew();
             try
             {
@@ -1440,8 +1495,16 @@ namespace ProxyPicker.Core
                 if (resp != null)
                 {
                     int st = (int)resp.StatusCode;
+                    string wwwAuth = "";
+                    string body = "";
+                    try { wwwAuth = resp.Headers["WWW-Authenticate"] ?? ""; } catch { }
+                    try { body = ReadBodyLimited(resp.GetResponseStream(), 4096, 500, sw); } catch { }
                     resp.Close();
-                    if (st == 401 || st == 403) return ProbeResult.Unauthorized;
+                    if (st == 401 || st == 403)
+                    {
+                        mihomoUnauthHint = LooksLikeMihomoUnauthorized(st, body, wwwAuth);
+                        return ProbeResult.Unauthorized;
+                    }
                     return ProbeResult.NotMihomo;
                 }
                 return ProbeResult.Error;
@@ -2356,6 +2419,18 @@ namespace ProxyPicker.Core
                 _boundConfigPath = fSavedBound;
             }
 
+            // v2.6.1 P3-02 回归：Unknown 监听者未验明 mihomo 特征时不盲发 Bearer；空体/Basic 401 不算 mihomo 特征
+            check("v2.6.1 Unknown 监听者未确认 mihomo 特征时拒绝发送 Bearer（仅认 JSON Unauthorized 且禁 Basic）",
+                AllowSecretForVerdict(ListenerKind.Kernel, false) &&
+                !AllowSecretForVerdict(ListenerKind.Other, true) &&
+                !AllowSecretForVerdict(ListenerKind.Unknown, false) &&
+                AllowSecretForVerdict(ListenerKind.Unknown, true) &&
+                LooksLikeMihomoUnauthorized(401, "{\"message\":\"Unauthorized\"}", "") &&
+                !LooksLikeMihomoUnauthorized(401, "", "") &&
+                !LooksLikeMihomoUnauthorized(401, "<html>401</html>", "") &&
+                !LooksLikeMihomoUnauthorized(401, "{\"message\":\"Unauthorized\"}", "Basic realm=\"admin\""),
+                "");
+
             sb.AppendLine();
             sb.AppendLine("合计 " + (pass + fail) + " 项：" + pass + " 通过 / " + fail + " 失败");
             return sb.ToString();
@@ -2450,6 +2525,7 @@ namespace ProxyPicker.Core
             _pipeTrustDetail = null;
             _pipeAmbiguous = null;
             _boundConfigPath = null;
+            _verifiedUnknownHintEp = null;
         }
 
         public static void Forget()
