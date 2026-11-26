@@ -1,0 +1,120 @@
+<UserControl x:Class="ProxyPicker.App.Views.Pages.ConnectionsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="clr-namespace:ProxyPicker.App.Converters">
+    <UserControl.Resources>
+        <conv:IntEqualsToBoolConverter x:Key="IntEqBool" />
+    </UserControl.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- 顶部实时连接态势总览 -->
+        <Border Grid.Row="0" Style="{StaticResource CardBorder}" Margin="0,0,0,12" Padding="14,11">
+            <DockPanel>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="实时活跃连接白盒监视器" Style="{StaticResource Text.SectionTitle}" VerticalAlignment="Center" />
+                    <Border Background="{DynamicResource Brush.AccentSoft}" CornerRadius="10" Padding="8,2" Margin="10,0,0,0">
+                        <TextBlock FontSize="11.5" Foreground="{DynamicResource Brush.Accent}" FontWeight="SemiBold">
+                            <Run Text="共 " /><Run Text="{Binding ActiveConnTotal, Mode=OneWay}" /><Run Text=" 条连接" />
+                        </TextBlock>
+                    </Border>
+                    <Border Background="{DynamicResource Brush.DangerSoft}" CornerRadius="10" Padding="8,2" Margin="6,0,0,0">
+                        <TextBlock FontSize="11.5" Foreground="{DynamicResource Brush.Danger}" FontWeight="SemiBold">
+                            <Run Text="错路旧连接 " /><Run Text="{Binding MismatchedConnCount, Mode=OneWay}" /><Run Text=" 条" />
+                        </TextBlock>
+                    </Border>
+                </StackPanel>
+
+                <Button Content="一键断开全部错路连接" Style="{StaticResource DangerButton}" HorizontalAlignment="Right"
+                        Command="{Binding CloseMismatchedConnectionsCommand}" />
+            </DockPanel>
+        </Border>
+
+        <!-- 筛选胶囊与搜索栏 -->
+        <Grid Grid.Row="1" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                <RadioButton Content="全部" GroupName="ConnFilter" Style="{StaticResource FilterPill}" IsChecked="{Binding ConnFilterTab, Converter={StaticResource IntEqBool}, ConverterParameter=0}" />
+                <RadioButton Content="主代理" GroupName="ConnFilter" Style="{StaticResource FilterPill}" IsChecked="{Binding ConnFilterTab, Converter={StaticResource IntEqBool}, ConverterParameter=1}" />
+                <RadioButton Content="固定IP" GroupName="ConnFilter" Style="{StaticResource FilterPill}" IsChecked="{Binding ConnFilterTab, Converter={StaticResource IntEqBool}, ConverterParameter=2}" />
+                <RadioButton Content="本地直连" GroupName="ConnFilter" Style="{StaticResource FilterPill}" IsChecked="{Binding ConnFilterTab, Converter={StaticResource IntEqBool}, ConverterParameter=3}" />
+                <RadioButton Content="仅看错路" GroupName="ConnFilter" Style="{StaticResource FilterPill}" IsChecked="{Binding ConnFilterTab, Converter={StaticResource IntEqBool}, ConverterParameter=4}" />
+            </StackPanel>
+
+            <TextBox Grid.Column="1" Style="{StaticResource FluentTextBox}" Margin="10,0,0,0" Height="32"
+                     Tag="按进程名、目标域名或出站链路过滤连接…"
+                     Text="{Binding ConnSearchText, UpdateSourceTrigger=PropertyChanged}" />
+        </Grid>
+
+        <!-- 实时连接表格 -->
+        <Border Grid.Row="2" Style="{StaticResource CardBorder}" Padding="0">
+            <DataGrid ItemsSource="{Binding FilteredConnections}" Style="{StaticResource EnterpriseDataGrid}" RowHeight="38">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="软件进程" Binding="{Binding ProcessExe}" Width="130" FontWeight="SemiBold" />
+                    <DataGridTextColumn Header="目标地址 : 端口" Binding="{Binding TargetEndpoint}" Width="1.5*" FontFamily="{StaticResource Font.Mono}" />
+                    <DataGridTextColumn Header="协议" Binding="{Binding Network}" Width="54" />
+                    <DataGridTemplateColumn Header="实际出站" Width="82">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <Border CornerRadius="5" Padding="7,2" HorizontalAlignment="Left">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Setter Property="Background" Value="{DynamicResource Brush.DirectSoft}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ActualChannel}" Value="主代理">
+                                                    <Setter Property="Background" Value="{DynamicResource Brush.AccentSoft}" />
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding ActualChannel}" Value="固定IP">
+                                                    <Setter Property="Background" Value="{DynamicResource Brush.StaticSoft}" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock Text="{Binding ActualChannel}" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource Brush.TextPrimary}" />
+                                </Border>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTextColumn Header="完整出站链" Binding="{Binding OutboundChain}" Width="1.2*" Foreground="{DynamicResource Brush.TextSecondary}" />
+                    <DataGridTextColumn Header="累计流量" Binding="{Binding TrafficText}" Width="174" FontFamily="{StaticResource Font.Mono}" />
+                    <DataGridTemplateColumn Header="状态" Width="62">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding MismatchBadge}" FontSize="11.5" FontWeight="SemiBold">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="{DynamicResource Brush.Success}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsMismatched}" Value="True">
+                                                    <Setter Property="Foreground" Value="{DynamicResource Brush.Danger}" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                    <DataGridTemplateColumn Header="操作" Width="64">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <Button Content="断开" Style="{StaticResource SecondaryButton}" Padding="8,3" FontSize="11"
+                                        Command="{Binding DataContext.CloseConnectionCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                        CommandParameter="{Binding}" />
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+        </Border>
+    </Grid>
+</UserControl>

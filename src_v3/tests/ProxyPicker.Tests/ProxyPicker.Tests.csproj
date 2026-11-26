@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>ProxyPicker.Tests</RootNamespace>
+    <AssemblyName>ProxyPicker.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ProxyPicker.Domain\ProxyPicker.Domain.csproj" />
+    <ProjectReference Include="..\..\src\ProxyPicker.Platform.Windows\ProxyPicker.Platform.Windows.csproj" />
+    <ProjectReference Include="..\..\src\ProxyPicker.Infrastructure\ProxyPicker.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\ProxyPicker.Application\ProxyPicker.Application.csproj" />
+  </ItemGroup>
+</Project>

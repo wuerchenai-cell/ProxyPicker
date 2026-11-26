@@ -1,0 +1,64 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{276BA0BC-3F5F-4BAD-BC14-B5E521631029}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyPicker.Domain", "src\ProxyPicker.Domain\ProxyPicker.Domain.csproj", "{16639106-8F0A-4D9F-B5CE-3D64C2AFEDB8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyPicker.Platform.Windows", "src\ProxyPicker.Platform.Windows\ProxyPicker.Platform.Windows.csproj", "{AB5E5BF7-8881-47E4-B053-583BB9400111}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyPicker.Infrastructure", "src\ProxyPicker.Infrastructure\ProxyPicker.Infrastructure.csproj", "{E44872FA-2EA9-44C8-AF87-A46BE214CE2E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyPicker.Application", "src\ProxyPicker.Application\ProxyPicker.Application.csproj", "{E5995942-A5AA-4ABB-9469-214BA06B2941}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyPicker.App", "src\ProxyPicker.App\ProxyPicker.App.csproj", "{F8584780-7FB3-4A02-B269-97AA22AE08BE}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{872B6759-D9DB-4EE0-965C-184447F1DBD3}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyPicker.Tests", "tests\ProxyPicker.Tests\ProxyPicker.Tests.csproj", "{06FC15FC-8347-4A5B-9AE3-2D23D18A905D}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{16639106-8F0A-4D9F-B5CE-3D64C2AFEDB8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{16639106-8F0A-4D9F-B5CE-3D64C2AFEDB8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{16639106-8F0A-4D9F-B5CE-3D64C2AFEDB8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{16639106-8F0A-4D9F-B5CE-3D64C2AFEDB8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AB5E5BF7-8881-47E4-B053-583BB9400111}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AB5E5BF7-8881-47E4-B053-583BB9400111}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AB5E5BF7-8881-47E4-B053-583BB9400111}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AB5E5BF7-8881-47E4-B053-583BB9400111}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E44872FA-2EA9-44C8-AF87-A46BE214CE2E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E44872FA-2EA9-44C8-AF87-A46BE214CE2E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E44872FA-2EA9-44C8-AF87-A46BE214CE2E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E44872FA-2EA9-44C8-AF87-A46BE214CE2E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E5995942-A5AA-4ABB-9469-214BA06B2941}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E5995942-A5AA-4ABB-9469-214BA06B2941}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E5995942-A5AA-4ABB-9469-214BA06B2941}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E5995942-A5AA-4ABB-9469-214BA06B2941}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F8584780-7FB3-4A02-B269-97AA22AE08BE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F8584780-7FB3-4A02-B269-97AA22AE08BE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F8584780-7FB3-4A02-B269-97AA22AE08BE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F8584780-7FB3-4A02-B269-97AA22AE08BE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{06FC15FC-8347-4A5B-9AE3-2D23D18A905D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{06FC15FC-8347-4A5B-9AE3-2D23D18A905D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{06FC15FC-8347-4A5B-9AE3-2D23D18A905D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{06FC15FC-8347-4A5B-9AE3-2D23D18A905D}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{16639106-8F0A-4D9F-B5CE-3D64C2AFEDB8} = {276BA0BC-3F5F-4BAD-BC14-B5E521631029}
+		{AB5E5BF7-8881-47E4-B053-583BB9400111} = {276BA0BC-3F5F-4BAD-BC14-B5E521631029}
+		{E44872FA-2EA9-44C8-AF87-A46BE214CE2E} = {276BA0BC-3F5F-4BAD-BC14-B5E521631029}
+		{E5995942-A5AA-4ABB-9469-214BA06B2941} = {276BA0BC-3F5F-4BAD-BC14-B5E521631029}
+		{F8584780-7FB3-4A02-B269-97AA22AE08BE} = {276BA0BC-3F5F-4BAD-BC14-B5E521631029}
+		{06FC15FC-8347-4A5B-9AE3-2D23D18A905D} = {872B6759-D9DB-4EE0-965C-184447F1DBD3}
+	EndGlobalSection
+EndGlobal

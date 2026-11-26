@@ -1,0 +1,67 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <!-- ProxyPicker v3.0 浅色主题 Design Tokens -->
+    <Color x:Key="Color.BgCanvas">#F4F6FA</Color>
+    <Color x:Key="Color.BgSidebar">#EBF0F7</Color>
+    <Color x:Key="Color.BgCard">#FFFFFF</Color>
+    <Color x:Key="Color.BgSubtle">#F8FAFC</Color>
+    <Color x:Key="Color.BgHover">#E8EEF6</Color>
+    <Color x:Key="Color.BgSelected">#DBEAFE</Color>
+    <Color x:Key="Color.Border">#E2E8F0</Color>
+    <Color x:Key="Color.BorderStrong">#CBD5E1</Color>
+
+    <Color x:Key="Color.TextPrimary">#0F172A</Color>
+    <Color x:Key="Color.TextSecondary">#475569</Color>
+    <Color x:Key="Color.TextMuted">#94A3B8</Color>
+
+    <Color x:Key="Color.Accent">#2563EB</Color>
+    <Color x:Key="Color.AccentHover">#1D4ED8</Color>
+    <Color x:Key="Color.AccentSoft">#EFF6FF</Color>
+
+    <Color x:Key="Color.Static">#7C3AED</Color>
+    <Color x:Key="Color.StaticSoft">#F5F3FF</Color>
+
+    <Color x:Key="Color.Direct">#64748B</Color>
+    <Color x:Key="Color.DirectSoft">#F1F5F9</Color>
+
+    <Color x:Key="Color.Success">#059669</Color>
+    <Color x:Key="Color.SuccessSoft">#ECFDF5</Color>
+
+    <Color x:Key="Color.Warn">#D97706</Color>
+    <Color x:Key="Color.WarnSoft">#FFFBEB</Color>
+
+    <Color x:Key="Color.Danger">#DC2626</Color>
+    <Color x:Key="Color.DangerSoft">#FEF2F2</Color>
+
+    <SolidColorBrush x:Key="Brush.BgCanvas" Color="{StaticResource Color.BgCanvas}" />
+    <SolidColorBrush x:Key="Brush.BgSidebar" Color="{StaticResource Color.BgSidebar}" />
+    <SolidColorBrush x:Key="Brush.BgCard" Color="{StaticResource Color.BgCard}" />
+    <SolidColorBrush x:Key="Brush.BgSubtle" Color="{StaticResource Color.BgSubtle}" />
+    <SolidColorBrush x:Key="Brush.BgHover" Color="{StaticResource Color.BgHover}" />
+    <SolidColorBrush x:Key="Brush.BgSelected" Color="{StaticResource Color.BgSelected}" />
+    <SolidColorBrush x:Key="Brush.Border" Color="{StaticResource Color.Border}" />
+    <SolidColorBrush x:Key="Brush.BorderStrong" Color="{StaticResource Color.BorderStrong}" />
+
+    <SolidColorBrush x:Key="Brush.TextPrimary" Color="{StaticResource Color.TextPrimary}" />
+    <SolidColorBrush x:Key="Brush.TextSecondary" Color="{StaticResource Color.TextSecondary}" />
+    <SolidColorBrush x:Key="Brush.TextMuted" Color="{StaticResource Color.TextMuted}" />
+
+    <SolidColorBrush x:Key="Brush.Accent" Color="{StaticResource Color.Accent}" />
+    <SolidColorBrush x:Key="Brush.AccentHover" Color="{StaticResource Color.AccentHover}" />
+    <SolidColorBrush x:Key="Brush.AccentSoft" Color="{StaticResource Color.AccentSoft}" />
+
+    <SolidColorBrush x:Key="Brush.Static" Color="{StaticResource Color.Static}" />
+    <SolidColorBrush x:Key="Brush.StaticSoft" Color="{StaticResource Color.StaticSoft}" />
+
+    <SolidColorBrush x:Key="Brush.Direct" Color="{StaticResource Color.Direct}" />
+    <SolidColorBrush x:Key="Brush.DirectSoft" Color="{StaticResource Color.DirectSoft}" />
+
+    <SolidColorBrush x:Key="Brush.Success" Color="{StaticResource Color.Success}" />
+    <SolidColorBrush x:Key="Brush.SuccessSoft" Color="{StaticResource Color.SuccessSoft}" />
+
+    <SolidColorBrush x:Key="Brush.Warn" Color="{StaticResource Color.Warn}" />
+    <SolidColorBrush x:Key="Brush.WarnSoft" Color="{StaticResource Color.WarnSoft}" />
+
+    <SolidColorBrush x:Key="Brush.Danger" Color="{StaticResource Color.Danger}" />
+    <SolidColorBrush x:Key="Brush.DangerSoft" Color="{StaticResource Color.DangerSoft}" />
+</ResourceDictionary>

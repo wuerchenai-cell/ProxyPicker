@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <RootNamespace>ProxyPicker.Platform.Windows</RootNamespace>
+    <AssemblyName>ProxyPicker.Platform.Windows</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ProxyPicker.Domain\ProxyPicker.Domain.csproj" />
+    <Reference Include="System.Security" />
+    <Reference Include="System.Management" />
+  </ItemGroup>
+</Project>

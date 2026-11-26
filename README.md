@@ -1,179 +1,73 @@
 # ProxyPicker
 
-只让「你勾选的软件」走代理 —— 一个给 Clash / mihomo 系客户端用的**按进程分流**小面板。
+> **企业级 Windows 桌面按进程分流与多通道控制工作台** —— 专为 Clash / mihomo 系代理客户端打造。
 
-单文件 exe，1,487,896 字节（约 1453 KB），不需要安装、不碰你的订阅。**默认不写注册表**；只有在你主动开启「开机自启」后，才会在当前用户的 `Run` 项里创建一条启动记录，关闭时删除，不需要管理员权限。
+单文件绿色便携 exe，**1,246,232 字节（约 1,217 KB）**，原生 WPF Fluent 双主题界面，免安装、免额外运行库（Win10/11 原生 `.NET Framework 4.8`）、不修改机场订阅源文件，100% 向下无损兼容迁移 `v2.x` 配置与 DPAPI 加密固定 IP 保险箱。
 
-[**下载最新版**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
-[直接下 exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
-[更新记录](CHANGELOG.md)
-
-> **最新版 v2.6.1**（2026-11-26）：外部独立全仓深度审计（T51）**12/12 实锤缺陷全量收口加固**（1 P0 + 5 P1 + 4 P2 + 2 P3）：
-> ① **固定 IP 优选防旧快照覆盖（`P0-01`）**：`StaticProxy.TryMergeAndSaveAutoHopResult` 测速返回后重读最新持久化配置，中途停用/改密/改模式一律安全丢弃旧测速结果，绝不覆盖用户新设置。
-> ② **双向联动全面加固（`P1-01`–`P1-05` + `P2-01`）**：业务软件拉起前强制门禁确认内核就绪且 `Guard.Judge` 规则一致防抢跑直连；守望进程遇 `settings.json` 瞬时 IO 冲突保留旧配置不自杀退出；`Process.Start` 失败不永久占锁而是 20 秒退避重试并记脱敏日志；同生共死升级为完整路径精确比对 + 多进程浏览器可见顶层窗口判定 + 代理客户端 6 轮（15 秒）防更新重启 + `Unknown` 不误退；主实例已运行时 `--follow` 快捷方式自动跨进程交接同生共死会话；注册表 `Run` 校验改精确第 0 参数相等并清除搬家后旧守望孤儿。
-> ③ **安全、还原与健壮性收口（`P2-02`–`P2-04` + `P3-01`–`P3-02`）**：旁路探针临时目录迁至当前用户私有目录并启动自动清扫过期残留；节点批量测速全链路收进 `try/finally` 防标志卡死；干净还原前先剥离 `# PP-STATIC-BEGIN..END` 防静态节点残留；短于 4 字符口令按字段/URL 上下文精准脱敏；`Unknown` 监听者未验明 mihomo JSON 特征前拒绝盲发 Bearer。
-> 离线自检扩至 **362 项**（通用性 201 + 控制接口安全 53 + 流量对账 20 + 节点管理 7 + 网络质量与风控 13 + 零干扰侧车探测 6 + 独立固定 IP 48 + 双向软件联动 14，全部 0 失败）。
-> 前版 v2.6.0–v1.4.0 已并入本版（详见 [CHANGELOG](CHANGELOG.md)）。
-> 切换客户端后请等几秒或点一次右上角「↻ 刷新」：程序会立即重扫活跃客户端并切换控制通道。
-
-![主界面](docs/img/main.png)
-
-*界面截图摄于早期版本：现已升级为 v2.2.0 多客户端深度适配、真实连接感知工作台与零干扰旁路评估，实际布局与功能以 v2.2.0 说明为准。*
+[**下载最新版 (v3.0.0)**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) ·
+[直接下载 ProxyPicker.exe](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest/download/ProxyPicker.exe) ·
+[完整更新日志](CHANGELOG.md) ·
+[详细使用说明](docs/使用说明.md)
 
 ---
 
-## 它解决什么问题
+> ### 🚀 v3.0.0 企业级全系统重构（2026-11-26）
+> 从 Demo 迭代形态彻底重构为严谨的企业级五层单向架构（`Domain` / `Platform.Windows` / `Infrastructure` / `Application` / `App` + 独立 `Tests` 工程），构建仍打包为**真正单文件绿色便携 `ProxyPicker.exe`**：
+> 1. **内核并发控制中枢（`KernelCoordinator` + `PowerResumeGuard`）**：全系统唯一串行写队列（`P0` 退出还原 → `P4` 后台优选）+ `ConfigRevision` 乐观锁 CAS 彻底终结数据竞争；系统休眠唤醒与墙钟跳变自动进入 12 秒静默宽限期防风暴。
+> 2. **原生 WPF MVVM 双主题企业工作台**：深色 / 浅色 / 跟随 Windows 系统主题即时热切换，100%–150%+ 高 DPI 全矢量清晰渲染，6 大一级工作区 + 紧凑迷你监控浮窗。
+> 3. **应用分流三态直切 + 实时连接白盒监视器**：软件表支持 `[ 直连 | 主代理 | 固定IP ]` 一键直切，配合三色实时矢量走势曲线与实时连接监视器（错路旧连接红标高亮、一键断开单条或全部错路连接）。
+> 4. **多固定 IP 通道池 + 10 分钟稳态优选 + UDP/QUIC 防穿透**：支持配置多条独立住宅/静态 IP 通道（默认通道完全兼容 `PP-STATIC-OUT`/`PP-STATIC-HOP`），旁路 16 路初筛 + Top 5 三次复核稳态优选跳板，默认封堵 UDP/QUIC 穿透。
+> 5. **真正四向对称软件联动 + 命名场景预设**：彻底补全「开 A↔开 B、关 A↔关 B」四向闭环——勾选跟随默认自动激活后台守望保存即生效；退出 ProxyPicker 先经 `P0` 队列干净还原内核，再按「业务软件 → 代理客户端」优雅关闭；支持命名场景预设一键切换。
+> 6. **DNS 防泄漏只读体检 + 跨机加密配置迁移**：新增只读 DNS/TUN 体检建议、零干扰旁路节点四门风控评估（Google / Gemini / OpenAI / Claude），以及 `PBKDF2-SHA256 + AES-256-CBC + HMAC-SHA256` 认证加密配置迁移包导入导出。
 
-Clash 的规则是按「域名 / IP / 规则集」写的，而人脑子里想的是「我要让 Chrome 走代理，微信别走」。
-两者之间差的是一层翻译：**进程 → 规则**。
-
-ProxyPicker 干的就是这件事。点几个开关，点保存，程序把 `PROCESS-NAME` 规则插到你内核配置的
-`rules:` 段首，然后热推一次（`PUT /configs`）。全程不重启客户端、不断其他连接，
-按软件的代理名单立刻生效。
+![ProxyPicker v3.0 企业级深色工作台](docs/img/main.png)
 
 ---
 
-## 特点
+## 六大核心工作区
 
-- **改完不用重启浏览器**：保存时只关闭「本次改动到的软件」的旧连接，其他连接（下载、长连接）不断。
-- **两种分流模式，随时可切**（新机器默认代理白名单；已有配置不会被升级覆盖）
-  | 模式 | 勾选的软件 | 没勾选的软件 | 适合谁 |
-  |---|---|---|---|
-  | 代理白名单（核心，新机器默认） | 走代理 | 一律直连 | 只想让少数软件出网 |
-  | 订阅兼容（高级） | 走代理 | 继续按订阅原规则走 | 不想动订阅 / 老用户 |
-- **自己发现 + 自己补回**：每 30 秒核对一次「我插的规则还在不在」（收进托盘也不停）。
-  换订阅、重启客户端、改设置都会把规则冲掉，这时会自己补回去并留一句提示。
-- **扫不到也能手动加**：自动发现只覆盖运行进程、已安装软件、内置清单和已保存名单，
-  绿色版、MSIX、游戏目录、脚本类程序可能漏。托盘菜单「手动添加软件…」可手选 exe，
-  加过一次会一直留在列表里；「全部」标签带总数，切过去或用搜索框就能找到。
-- **还原就是真的还原**：托盘「还原上次保存前的配置」会清掉内核里的本工具规则并撤销接管状态，
-  后台看守不会过几十秒又自动接管。整份旧备份只有在「来源路径与配置内容都没变」时才会推回；
-  换过客户端、或订阅在同一路径被更新过（Clash Verge 常见），不会把旧备份整份推回去，
-  而是按当前订阅重建一份干净配置，你自己的规则原样保留。名单文件删除失败时会明确告知，
-  不会假装「接管状态已清除」。
-- **不越权改全局设置**：IPv6 归客户端自己管（Clash Verge 新版把 `ipv6` 列为应用设置接管字段，
-  外部再写会被丢弃并弹橙色警告），所以程序默认一个字都不碰。
-  确需防泄漏时，可在帮助面板里主动打开「IPv6 防泄漏」：改前记下原值，关掉即恢复。
-- **换电脑直接用**：自动识别 Clash Verge Rev / Clash Verge / Clash Nyanpasu / Mihomo Party /
-  FlClash / Sparkle / Clash Party / Clash for Windows / 裸 mihomo。
-- **多个客户端会选择运行中的那个**：不再按目录顺序拿第一份配置。按「内核命令行指向 >
-  客户端进程 > 控制端口 > 配置更新时间」打分；`--diag` 会列出全部候选、得分和选择依据。
-  两个同时在跑时仍建议只留一个。
-- **看得见真实出口**：流量与出口一律以 mihomo 返回的 `chains`（实际链路）为准；
-  用户勾选只代表「预期」。两者不一致会在摘要卡提示，并在「复制诊断」里逐条列出。
-- **识别边界说得清**：同名 exe 来自不同目录会提示（勾一个会连带命中另一个），同目录的辅助进程
-  （Electron helper、更新器）由安装目录规则自动覆盖，不用手动逐个勾；右键仍可查看完整路径、同名冲突和同目录进程，另有只读 `--scan` 排查命令。
+| 工作区 | 核心能力 |
+|---|---|
+| **1. 应用分流** | 顶部双独立延迟仪表卡 + 三色实时吞吐曲线；软件表 `[直连 \| 主代理 \| 固定IP]` 一键直切；支持白名单 / 订阅兼容双模式，保存仅定向断连变动软件 |
+| **2. 节点与多固定IP** | 主策略组并发测速、一键切节点、故障转移备选池；多固定 IP 通道池管理、一行粘贴解析、10 分钟自动稳速优选前置跳板、UDP/QUIC 防穿透 |
+| **3. 实时连接监视** | 实时展示各进程活跃连接、目标端口、TCP/UDP、实际出站链与累计流量，错路旧连接自动标红并支持一键清理 |
+| **4. 链路与DNS体检** | 只读 TUN / DNS / UDP 防穿透诊断向导；零干扰隔离侧车单节点/全量节点风控评估（双源 IP 纯净度 + 地区漂移 + Google/Gemini/OpenAI/Claude 四门预检） |
+| **5. 四向联动与预设** | 完整四向对称软件启停联动（开机静默守望保存即激活、桌面原生图标快捷方式、退出先还原内核再优雅关软件）+ 命名场景预设一键切换 |
+| **6. 系统设置与审计** | 深/浅/跟随系统热切换、免管理员开机自启、IPv6 防泄漏、`PBKDF2+AES-256-HMAC` 跨机加密导出导入、只读版本检查与可搜索彩色脱敏审计时间线 |
 
-![帮助面板](docs/img/help.png)
+| 多固定 IP 通道池与节点策略 | 四向对称联动与场景预设 |
+|---|---|
+| ![多固定 IP 通道池](docs/img/nodes_static.png) | ![四向联动与场景预设](docs/img/automation.png) |
 
 ---
 
 ## 快速开始
 
-1. 打开右侧 **Releases**，下载最新的 `ProxyPicker-v1.x.x-share.zip`
-   （分享包；只需要主程序的话单独下 `ProxyPicker.exe` 也行）；
-2. 解压，双击 `ProxyPicker.exe`（右下角出现图标，面板自动弹出）；
-3. 勾上要走代理的软件 → 点右下角「保存并生效」。
-
-**前提**：这台电脑上本来就有 Clash Verge 之类的客户端、并且正在运行。
-这个工具**不带代理**，它只决定「谁走代理」。
-
-> 第一次运行可能被 Windows SmartScreen 拦一下（exe 用的是自签名证书，Windows 不认识这个发布者）：
-> 点「更多信息」→「仍要运行」。源码全在这个仓库里，可以自己编译；签名说明见下文。
-
-详细说明见 [docs/使用说明.md](docs/使用说明.md)。
+1. 前往 [**Releases**](https://github.com/wuerchenai-cell/ProxyPicker/releases/latest) 下载 `ProxyPicker-v3.0.0-share.zip`（含说明与自签名证书）或直接下载单文件 `ProxyPicker.exe`。
+2. 确保本机已运行 **Clash Verge Rev / FlClash / Sparkle / Clash Nyanpasu / Mihomo Party / 裸 mihomo**（推荐开启 TUN 模式）。
+3. 双击 `ProxyPicker.exe`（首次运行自签名程序若弹出 SmartScreen，点「更多信息」→「仍要运行」），选择各软件通道并点「保存并热推生效」。
+4. **v2.x 老用户无损升级**：直接替换 exe，首次启动自动继承 `pp-whitelist.yaml`、`settings.json` 与本机 DPAPI 加密的 `static_proxy.dat`。
 
 ---
 
-## 常见问题
+## 从源码构建与运行测试
 
-**Q：勾了还是不走代理？**
-先看摘要卡右下角的规则数有没有变，再看底部状态是不是「名单已生效」。
-如果客户端在你保存之后重新生成过配置，规则会被冲掉——等 30 秒它会自己补回，或者点一下右上角刷新。
+本仓库自 `v3.0.0` 起采用严格五层单向依赖多工程解决方案（位于 `src_v3/`）：
 
-**Q：怎么撤掉，回到原来的分流？**
-可靠做法：托盘菜单「还原上次保存前的配置」，或直接点窗口「×」退出（会先还原配置再退出）。
-这两条都会删掉接管名单，后台看守不再补回。
-在 Clash Verge 里点「更新 / 应用」只会**暂时**冲掉规则：只要本程序还在运行、接管名单还在，
-后台看守随后就会把规则补回来，不能当作永久退出方式。
-彻底删干净：exe、`%LOCALAPPDATA%\ProxyPicker\`、开机启动项
-（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 里的 ProxyPicker，开过才有）；
-如果从很老的版本升级过，再看一眼客户端的 `pp_rules` 目录（新版本不写它）。
+```powershell
+# 编译全部 5 个分层工程 + 单文件自嵌入主程序 + 独立单元测试工程（0 警告 0 错误）
+dotnet build src_v3\ProxyPicker.v3.sln -c Release
 
-**Q：会把我的订阅传到网上吗？**
-不会。程序只读本机配置文件和控制面接口，运行时唯一的对外请求是「检查更新」时发给 GitHub API 的一个 GET，
-不带任何本机信息；把 `settings.json` 里的 `"updateCheck"` 改成 `false` 就完全不联网。
+# 运行独立自动化测试套件（零外部 NuGet 依赖，覆盖内核协调、CAS、四向联动、加密迁移、节点风控与实机规则对账）
+.\src_v3\tests\ProxyPicker.Tests\bin\Release\net48\ProxyPicker.Tests.exe
+```
 
-**Q：Clash Verge 弹「扩展配置或脚本写入了由应用设置接管的字段 ipv6，这些值已被丢弃」？**
-这是客户端的提示，不是 ProxyPicker 报错。新版 Clash Verge 把 `ipv6` 收归自己的应用设置，
-早期版本在 Merge 扩展里留下的 `ipv6: false` 会被它丢弃并弹橙色条。删掉 merge 文件里那一行即可；
-ProxyPicker 现在默认完全不写这个字段。要真正开关 IPv6，请在 Clash Verge 设置界面里改。
-
-**Q：支持 macOS / Linux 吗？**
-不支持。命名管道、注册表开机自启、WinForms 自绘界面都是 Windows 专用。
+输出产物 `src_v3\src\ProxyPicker.App\bin\Release\net48\ProxyPicker.exe` 通过 MSBuild 自动将内部 4 个自研分层程序集嵌入资源，复制单个 `.exe` 至任意空目录即可独立运行。
 
 ---
 
-## 从源码构建
+## 安全与隐私承诺
 
-需要 .NET SDK（能编译 `net48` 目标即可）和 Windows：
-
-```bat
-dotnet build src\ProxyPicker.csproj -c Release
-```
-
-产物：`src\bin\Release\net48\ProxyPicker.exe`（单文件，无外部依赖）。
-
-只读自检出口（不改任何配置）：
-
-```bat
-ProxyPicker.exe --selftest 自检.txt     :: 通用 201 + 安全 52 + 流量 20 + 节点 7 + 风控 13 + 侧车 5 + 固定IP 36（共 334 项）
-ProxyPicker.exe --nodecheck 节点体检.txt :: 只读探测当前出口质量、地区、风控与 AI 预检（已脱敏）
-ProxyPicker.exe --delay 测速.txt        :: 只读检测当前出口策略链与真实节点延迟（已脱敏）
-ProxyPicker.exe --dryrun 配置.yaml 输出.yaml whitelist
-ProxyPicker.exe --scan 进程识别.txt     :: 只读列出路径、同名冲突、辅助进程（已脱敏）
-ProxyPicker.exe --version 版本.txt
-ProxyPicker.exe --checkupdate 更新.txt
-ProxyPicker.exe --cleanlegacy 清理.txt  :: 只检测旧版 profile 注入，不清理
-```
-
-所有命令行开关都必须带输出文件路径；只敲 `--selftest` 会打印用法并返回非 0，不会再悄悄打开面板。
-`--apply`、`--cleanlegacy --yes` 会真实修改客户端配置，必须加 `--yes` 确认；
-`--raw` 默认只允许 GET/HEAD，非只读方法同样要 `--yes`：
-
-```bat
-ProxyPicker.exe --apply 结果.txt --yes   :: 按当前勾选名单推送规则；ok=False 时退出码非 0
-```
-
-其余开关（含 `--diag`、`--payload`、`--audit`、`--api`、`--raw`）都不写**磁盘配置**。
-但 `--restore` 会调用退出还原，向运行中的内核推送一份干净配置 —— 它不改订阅文件，
-却会改变内核当前的运行状态，诊断 / 排障环境里不要随手执行。
-
-**关于数字签名**：v1.1.0 起 Release 的 exe 带 Authenticode 签名（SHA-256）。用的是自签名证书
-`CN=ProxyPicker Development Signing`，指纹 `90361B0827F82D434A62CBEBE13D50ECB78D6CE8`，
-公钥证书 `ProxyPicker-selfsigned.cer` 随包提供，可用 `Get-AuthenticodeSignature ProxyPicker.exe` 核对签名者指纹。
-
-自签名只能证明「文件没被改过」，不能证明发布者身份：Windows SmartScreen **仍会**提示「未知发布者」
-（点「更多信息」→「仍要运行」）。要彻底消除提示必须购买 OV / EV 代码签名证书，这一步需要证书机构实名与付费，
-当前未做。每个 Release 都会公布**官方已签名附件**的 SHA-256 并对应固定的源码提交。
-注意：从源码自行编译不会得到相同的文件 SHA-256 —— 发布 exe 带 Authenticode 签名与时间戳，
-独立构建者没有同一私钥，签名数据也不可能一致。自行编译适合核对程序集内容与功能，
-核对下载文件是否被动过请用公布的那个哈希。
-
----
-
-## 目录
-
-```
-src/            C# 源码（net48，WinForms 自绘界面）
-  Core/         发现客户端、读配置、生成规则、控制面通信、对账、偏好
-  UI/           窗口、列表、托盘、主题、动效
-  Assets/       ico（16/24/32/48/64/128/256 七帧 32 位）
-docs/           使用说明与截图
-```
-
----
-
-## 许可
-
-MIT，见 [LICENSE](LICENSE)。
+- **零遥测、零上传**：仅与本机回环 mihomo 控制管道/端口通信；仅在用户主动触发「节点体检」或「检查更新」时发起只读外网探测。
+- **凭据强隔离**：本地固定 IP 凭据经 Windows DPAPI 当前用户隔离加密存储于 `%LOCALAPPDATA%\ProxyPicker\`；跨机迁移包采用 `PBKDF2-SHA256 (100,000 轮) + AES-256-CBC + Encrypt-then-MAC HMAC-SHA256`。
+- **全链路自动脱敏**：所有诊断报告与审计日志均经 `RedactorService` 自动打码真实 IP、长短口令、节点名、用户名路径与管道 ID。

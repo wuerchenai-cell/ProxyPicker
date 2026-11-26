@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>ProxyPicker.App</RootNamespace>
+    <AssemblyName>ProxyPicker</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\ProxyPicker.ico</ApplicationIcon>
+    <StartupObject>ProxyPicker.App.Program</StartupObject>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <PathMap>$(MSBuildProjectDirectory)=ProxyPicker</PathMap>
+    <AssemblyTitle>ProxyPicker</AssemblyTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ProxyPicker.Domain\ProxyPicker.Domain.csproj" />
+    <ProjectReference Include="..\ProxyPicker.Platform.Windows\ProxyPicker.Platform.Windows.csproj" />
+    <ProjectReference Include="..\ProxyPicker.Infrastructure\ProxyPicker.Infrastructure.csproj" />
+    <ProjectReference Include="..\ProxyPicker.Application\ProxyPicker.Application.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\ProxyPicker.ico" LogicalName="ProxyPicker.Assets.ProxyPicker.ico" />
+  </ItemGroup>
+
+  <!-- 将 4 个自研内部层 DLL 嵌入主程序资源，发布时保持真正单文件绿色 ProxyPicker.exe，零第三方依赖 -->
+  <Target Name="EmbedOwnedProjectAssemblies" AfterTargets="ResolveAssemblyReferences" BeforeTargets="PrepareResources">
+    <ItemGroup>
+      <_OwnedDlls Include="@(ReferenceCopyLocalPaths)"
+                  Condition="'%(Extension)' == '.dll' and $([System.String]::Copy('%(Filename)').StartsWith('ProxyPicker.'))" />
+      <EmbeddedResource Include="@(_OwnedDlls)" LogicalName="ProxyPicker.Libs.%(Filename)%(Extension)" />
+      <ReferenceCopyLocalPaths Remove="@(_OwnedDlls)" />
+      <ReferenceCopyLocalPaths Remove="@(ReferenceCopyLocalPaths)"
+                               Condition="'%(Extension)' == '.pdb' and $([System.String]::Copy('%(Filename)').StartsWith('ProxyPicker.'))" />
+    </ItemGroup>
+  </Target>
+</Project>
